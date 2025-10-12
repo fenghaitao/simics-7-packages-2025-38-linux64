@@ -1,0 +1,93 @@
+/*
+  sample-i2c-device.dml - sample code for a Simics I2C device
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_i2c_device;
+param desc = "sample I2C device";
+param documentation = "The is the <class>" + classname + "</class> class"
+    + " which is an example of how I2C slave devices can be written in Simics.";
+
+import "simics/devs/i2c.dml";
+
+loggroup lg_common;
+
+// I2C link connection
+connect i2c_link_v2 {
+    param desc = "I2C link Connection";
+    param configuration = "optional";
+    interface i2c_master_v2;
+}
+
+// i2c_slave_v2 interface
+implement i2c_slave_v2 {
+    method start(uint8 addr) {
+        local i2c_ack_t response =
+            addr[7:1] == address.val ? I2C_ack : I2C_noack;
+
+        log info, 4, lg_common: "START condition addr=0x%02x: %sACK",
+            addr, response == I2C_ack ? "" : "N";
+
+        i2c_link_v2.i2c_master_v2.acknowledge(response);
+    }
+
+    method read() {
+        log info, 4, lg_common: "Reading 0x%x", read_value.val;
+
+        i2c_link_v2.i2c_master_v2.read_response(read_value.val);
+    }
+
+    method write(uint8 value) {
+        log info, 4, lg_common: "Writing 0x%x", value;
+
+        written_value.val = value;
+
+        i2c_link_v2.i2c_master_v2.acknowledge(I2C_ack);
+    }
+
+    method stop() {
+        log info, 4, lg_common: "STOP condition";
+    }
+
+    method addresses() -> (attr_value_t) {
+        // respond to both the read and write 8-bit addresses
+        return SIM_make_attr_list(
+            2, SIM_make_attr_uint64(address.val << 1 | 0),
+            SIM_make_attr_uint64(address.val << 1 | 1));
+    }
+}
+
+attribute address is uint64_attr {
+    param documentation = "7-bit address on the i2c bus. It can be any "
+        + "valid i2c address in range of [0, 127].";
+    param configuration = "required";
+
+    method set(attr_value_t val) throws {
+        if (SIM_attr_integer(val) > 127) {
+            SIM_c_attribute_error("Value %llu is outside valid range [0, 127]",
+                                  SIM_attr_integer(val));
+            throw;
+        }
+        default(val);
+    }
+}
+
+attribute read_value is uint64_attr {
+    param documentation = "Value to return on reads.";
+}
+
+attribute written_value is uint64_attr {
+    param documentation = "Last byte written to this device.";
+}

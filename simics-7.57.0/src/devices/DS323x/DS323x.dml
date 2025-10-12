@@ -1,0 +1,567 @@
+/*
+  DS323x.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device DS323x;
+parameter desc = "model of DS3231 I2C real-time clock";
+parameter documentation = "DS1213 I2C Real-Time Clock.";
+
+import "simics/util/os-time.dml";
+import "utility.dml";
+import "simics/devs/i2c.dml";
+import "simple-i2c-slave.dml";
+
+// We need some functions from the standard C header files.
+
+header %{
+#include <stdio.h>
+#include <math.h>
+%}
+
+extern int snprintf(char *str, size_t size, const char *format, ...);
+extern double floor(double x);
+
+parameter limitations = "<ul>"
+    + "<li>Alarm registers not implemented.</li>"
+    + "<li>Registers Control, Control/Status, Aging Offset, "
+    + "MSB of Tempa, and LSB of Temp not implemented.</li>"
+    + "</ul>";
+
+loggroup lg_common;
+
+connect i2c_bus {
+    interface i2c_bus;
+}
+
+attribute address_range {
+    parameter documentation
+        = "Specifies the accessible address range. For DS3231, "
+        + "0x13 is the recommended value. For DS3232, 0x100 is recommended. "
+        + "The default is 0x12 (making the model behave as a DS3231).";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint32";
+}
+
+attribute base_time {
+    parameter documentation =
+        "The simulated time when the oscillator was enabled, "+
+        "in seconds since the start of the simulation.";
+    parameter allocate_type = "double";
+}
+
+attribute base_rtc_time {
+    parameter documentation =
+        "The real-time clock time when the oscillator was enabled, "+
+        "in seconds since 1970-01-01 00:00:00.";
+    parameter allocate_type = "int64";
+}
+
+attribute current_rtc_time {
+    parameter documentation
+        = "The real-time clock time, in seconds since 1970-01-01 00:00:00.";
+    parameter configuration = "pseudo";
+    parameter type = "i";
+
+    method get() -> (attr_value_t value) {
+        local int64 rtc_time;
+        call $get_rtc_time() -> (rtc_time);
+        value = SIM_make_attr_int64(rtc_time);
+    }
+}
+
+attribute enabled {
+    parameter documentation = "tells if the real-time clock is enabled or not";
+    parameter allocate_type = "bool";
+}
+
+//  These functions get and set the real-time clock time, as described above.
+
+method get_rtc_time() -> (int64 rtc_time) {
+    if (!$enabled)
+        rtc_time = $base_rtc_time;
+    else
+        rtc_time = $base_rtc_time + floor(SIM_time($obj) - $base_time);
+}
+
+/* Sets the rtc time and sync to beginning of a new second */
+method resync_time(int64 rtc_time) {
+    local char rtc_time_str[64];
+
+    $base_time = SIM_time($obj);
+    $base_rtc_time = rtc_time;
+
+    call $get_rtc_time_str(rtc_time_str, 64);
+    log info, 2: "time set to %s", rtc_time_str;
+}
+
+/* Sets the rtc time and keeping the subsecond value */
+method set_rtc_time(int64 rtc_time) {
+    local char rtc_time_str[64];
+
+    if (!$enabled) {
+        $base_rtc_time = rtc_time;
+    } else {
+        $base_rtc_time = rtc_time
+            - floor(SIM_time($obj) - $base_time);
+    }
+
+    call $get_rtc_time_str(rtc_time_str, 64);
+    log info, 2: "time set to %s", rtc_time_str;
+}
+
+
+// Writes the current real-time clock time to the string rtc_time_str on the
+// format "YYYY-MM-DD hh:mm:ss". The string must have space for str_size characters.
+
+method get_rtc_time_str(char *rtc_time_str, int str_size) {
+    local int64 rtc_time;
+    local os_tm_t rtc_time_parts;
+
+    // Get the real-time clock time.
+    inline $get_rtc_time() -> (rtc_time);
+
+    // Split the time parts.
+    inline $gmtime64(rtc_time) -> (rtc_time_parts);
+
+    // We count months from 1, os_tm_t counts from 0.
+    rtc_time_parts.tm_mon += 1;
+
+    // Convert the parts to a string.
+    snprintf(rtc_time_str, str_size,
+             "%04lld-%02lld-%02lld %02lld:%02lld:%02lld",
+             cast(1900 + rtc_time_parts.tm_year, uint64),
+             cast(rtc_time_parts.tm_mon, uint64),
+             cast(rtc_time_parts.tm_mday, uint64),
+             cast(rtc_time_parts.tm_hour, uint64),
+             cast(rtc_time_parts.tm_min, uint64),
+             cast(rtc_time_parts.tm_sec, uint64));
+}
+
+// 64-bit wrapper around os_gmtime(). Performs a sanity check when/if casting
+// from larger (int64) to smaller (int32) type. Use this method instead of
+// os_gmtime(). Will assert if time can not be safely converted.
+
+method gmtime64(int64 time64) -> (os_tm_t os_time_parts) {
+    local os_time_t os_time;
+
+    // Check for year 2038 wraparound using gmtime on 32-bit host
+    if (sizeoftype(os_time_t) < sizeoftype(int64)) {
+        assert time64 <= 0x7fffffff;
+    }
+
+    os_time = cast(time64, os_time_t);
+    os_time_parts = os_gmtime(&os_time);
+}
+
+// 64-bit wrapper around os_timegm(). Provided for symmetrical reasons, use in
+// combination with gmtime64().
+// os_timegm should not be used, see Bug 14078.
+
+method timegm64(os_tm_t os_time_parts) -> (int64 time64) {
+    local os_time_t os_time;
+    os_time = os_timegm(&os_time_parts);
+    if (os_time == -1)
+    {
+        log spec_viol, 1, lg_common: "calendar time cannot be represented";
+    }
+    time64 = cast(os_time, int64); // safe to cast to larger type
+}
+
+attribute address {
+    parameter documentation = "Address on the i2c bus.";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint8";
+}
+
+attribute address_mode {
+    parameter documentation = "Address mode. Internal state that decides if " +
+        "the RTC should treat data as address or value";
+    parameter allocate_type = "bool";
+}
+
+attribute addr_ptr {
+    parameter documentation = "Address pointer. Points the internal address" +
+        "affected on next data access.";
+    parameter allocate_type = "uint8";
+}
+
+is simple_i2c_slave;
+// I2C methods for i2c_link_v2
+method i2c_start_request_read() -> (i2c_status_t ack) {
+    log info, 4: "transmit request received";
+    ack = 0;
+}
+
+method i2c_start_request_write() -> (i2c_status_t ack) {
+    log info, 4: "receive request received";
+    $address_mode = true;
+    ack = 0;
+}
+
+method i2c_read_request() -> (uint8 value) {
+    local generic_transaction_t memop;
+
+    value = 0;
+    SIM_set_mem_op_type(&memop, Sim_Trans_Load);
+
+    local bool success;
+    call $regs.read_access(&memop, $addr_ptr, 1) -> (success, value);
+    if (!success) {
+        // since we have a wrapping address pointer that wraps
+        // this should never happen
+        assert false;
+    }
+
+    $addr_ptr = ($addr_ptr + 1) % $address_range;
+}
+
+method i2c_write_request(uint8 value) -> (i2c_status_t ack) {
+    local bool success = true;
+    if ($address_mode) {
+        // using modules here is just an assumption strengthen
+        // by the fact that incrementation on writes wraps
+
+        log info, 4: "setting address pointer to 0x%x",
+            value % $address_range;
+
+        $addr_ptr = value % $address_range;
+        $address_mode = false;
+    } else {
+        local generic_transaction_t memop;
+        SIM_set_mem_op_type(&memop, Sim_Trans_Store);
+
+        call $regs.write_access(&memop, $addr_ptr, 1, value) -> (success);
+        if (!success) {
+            // since we have a wrapping address pointer that wraps
+            // this should never happen
+            assert false;
+        }
+
+        $addr_ptr = ($addr_ptr + 1) % $address_range;
+    }
+
+    ack = success ? I2C_status_success : I2C_status_noack;
+}
+
+method get_slave_address() -> (bool enable, uint8 addr) {
+    enable = true;
+    addr = $address;
+}
+
+bank regs {
+    parameter register_size = 1;
+    parameter function = 1;
+
+    register seconds           @ 0x0;
+    register minutes           @ 0x1;
+    register hours             @ 0x2;
+    register day               @ 0x3;
+    register date              @ 0x4;
+    register month             @ 0x5;
+    register year              @ 0x6;
+    register alarm_1_seconds   @ 0x7;
+    register alarm_1_minutes   @ 0x8;
+    register alarm_1_hours     @ 0x9;
+    register alarm_1_day_date  @ 0xA;
+    register alarm_2_minutes   @ 0xB;
+    register alarm_2_hours     @ 0xC;
+    register alarm_2_day_date  @ 0xD;
+    register control           @ 0xE;
+    register control_status    @ 0xF;
+    register aging_offset      @ 0x10;
+    register msb_of_temp       @ 0x11;
+    register lsb_of_temp       @ 0x12;
+
+    register test              @ 0x13;
+
+    register sram[236]         @ 0x14 + $i;
+}
+
+// This template is used by all time registers of the real-time
+// clock. It contains methods for converting between BCD and binary format and
+// for checking that the value is within the allowed range.
+
+template time_register {
+    parameter max_value default undefined;
+    parameter min_value default undefined;
+    parameter configuration = "none";
+
+    // Converts a value from BCD format to binary format.
+    method from_bcd(uint8 value) -> (uint8 result) {
+        local bool illegal = false;
+        local uint8 adjusted_value = value;
+        if ((adjusted_value >> 4) > 9) {
+            illegal = true;
+            adjusted_value = 0x90 | (adjusted_value & 0xf);
+        }
+        if ((adjusted_value & 0xf) > 9) {
+            illegal = true;
+            adjusted_value = (adjusted_value & 0xf0) | 0x9;
+        }
+        if (illegal)
+            log spec_viol:
+                "illegal BCD value 0x%x written to register %s - adjusting to BCD value 0x%x",
+                value, $qname, adjusted_value;
+        result = ((adjusted_value >> 4) * 10) + (adjusted_value & 0xf);
+    }
+
+    // Converts a value from binary format to binary BCD.
+    method to_bcd(uint8 value) -> (uint8 result) {
+        if (value > 99) {
+            log error:
+                "value 0x%x of register %s can not be converted to a BCD value - adjusting to BCD value 0x99",
+                value, $qname;
+            result = 0x99;
+        }
+        else
+            result = ((value / 10) << 4) | (value % 10);
+    }
+
+    // Checks that that value is within the allowed bounds, and adjusts it
+    // if not.
+    method check_bounds(uint8 value) -> (uint8 result) {
+        result = value;
+        if (defined $min_value && result < $min_value) {
+            log spec_viol:
+                "illegal value 0x%x written to register %s - adjusting value to 0x%x",
+                result, $qname, $min_value;
+            result = $min_value;
+        }
+        if (defined $max_value && result > $max_value) {
+            log spec_viol:
+                "illegal value 0x%x written to register %s - adjusting value to 0x%x",
+                result, $qname, $max_value;
+            result = $max_value;
+        }
+    }
+
+    // Convert a value from the current register format to binary format.
+    method from_register_format(uint8 value) -> (uint8 result) default {
+        call $from_bcd(value) -> (result);
+    }
+
+    // Convert a value from binary format to the current register format.
+    method to_register_format(uint8 value) -> (uint8 result) default {
+        call $to_bcd(value) -> (result);
+    }
+
+    // Update the time registers, convert the register value to the
+    // current format and return it.
+    method read() -> (value) {
+        call $update_time_registers_conditional();
+        call $to_register_format($this) -> (value);
+    }
+
+    // Update the time registers, parse the register value from the
+    // current format, perform the write, writeback the value of the time
+    // registers to the internal time, and maybe update the alarm
+    // interrupt event.
+    method write(value) {
+        local int64 rtc_time;
+
+        call $update_time_registers_conditional();
+        call $from_register_format(value) -> (value);
+        call $check_bounds(value) -> ($this);
+        call $writeback_time_registers() -> (rtc_time);
+
+        // Set the real-time clock time.
+        inline $update_time(rtc_time);
+    }
+    method update_time(int64 rtc_time) default {
+        inline $set_rtc_time(rtc_time);
+    }
+}
+
+
+// Copies the contents of the time registers to the internal time counter.
+
+method writeback_time_registers() -> (int64 rtc_time) {
+    local os_tm_t tm;
+
+    // Read the time registers. DS3231 counts month
+    // from 1, os_tm_t counts from 0.
+    tm.tm_sec = $regs.seconds;
+    tm.tm_min = $regs.minutes;
+    tm.tm_hour = $regs.hours.h;
+    tm.tm_mday = $regs.date;
+    tm.tm_mon = $regs.month.m - 1;
+    tm.tm_year = $regs.year;
+    if ($regs.month.century == 1)
+        tm.tm_year += 100;
+
+    // Join the time parts.
+    inline $timegm64(tm) -> (rtc_time);
+}
+
+bank regs {
+    register seconds is (time_register) {
+                            parameter documentation =
+                "Seconds register. In binary format in the range " +
+                "0-59, regardless of the current register mode.";
+            parameter max_value = 59;
+            method update_time(int64 rtc_time) {
+                // Writing seconds resets the subsecond counter.
+                inline $resync_time(rtc_time);
+            }
+    }    
+
+    register minutes is (time_register) {
+        parameter documentation =
+            "Minutes register. In binary format in the range " +
+            "0-59, regardless of the current register mode.";
+        parameter max_value = 59;
+    }
+    register hours {
+        field TWELVE_H [7] "12 hour format flag";
+        field h [6:0] {
+            is time_register;
+            parameter documentation =
+            "Hours register. In binary format in the range 0-23.";
+            parameter max_value = 23;
+            method from_register_format(uint8 value) -> (uint8 result) {
+                local bool pm = $TWELVE_H && value[5];
+                result = value;
+                if (pm)
+                    result[5] = 0;
+                call $from_bcd(result) -> (result);
+                if ($TWELVE_H)
+                    result -= 1;
+                if (pm)
+                    result += 12;
+            }
+
+            method to_register_format(uint8 value) -> (uint8 result) {
+                local bool pm = $TWELVE_H && value > 12;
+                result = value;
+                if (pm)
+                    result -= 12;
+                if ($TWELVE_H)
+                    result += 1;
+                call $to_bcd(result) -> (result);
+                if (pm)
+                    result[5] = 1;
+            }
+        }
+    }
+    register day is (time_register) {
+        parameter documentation =
+            "Day of the week register. In binary format in the " +
+            "range 1-7, regardless of the current register mode.";
+        parameter min_value = 1;
+        parameter max_value = 7;
+    }
+    register date is (time_register) {
+        parameter documentation =
+            "Day of the month register. In binary format in the " +
+            "range 1-31, regardless of the current register mode.";
+        parameter min_value = 1;
+        parameter max_value = 31;
+    }
+    register month {
+        parameter documentation =
+            "Month register. In binary format in the range " +
+            "1-12, regardless of the current register mode.";
+
+        field century[7] "Century flag" {
+            method write(value) {
+                call $update_time_registers_conditional();
+                $this = value;
+
+                local int64 rtc_time;
+                call $writeback_time_registers() -> (rtc_time);
+                inline $set_rtc_time(rtc_time);
+            }
+        }
+        field m[6:0] {
+            is time_register;
+            parameter min_value = 1;
+            parameter max_value = 12;
+        }
+    }
+    register year is (time_register) {
+        parameter documentation =
+            "Year register. In binary format in the range 0-99, " +
+            "regardless of the current register mode.";
+        parameter max_value = 99;
+    }
+    register control {
+        parameter documentation = "Control Register.";
+        field EOSC[7]  is (unimplemented) "Enable oscillator";
+        field BBSQW[6] is (unimplemented) "Battery-backed square-wave enable";
+        field CONV[5]  is (unimplemented) "Convert temperature";
+        field RS2[4]   is (unimplemented) "Rate select 2" {
+            parameter hard_reset_value = 1;
+        }
+        field RS1[3]   is (unimplemented) "Rate select 1" {
+            parameter hard_reset_value = 1;
+        }
+        field INTCN[2] is (unimplemented) "Interrupt control" {
+            parameter hard_reset_value = 1;
+        }
+        field A2IE[1]  is (unimplemented) "Alarm 2 interrupt enable";
+        field A1IE[0]  is (unimplemented) "Alarm 1 interrupt enable";
+    }
+
+    register sram[236] is (no_reset);
+}
+
+// Copies the contents of the internal time counter to the time registers if
+// the real-time clock is running (the oscillator is enabled and the SET bit of
+// register b is not set).
+
+method update_time_registers_conditional() {
+    if ($enabled)
+        inline $update_time_registers_unconditional();
+}
+
+// Copies the contents of the internal time counter to the time registers,
+// regardless of if real-time clock is running (the oscillator is on and the
+// SET bit of register b is set).
+
+method update_time_registers_unconditional() {
+    local int64 rtc_time;
+    local os_tm_t tm;
+
+    // Get the real-time clock time.
+    inline $get_rtc_time() -> (rtc_time);
+
+    // Split the time parts.
+    inline $gmtime64(rtc_time) -> (tm);
+
+    // Write the time registers. DS3231 counts day of month
+    // from 1, os_tm_t count from 0.
+    $regs.seconds = tm.tm_sec;
+    $regs.minutes = tm.tm_min;
+    $regs.hours.h = tm.tm_hour;
+    $regs.day = tm.tm_wday + 1;
+    $regs.date = tm.tm_mday;
+    $regs.month.m = tm.tm_mon + 1;
+    $regs.year = tm.tm_year % 100;
+    $regs.month.century = tm.tm_year > 99;
+}
+
+
+method init() {
+    $enabled = true;
+    $address_range = 0x13; /* DS3231, without NV-RAM */
+    $addr_ptr = 0x0;
+    $address = 0x68; /* Real hardware is hard-coded to this */
+    $address_mode = false;
+}
+
+method post_init() {
+    call $i2c_register_address($address);
+}

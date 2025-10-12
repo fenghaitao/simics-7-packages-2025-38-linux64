@@ -1,0 +1,253 @@
+/*
+ * sample-802-15-4-transceiver.dml
+
+  © 2014 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device sample_802_15_4_transceiver;
+
+parameter desc = "a sample IEEE 802.15.4 transceiver";
+
+import "utility.dml";
+import "ieee-802-15-4-interfaces.dml";
+import "simics/devs/signal.dml";
+import "simics/model-iface/state.dml";
+
+template counter_templ {
+    parameter target;
+
+    method inc() {
+        $this++;
+        inline $target.update($this);
+    }
+
+    method reset() {
+        $this = 0;
+        inline $target.update($this);
+    }
+}
+
+template number_output_templ {
+    interface uint64_state;
+
+    method update(uint64 val) {
+        if ($obj)
+            $uint64_state.set(val);
+    }
+}
+
+attribute id {
+    parameter documentation = "node id";
+    parameter allocate_type = "uint64";
+}
+
+attribute received_frames_count {
+    parameter documentation = "The number of received frames.";
+    parameter allocate_type = "uint64";
+    is counter_templ;
+    parameter target = $pkt_recv_target;
+}
+
+attribute sent_frames_count {
+    parameter documentation = "The number of sent frames.";
+    parameter allocate_type = "uint64";
+
+    is counter_templ;
+    parameter target = $pkt_sent_target;
+}
+
+attribute lost_frames_count {
+    parameter documentation = "The number of lost frames.";
+    parameter allocate_type = "uint64";
+
+    is counter_templ;
+    parameter target = $pkt_lost_target;
+}
+
+attribute contention_count {
+    parameter documentation = "Contention failure times.";
+    parameter allocate_type = "uint64";
+
+    is counter_templ;
+    parameter target = $contention_target;
+}
+
+attribute channel_page {
+    parameter documentation = "The channel page.";
+    parameter allocate_type = "uint64";
+}
+
+attribute channel_num {
+    parameter documentation = "The channel number.";
+    parameter allocate_type = "uint64";
+}
+
+attribute crc {
+    parameter documentation = "The CRC status.";
+    parameter allocate_type = "uint64";
+}
+
+parameter MAX_PKIT_LEN = 2*1024;
+
+attribute tx_buffer {
+    parameter documentation = "A buffer for transmit FIFO.";
+    parameter type = "d";
+
+    data uint8  buf[$MAX_PKIT_LEN];
+
+    method set(attr_value_t val) {
+        if (SIM_attr_is_data(val)) {
+            if (SIM_attr_data_size(val) > $MAX_PKIT_LEN)
+                throw;
+            memcpy(&$buf, SIM_attr_data(val), SIM_attr_data_size(val));
+        } else {
+            throw;
+        }
+    }
+
+    method get() -> (attr_value_t val) {
+        val = SIM_make_attr_data($MAX_PKIT_LEN, &$buf);
+    }
+}
+
+attribute tx_buffer_pos {
+    parameter documentation = "The next pos to fill in the buffer.";
+    parameter allocate_type = "uint64";
+}
+
+bank regs {
+    parameter register_size = 4;
+
+    register tx_fifo size 1 @ 0 {
+        method write(val) {
+            inline $changed(val);
+        }
+
+        method changed(val) {
+            if ($tx_buffer_pos < $MAX_PKIT_LEN) {
+                $tx_buffer.buf[$tx_buffer_pos] = val;
+                $tx_buffer_pos++;
+            } else {
+                log "error": "transmit buffer is overflow";
+            }
+        }
+    }
+
+    register tx_cmd @ 4 {
+        method write(val) {
+            inline $changed(val);
+        }
+
+        method changed(val) {
+            if (val != 0) {
+                if ($ep.obj) {
+                    local frags_t p;
+                    local ieee_802_15_4_transmit_status_t status;
+
+                    frags_init_add(&p, &$tx_buffer.buf, $tx_buffer_pos);
+                    status = $ep.ieee_802_15_4_link.transmit(&p, $channel_page,
+                                                            $channel_num, $crc);
+
+                    switch(status) {
+                    case IEEE_802_15_4_Transmit_No_Error:
+                        call $sent_frames_count.inc();
+                        break;
+
+                    case IEEE_802_15_4_Transmit_Channel_Contention:
+                        call $contention_count.inc();
+                        break;
+
+                    default:
+                        break;
+                    }
+                }
+
+                $tx_buffer_pos = 0;
+            }
+        }
+    }
+}
+
+implement ieee_802_15_4_receiver {
+    method receive(const frags_t *frame,
+                   uint32 rssi,
+                   uint16 channel_page,
+                   uint16 channel_number,
+                   ieee_802_15_4_frame_crc_status_t crc_status) {
+        if (channel_page == $channel_page && channel_number == $channel_num) {
+            log "info", 3: "message received";
+            call $received_frames_count.inc();
+        }
+    }
+
+    method frame_lost(uint32 rssi,
+                      uint16 channel_page,
+                      uint16 channel_number) {
+        if (channel_page == $channel_page && channel_number == $channel_num) {
+            log "info", 3: "message lost";
+            call $lost_frames_count.inc();
+        }
+    }
+}
+
+connect ep {
+    parameter documentation = "The endpoint that the device"
+                              + " will be connected to.";
+
+    interface ieee_802_15_4_link;
+}
+
+connect id_target {
+    parameter documentation = "The NumberOutput for ID.";
+    is number_output_templ;
+}
+
+connect pkt_sent_target {
+    parameter documentation = "The NumberOutput for sent packets.";
+    is number_output_templ;
+}
+
+connect pkt_recv_target {
+    parameter documentation = "The NumberOutput for received packets.";
+    is number_output_templ;
+}
+
+connect pkt_lost_target {
+    parameter documentation = "The NumberOutput for lost packets.";
+    is number_output_templ;
+}
+
+connect contention_target {
+    parameter documentation = "The NumberOutput for contention times.";
+    is number_output_templ;
+}
+
+port reset {
+    implement signal {
+        method signal_raise() {
+            log "info", 2: "hard reset";
+            call $dev.hard_reset();
+            call $received_frames_count.reset();
+            call $sent_frames_count.reset();
+            call $lost_frames_count.reset();
+            call $contention_count.reset();
+        }
+
+        method signal_lower() {}
+    }
+}
+
+
+method post_init() {
+    call $id_target.update($id);
+}

@@ -1,0 +1,79 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device x58_core;
+param classname = "x58-core";
+
+param desc = "Intel® X58 Core functions";
+param documentation =
+    "PCIe Core Functions in the Intel® X58 Express Chipset.";
+
+param limitations = "Except for Intel® VT-d, the device is mostly dummy";
+
+import "x58-common.dml";
+import "core-f0.dml";
+import "core-f1.dml";
+import "core-f2.dml";
+import "core-f3.dml";
+
+is pcie_multifunction_endpoint;
+
+template cfg_with_caps is x58_ep_config {
+    register capabilities_ptr { param init_val = 0x40; }
+
+    group exp is exp_capability {
+        param base = 0x40;
+        param next_ptr = 0x0;
+        param has_links = true;
+        param has_slots = true;
+        param has_root = true;
+        param dp_type = PCIE_DP_Type_RCiEP;
+        register capability {
+            field si {
+                param init_val = 0;
+                param writable_after_hreset = true;
+            }
+        }
+        group device {
+            register cap {
+                field rber { param init_val = 0x1; }
+                field flrc { param init_val = 0x0; }
+            }
+        }
+        group link {
+            register cap {
+                field l1el   { param init_val = 0x7; }
+                field sder   { param init_val = 0x1; }
+                field dlllar { param init_val = 0x1; }
+                field lbn    { param init_val = 0x1; }
+            }
+            register status {
+                field scc { param init_val = 0x1; }
+            }
+        }
+        group slot {
+            register control {
+                field aic { param init_val = 0x3; }
+                field pic { param init_val = 0x3; }
+                field pcc { param init_val = 0x1; }
+            }
+        }
+        group root {
+            register cap {
+                field csv  { param init_val = 0x1; }
+            }
+        }
+    }
+}

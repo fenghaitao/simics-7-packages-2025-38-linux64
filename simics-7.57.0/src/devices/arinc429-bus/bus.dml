@@ -1,0 +1,171 @@
+/*
+ bus.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device arinc429_bus;
+
+parameter desc = "model of Arinc-429 protocol bus";
+parameter documentation = "Object that delivers Arinc-429 traffic from one"
+                        + " transmitter to one or many receivers.";
+parameter limitations = "Best case implementation based on public information.";
+
+import "simics-api.dml";
+import "arinc-429.dml";
+
+typedef struct {
+    conf_object_t *obj;
+    const char *port;
+    const arinc429_receiver_interface_t *iface;
+} receiving_device_t;
+
+attribute receivers {
+    parameter type = "[o|[os]*]";
+    parameter documentation = "Receiver ports on the bus. Must implement the "
+        + ARINC429_RECEIVER_INTERFACE + " interface.";
+
+    data receiving_device_t *devs;
+    data int n_devs;
+
+    method get() -> (attr_value_t attr) {
+        local int i;
+        attr = SIM_alloc_attr_list($n_devs);
+        for (i = 0; i < $n_devs; i++) {
+            local attr_value_t a;
+            local receiving_device_t *dev = &$devs[i];
+            if (dev->port != NULL) {
+                a = SIM_make_attr_list(2,
+                                       SIM_make_attr_object(dev->obj),
+                                       SIM_make_attr_string(dev->port));
+            } else {
+                a = SIM_make_attr_object(dev->obj);
+            }
+            SIM_attr_list_set_item(&attr, i, a);
+        }
+    }
+
+    method fill_array(attr_value_t val) {
+        local int i;
+        for (i = 0; i < $n_devs; i++) {
+            local receiving_device_t *dev = &$devs[i];
+            local attr_value_t a = SIM_attr_list_item(val, i);
+            if (SIM_attr_is_list(a)) {
+                dev->obj = SIM_attr_object(SIM_attr_list_item(a, 0));
+                dev->port = MM_STRDUP(
+                    SIM_attr_string(SIM_attr_list_item(a, 1)));
+                dev->iface = SIM_get_port_interface(
+                    dev->obj, ARINC429_RECEIVER_INTERFACE, dev->port);
+            } else {
+                dev->obj = SIM_attr_object(a);
+                dev->iface = SIM_get_interface(dev->obj,
+                                               ARINC429_RECEIVER_INTERFACE);
+            }
+            if (dev->iface == NULL) {
+                log "error": "can not get %s interface from receiver %s",
+                    ARINC429_RECEIVER_INTERFACE, SIM_object_name(dev->obj);
+                throw;
+            }
+        }
+    }
+
+    method free_devs() {
+        local int i;
+        if ($devs == NULL) {
+            // no need to do further free
+            return;
+        }
+        for (i = 0; i < $n_devs; i++) {
+            local receiving_device_t *dev = &$devs[i];
+            MM_FREE(cast(dev->port, char*));
+            dev->port = NULL;
+        }
+        MM_FREE($devs);
+        $devs = NULL;
+        $n_devs = 0;
+    }
+
+    method set(attr_value_t val) {
+        local receiving_device_t *t;
+        call $free_devs();
+
+        $n_devs = SIM_attr_list_size(val);
+        $devs = new receiving_device_t[$n_devs];
+        try {
+            inline $fill_array(val);
+        } catch {
+            call $free_devs();
+            throw;
+        }
+    }
+}
+
+implement arinc429_bus {
+    method send_word(uint32 word, int parity_ok) {
+        local uint1 p;
+        local int i;
+        static hap_type_t frame_hap = -1;
+        local attr_value_t empty;
+
+        call $parity_32(word) -> (p);
+        if (parity_ok == 1) {
+            if (!p) word ^= 0x80000000;
+        } else if (parity_ok == 0) {
+            if (p) word ^= 0x80000000;
+        } else if (parity_ok == -1) {
+            parity_ok = p;
+        } else {
+            log "error":
+                "wrong value of parity_ok: %d, valid values: -1, 0, 1",
+                parity_ok;
+            return;
+        }
+
+        // Invoke eventual hap handlers
+        $last_word = word;
+        if (frame_hap == -1)
+            frame_hap = SIM_hap_get_number("Arinc429_Word");
+
+        empty = SIM_alloc_attr_list(0);
+        SIM_hap_occurred_always(frame_hap, $obj, 0, &empty);
+        SIM_attr_free(&empty);
+
+        // $last_word could be changed in the Arinc429_Word
+        // hap handlers
+        if ($last_word != word) {
+            if ($last_word == -1) {
+                log "info", 4: "dropping packet";
+                return;
+            }
+            /* recalculate parity */
+            log "info", 4: "packet changed by hap, recalculating parity";
+            word = $last_word;
+            call $parity_32(word) -> (parity_ok);
+        }
+
+        log "info", 3: "broadcasting 0x%x on the bus (%s parity)",
+            word, parity_ok == 1 ? "correct" : "wrong";
+        for (i = 0; i < $receivers.n_devs; i++) {
+            local receiving_device_t *dev = &$receivers.devs[i];
+            dev->iface->receive_word(dev->obj, word, parity_ok);
+        }
+    }
+}
+
+attribute last_word {
+    parameter documentation = "Attribute that represents the word being sent,"
+                            + "for use by Arinc429_Word hap handlers."
+                            + " Set to -1 to drop this word.";
+    parameter configuration = "pseudo";
+    parameter allocate_type = "int64";
+}

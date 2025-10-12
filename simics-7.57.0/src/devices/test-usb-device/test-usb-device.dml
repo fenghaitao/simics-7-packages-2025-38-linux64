@@ -1,0 +1,116 @@
+/*
+  © 2013 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device test_usb_device;
+
+parameter desc = "tests a USB device";
+parameter documentation = "A test device that can be" 
+                        + " used for USB tablet testing.";
+
+import "simics/utils.dml";
+import "simics/devs/usb.dml";
+
+constant Tablet_HID_Data_Size = 6;
+
+connect usb_dev{
+    interface usb_device;
+}
+
+data usb_transfer_t transfer;
+
+attribute tablet_hid_data {
+    parameter configuration = "pseudo";
+    parameter documentation = "The USB HID report data";
+    parameter type = "[iiiiii]";
+    
+    method get() -> (attr_value_t attr) {
+        local int idx;
+        attr = SIM_alloc_attr_list(Tablet_HID_Data_Size);
+        for (idx = 0; idx < Tablet_HID_Data_Size; idx++)
+            SIM_attr_list_set_item(&attr, idx, SIM_make_attr_uint64(
+                                   dbuffer_read_all($transfer.buf)[idx]));
+    }
+}
+
+attribute transfer_dbuffer {
+    parameter configuration = "pseudo";
+    parameter documentation = "The content of the dbuffer.";
+    parameter type = "d";
+    
+    method get() -> (attr_value_t attr) {
+        attr = SIM_make_attr_data(dbuffer_len($transfer.buf),
+                               dbuffer_read_all($transfer.buf));
+    }
+}
+
+attribute transfer_size {
+    parameter configuration = "pseudo";
+    parameter documentation = "The size of the USB transfer.";
+    parameter type = "i";
+    
+    method get() -> (attr_value_t attr) {
+            attr = SIM_make_attr_uint64($transfer.size);
+    }
+}
+
+attribute transfer_status {
+    parameter configuration = "pseudo";
+    parameter documentation = "The status of the USB transfer.";
+    parameter type = "i";
+
+    method get() -> (attr_value_t attr) {
+            attr = SIM_make_attr_uint64($transfer.status);
+    }
+}
+
+attribute usb_transfer {
+    parameter configuration = "pseudo";
+    parameter documentation = "USB transfer data.";
+    parameter type = "[iii[i{5}]ii[d*]i]";
+    
+    method attr_to_tran(attr_value_t attr, usb_transfer_t *transfer){
+        local attr_value_t dev_req = SIM_attr_list_item(attr, 3);
+
+        transfer->buf = new_dbuffer();
+        transfer->function_address                
+            = SIM_attr_integer(SIM_attr_list_item(attr, 0));
+        transfer->endpoint_number                 
+            = SIM_attr_integer(SIM_attr_list_item(attr, 1));
+        transfer->type                            
+            = SIM_attr_integer(SIM_attr_list_item(attr, 2));
+        transfer->u.control_request.bmRequestType 
+            = SIM_attr_integer(SIM_attr_list_item(dev_req, 0));
+        transfer->u.control_request.bRequest      
+            = SIM_attr_integer(SIM_attr_list_item(dev_req, 1));
+        transfer->u.control_request.wValue        
+            = SIM_attr_integer(SIM_attr_list_item(dev_req, 2));
+        transfer->u.control_request.wIndex        
+            = SIM_attr_integer(SIM_attr_list_item(dev_req, 3));
+        transfer->u.control_request.wLength       
+            = SIM_attr_integer(SIM_attr_list_item(dev_req, 4));
+        transfer->direction                       
+            = SIM_attr_integer(SIM_attr_list_item(attr, 4));
+        transfer->size                            
+            = SIM_attr_integer(SIM_attr_list_item(attr, 5));
+        transfer->status                          
+            = SIM_attr_integer(SIM_attr_list_item(attr, 7));
+    }
+
+    method set(attr_value_t attr) {
+        inline $attr_to_tran(attr, &$transfer);
+        $usb_dev.usb_device.submit_transfer(&$transfer);
+    }
+}
+

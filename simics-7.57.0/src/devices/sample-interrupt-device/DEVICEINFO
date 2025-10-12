@@ -1,0 +1,2 @@
+desc: Sample interrupt DML code used as a starting point for writing devices with interrupt functionality
+name: Sample Device With Interrupt Functionality

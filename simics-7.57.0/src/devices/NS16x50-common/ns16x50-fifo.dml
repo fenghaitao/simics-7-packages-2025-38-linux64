@@ -1,0 +1,95 @@
+/*
+  ns16x50-fifo.dml - A checkpointable FIFO queue buffer used in UARTs.
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+// Standard FIFO with checkpointing templated for the two internal FIFO's.
+template fifo
+{
+    parameter type = "d";
+    data uint8 fifo[$fifo_depth];
+    data uint32 len;
+    data int rpoint;
+    method is_full() -> (bool full) {
+        full = ($len == (($in_fifo_mode) ? $fifo_depth : 1));
+    }
+    method push(uint8 value) -> (bool full)
+    {
+        local size_t maxlen;
+        maxlen = ($in_fifo_mode) ? $fifo_depth : 1;
+        if ($len == maxlen) {
+            full = true;
+            log info, 4: "FIFO: '%s' pushed and full.", $qname;
+        } else {
+            local int wpoint = ($rpoint + $len) % $fifo_depth;
+            $fifo[wpoint] = value;
+            full = false;
+            $len++;
+            log info, 4: "FIFO: '%s' pushed, new length: %d", $qname, $len;
+            inline $changed();
+        }
+    }
+    method pop() -> (bool empty, uint8 value)
+    {
+        if ($len == 0) {
+            empty = true;
+            log info, 4: "FIFO: '%s', empty and pop'd.", $qname;
+        } else {
+            value = $fifo[$rpoint];
+            $rpoint = ($rpoint + 1) % $fifo_depth;
+            empty = false;
+            $len--;
+            log info, 4: "FIFO: '%s' pop'd, new length: %d", $qname, $len;
+            inline $changed();
+        }
+    }
+    method get() -> (attr_value_t value)
+    {
+        local uint8* dblock = new uint8[$len];
+        local size_t i;
+        local int o;
+        for (i = 0, o = $rpoint; i < $len; i++, o = (o + 1) % $fifo_depth)
+            dblock[i] = $fifo[o];
+        value = SIM_make_attr_data_adopt($len, dblock);
+    }
+    method set(attr_value_t value)
+    {
+        local const uint8 *dblock = SIM_attr_data(value);
+        local size_t i;
+        local int o;
+        $len = SIM_attr_data_size(value);
+        $rpoint = 0;
+        for (i = 0, o = $rpoint; i < $len; i++, o = (o + 1) % $fifo_depth)
+            $fifo[o] = dblock[i];
+    }
+    method peek() -> (bool empty, uint8 value)
+    {
+        if ($len == 0) {
+            empty = true;
+            log info, 4: "FIFO: '%s' peeked.", $qname;
+        } else {
+            value = $fifo[$rpoint];
+            empty = false;
+            log info, 4: "FIFO: '%s', empty and peak'd.", $qname;
+        }
+    }
+    method clear() {
+        $len = $rpoint = 0;
+        inline $changed();
+    }
+    method changed() default {
+        // Do nothing.
+    }
+}

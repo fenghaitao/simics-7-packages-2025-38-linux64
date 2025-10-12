@@ -1,0 +1,351 @@
+/*
+  endpoint-dma.dml
+
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+//:: pre base {{
+dml 1.4;
+
+device sample_pcie_ats_prs_dma;
+param classname = "sample-pcie-ats-prs-dma";
+param desc = "sample PCIe Endpoint utilizing ATS and PRS for DMA";
+
+param documentation = "DMA endpoint with eight concurrent channels."
+                    + " Each DMA channel starts with allocating the necessary pages"
+                    + " using PRS. The DMA then performs an ATS translation followed"
+                    + " by the actual DMA operating on the translated addresses."
+                    + " After the DMA is finished it issues a stop marker message to the TA"
+                    + " to free up the pages.";
+
+param pcie_version = 6.0;
+
+import "pcie/common.dml";
+
+is pcie_endpoint;
+
+param NBR_CHANNELS = 8;
+
+method umin(uint64 a, uint64 b) -> (uint64) {
+    return a < b ? a : b;
+}
+
+connect device_memory is (map_target) {
+    param documentation = "Memory in device endpoint";
+    param configuration = "required";
+}
+connect irq_dma_done[i < NBR_CHANNELS] is signal_connect {
+    param documentation = "Interrupt signal raised by DMA channel"
+                        + " when it is finished";
+}
+
+
+bank pcie_config {
+    register capabilities_ptr {
+        param init_val = 0x40;
+    }
+    is defining_pm_capability;
+    param pm_offset = capabilities_ptr.init_val;
+    param pm_next_ptr = pm_offset + 0x10;
+
+    is defining_exp_capability;
+    param exp_offset = pm_next_ptr;
+    param exp_next_ptr = 0x0;
+    param exp_dp_type = PCIE_DP_Type_EP;
+
+    is defining_ats_capability;
+    param ats_offset = 0x100;
+    param ats_next_ptr = ats_offset + 0x100;
+
+    is defining_pasid_capability;
+    param pasid_offset = ats_next_ptr;
+    param pasid_next_ptr = pasid_offset + 0x20;
+    group pasid {
+        register capability {
+            field trwps { param init_val = 1; }
+            // pasid in range 0 - 0xfffff
+            field mpw { param init_val = 0x14; }
+        }
+    }
+
+    is defining_prs_capability;
+    param prs_offset = pasid_next_ptr;
+    param prs_next_ptr = 0;
+
+    group prs {
+        register status {
+            field pasid { param init_val = 1; }
+        }
+        method page_response_received(transaction_t *t,
+                                      uint64 addr) -> (bool) {
+
+            if (ATOM_transaction_pcie_prs_page_group_response(t) != NULL
+                && ATOM_transaction_pcie_pasid(t) != NULL) {
+                local pcie_prs_page_group_response_t msg = {
+                    .u16 = ATOM_get_transaction_pcie_prs_page_group_response(t),
+                    ...
+                };
+                local pcie_pasid_info_t pasid = {
+                    .u32 = ATOM_get_transaction_pcie_pasid(t),
+                    ...
+                };
+
+                for (local int i = 0; i < dma.len; i++)
+                    if (dma[i].prs_page_response(msg, pasid))
+                        return true;
+                return false;
+            } else {
+                log error:
+                    "%s, Expected atoms pcie_prs_page_group_response"
+                  + " and pcie_pasid", this.qname;
+                return false;
+            }
+        }
+    }
+}
+
+bank regs {
+    param register_size = 8;
+
+    group channel[i < NBR_CHANNELS ] {
+        register dma_dev @ 0x0 + i * 0x30 {
+            field addr @ [63:12] "64-bit device address for DMA";
+        }
+        register dma_host @ 0x8 + i * 0x30 {
+            field addr @ [63:12] "64-bit host address for DMA";
+        }
+        register dma_len @ 0x10 + i * 0x30 {
+            param documentation = "Max 64k for single DMA transfer";
+            field len @ [15:0];
+        }
+        register dma_start @ 0x18 + i * 0x30 {
+            field start @ [31] "Start DMA" {
+                is write;
+
+                method write(uint64 value) {
+                    if (value == 1) {
+                        if (dma_status.busy.get() != 0) {
+                            log spec_viol: "Cannot start DMA while busy!";
+                            return;
+                        }
+                        local uint64 haddr = dma_host.addr.val << 12;
+                        local int lsbit = pcie_config.ats.control.stu.lsbit();
+                        if (haddr[lsbit - 1:0] != 0) {
+                            log spec_viol:
+                                "DMA host address must be ATS STU aligned";
+                            return;
+                        }
+                        dma[i].start(haddr,
+                                     dma_dev.addr.val << 12,
+                                     dma_len.len.val,
+                                     pasid.pasid.val,
+                                     rnw.val ? true : false);
+                    }
+                }
+            }
+            field rnw @ [0] "DMA Read from host = 1, Write to host = 0";
+        }
+        register dma_status @ 0x20 + i * 0x30 {
+            field busy @ [0] "DMA is busy with ongoing transfer" {
+                is (read, get);
+                method read() -> (uint64) {
+                    return get();
+                }
+                method get() -> (uint64) {
+                    return dma[i].pending ? 1 : 0;
+                }
+            }
+        }
+        register pasid @ 0x28 + i * 0x30 {
+            field pasid @ [19:0] "PASID to be used for DMA transfer";
+        }
+    }
+}
+
+group dma[n < NBR_CHANNELS] {
+    saved bool pending;
+    saved uint64 host_addr;
+    saved uint64 dev_addr;
+    saved uint32 size;
+    saved bool is_read;
+    saved uint20 pasid;
+
+    method start(uint64 host_addr,
+                     uint64 dev_addr,
+                     uint32 size,
+                     uint20 pasid_value,
+                     bool is_read) {
+        assert(!pending);
+        this.pending = true;
+        this.host_addr = host_addr;
+        this.dev_addr = dev_addr;
+        this.size = size;
+        this.is_read = is_read;
+        this.pasid = pasid_value;
+        this.request_pages();
+    }
+    method request_pages() {
+        local int nbr_stus =
+            pcie_config.ats.translation_size_to_entries(size);
+        local uint64 stu_size = pcie_config.ats.control.stu.size();
+        local int nbr_pages = nbr_stus * stu_size / 4096;
+
+        for (local int i = 0; i < nbr_pages; i++) {
+            local pcie_prs_page_request_t request = {
+                .field = {
+                    .r = is_read ? 1 : 0,
+                    .w = is_read ? 0 : 1,
+                    .l = i == (nbr_pages - 1) ? 1 : 0,
+                    .prgi = n,
+                    .page_addr = (this.host_addr + (i * 4096)) >> 12,
+                },
+                ...
+            };
+            local pcie_pasid_info_t p = { .field = { .pasid = this.pasid, ...}, ...};
+            local pcie_error_t ret = pcie_config.prs.page_request(request, &p);
+            if (ret != PCIE_Error_No_Error) {
+                log error:
+                    "%s PRS request denied %s", this.qname, pcie_error_name(ret);
+                return;
+            }
+        }
+    }
+    method prs_page_response(pcie_prs_page_group_response_t msg,
+                             pcie_pasid_info_t p) -> (bool) {
+        if (!this.pending)
+            return false;
+
+        if (p.field.pasid == this.pasid && msg.field.prgi == n) {
+            if (msg.field.response_code == PCIE_PRS_Response_Success) {
+                after: try_ats_and_dma();
+            } else {
+                log info, 1: "Page response indicated error: %s",
+                    pcie_config.prs.response_code_name(msg.field.response_code);
+                this.pending = false;
+            }
+            return true;
+        } else {
+            return false;
+        }
+    }
+    method try_ats_and_dma() {
+        local int nbr_entries =
+            pcie_config.ats.translation_size_to_entries(size);
+        local pcie_ats_translation_completion_entry_t entries[nbr_entries];
+        local bool no_write = is_read;
+
+        // For the DMA the PRS operate on page size, having an STU
+        // greater than 4096 can lead to the follow up ATS request
+        // to be shifted to align with STU, thus pages not allocated by PRS
+        // can here be requested which is not desired. To prevent this
+        // the DMA must align its host address to STU to ensure 1:1 mapping
+        // between PRS requests and ATS translation requests
+        local int stu_lsb = pcie_config.ats.control.stu.lsbit();
+        assert(host_addr[stu_lsb - 1:0] == 0);
+
+        local pcie_pasid_info_t p = { .field = { .pasid = this.pasid, ...}, ...};
+        local pcie_error_t ret;
+        local int valid_entries;
+        (ret, valid_entries) =
+            pcie_config.ats.translation_request(host_addr,
+                                                entries,
+                                                nbr_entries,
+                                                &p,
+                                                no_write,
+                                                false);
+
+        if (ret != PCIE_Error_No_Error) {
+            log error:
+                "%s ATS request denied %s", this.qname, pcie_error_name(ret);
+            return;
+        }
+
+        for (local int i = 0; i < valid_entries; i++) {
+            local (uint64 translated_addr, uint64 txl_size) =
+                pcie_config.ats.get_translation_range(entries[i]);
+
+            local uint64 dma_size = umin(txl_size, this.size);
+            try {
+                do_dma(translated_addr, dev_addr, dma_size, is_read);
+            } catch {
+                log error:
+                    "DMA %s failed for ATS address 0x%08X, device address: 0x%08X",
+                    is_read ? "Read" : "Write", translated_addr, dev_addr;
+                return;
+            }
+            this.size -= dma_size;
+            this.dev_addr += dma_size;
+        }
+        assert(this.size == 0);
+        free_pages();
+        this.pending = false;
+        irq_dma_done[n].set_level(1);
+        irq_dma_done[n].set_level(0);
+    }
+
+    method do_dma(uint64 translated_addr,
+                  uint64 dev_addr,
+                  uint32 size,
+                  bool is_read) throws {
+        if (is_read)
+            dma_read(translated_addr, dev_addr, size);
+        else
+            dma_write(translated_addr, dev_addr, size);
+    }
+
+    method dma_write(uint64 translated_addr,
+                     uint64 dev_addr,
+                     uint32 size) throws {
+        local uint8 data[size];
+
+        local bytes_t buf = { .data = data, . len = size };
+
+        device_memory.read_bytes(dev_addr, size, data);
+
+        local pcie_pasid_info_t p = { .field = { .pasid = this.pasid, ...}, ...};
+        local pcie_error_t ret;
+        ret = pcie_config.ats.memory_write_bytes(buf,
+                                                 translated_addr,
+                                                 PCIE_AT_Translated,
+                                                 &p);
+        if (ret != PCIE_Error_No_Error)
+            throw;
+    }
+
+    method dma_read(uint64 translated_addr,
+                    uint64 dev_addr,
+                    uint32 size) throws {
+        local uint8 data[size];
+        local buffer_t buf = { .data = data, . len = size };
+        local pcie_pasid_info_t p = { .field = { .pasid = this.pasid, ...}, ...};
+
+        local pcie_error_t ret;
+        ret = pcie_config.ats.memory_read_buf(buf,
+                                              translated_addr,
+                                              PCIE_AT_Translated,
+                                              &p);
+        if (ret != PCIE_Error_No_Error)
+            throw;
+
+        device_memory.write_bytes(dev_addr, size, data);
+    }
+    method free_pages() {
+        local pcie_pasid_info_t p = { .field = { .pasid = this.pasid, ...}, ...};
+        local pcie_error_t ret = pcie_config.prs.send_stop_marker(&p);
+
+        if (ret != PCIE_Error_No_Error) {
+            log error: "Failed to free pages for PASID %d: %s",
+                p.u32, pcie_error_name(ret);
+        }
+    }
+}
+// }}

@@ -1,0 +1,219 @@
+/*
+  firewire-common.dml - Common firewire code
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+bitorder be;
+
+import "simics/devs/firewire.dml";
+
+header %{
+#include <simics/devs/firewire.h>
+
+static UNUSED uint32
+fw_extract_quadlet(dbuffer_t *packet, int index)
+{
+    const uint8 *b = dbuffer_read(packet, index * 4, 4);
+    return LOAD_BE32((uint32 *)b);
+}
+
+static UNUSED uint8
+fw_extract_tcode(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return (q >> 4) & 0xf;
+}
+
+static UNUSED uint8
+fw_extract_label(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return (q >> 10) & 0x3f;
+}
+
+static UNUSED uint8
+fw_extract_channel(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return (q >> 8) & 0x3f;
+}
+
+static UNUSED uint8
+fw_extract_tag(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return (q >> 14) & 0x3;
+}
+
+static UNUSED uint8
+fw_extract_sync(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return q & 0xf;
+}
+
+static UNUSED uint16
+fw_extract_iso_data_length(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return (q >> 16) & 0xffff;
+}
+
+static UNUSED uint16
+fw_extract_destination_id(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 0);
+    return (q >> 16) & 0xffff;
+}
+
+static UNUSED uint16
+fw_extract_source_id(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 1);
+    return (q >> 16) & 0xffff;
+}
+
+static UNUSED uint16
+fw_extract_data_length(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 3);
+    return (q >> 16) & 0xffff;
+}
+
+static UNUSED uint16
+fw_extract_extended_tcode(dbuffer_t *packet)
+{
+    uint32 q = fw_extract_quadlet(packet, 3);
+    return q & 0xffff;
+}
+
+static UNUSED uint64
+fw_extract_address(dbuffer_t *packet)
+{
+    uint32 q1 = fw_extract_quadlet(packet, 1);
+    uint32 q2 = fw_extract_quadlet(packet, 2);
+    return ((uint64)(q1 & 0xffff) << 32) | q2;
+}
+
+static UNUSED int
+is_fw_packet_potentially_valid(dbuffer_t *packet)
+{
+    return (packet != NULL) && (dbuffer_len(packet) >= 8);
+}
+
+static UNUSED int
+is_fw_packet_size_correct(dbuffer_t *packet)
+{
+    unsigned header_size = 0;
+    switch (fw_extract_tcode(packet)) {
+    case Firewire_Write_Quadlet:
+    case Firewire_Write_Block:
+    case Firewire_Read_Block:
+    case Firewire_Lock:
+    case Firewire_Read_Quadlet_Response:
+    case Firewire_Read_Block_Response:
+    case Firewire_Lock_Response:
+    case Firewire_Cycle_Start:
+        header_size = 20;
+        break;
+    case Firewire_Read_Quadlet:
+    case Firewire_Write_Response:
+        header_size = 16;
+        break;
+    case Firewire_Streaming:
+        header_size = 8;
+        break;
+    default:
+        ASSERT(0);
+    }
+    if (dbuffer_len(packet) < header_size) return 0;
+    
+    unsigned data_length = 0;
+    switch (fw_extract_tcode(packet)) {
+    case Firewire_Write_Block:
+    case Firewire_Read_Block_Response:
+    case Firewire_Lock:
+    case Firewire_Lock_Response:
+        data_length = fw_extract_data_length(packet);
+        break;
+    case Firewire_Streaming:
+        data_length = fw_extract_iso_data_length(packet);
+        break;
+    case Firewire_Write_Quadlet:
+    case Firewire_Read_Block:
+    case Firewire_Read_Quadlet_Response:
+    case Firewire_Cycle_Start:
+    case Firewire_Read_Quadlet:
+    case Firewire_Write_Response:
+        data_length = 0;
+        break;
+    default:
+        ASSERT(0);
+    }
+    unsigned payload_size = (data_length > 0) 
+        ? (((data_length + 3) & ~3) + 4)
+        : 0;
+    return dbuffer_len(packet) == header_size + payload_size;
+}
+
+static UNUSED int
+is_fw_packet_phy(dbuffer_t *packet)
+{
+    if (dbuffer_len(packet) != 8)
+        return 0;
+    uint32 q1 = fw_extract_quadlet(packet, 0);
+    uint32 q2 = fw_extract_quadlet(packet, 1);
+    return ~q2 == q1;
+}
+
+%}
+extern uint32 fw_extract_quadlet(dbuffer_t *packet, int index);
+extern uint8 fw_extract_tcode(dbuffer_t *packet);
+extern uint8 fw_extract_label(dbuffer_t *packet);
+extern uint8 fw_extract_channel(dbuffer_t *packet);
+extern uint16 fw_extract_destination_id(dbuffer_t *packet);
+extern uint16 fw_extract_source_id(dbuffer_t *packet);
+extern uint16 fw_extract_data_length(dbuffer_t *packet);
+extern uint16 fw_extract_extended_tcode(dbuffer_t *packet);
+extern uint64 fw_extract_address(dbuffer_t *packet);
+extern uint8 fw_extract_tag(dbuffer_t *packet);
+extern uint8 fw_extract_sync(dbuffer_t *packet);
+extern uint16 fw_extract_iso_data_length(dbuffer_t *packet);
+extern int is_fw_packet_potentially_valid(dbuffer_t *packet);
+extern int is_fw_packet_size_correct(dbuffer_t *packet);
+extern int is_fw_packet_phy(dbuffer_t *packet);
+
+/*
+ * Typedefs for various packet variants to make it easier to pack/unpack them.
+ */
+typedef layout "big-endian" {
+    uint16 destination_id;
+    bitfields 16 {
+        uint6 label @ [0:5];
+        uint2 rt @ [6:7];
+        uint4 tcode @ [8:11];
+        uint4 res @ [12:15];
+    } h;
+    uint16 source_id;
+    bitfields 16 {
+        uint4 rcode @ [0:3];
+        uint12 res @ [4:15];
+    } addrh;
+    uint32 addrl;
+    bitfields 32 {
+        uint16 data_length @ [0:15];
+        uint16 extended_tcode @ [16:31];
+    } quadlet;
+    uint32 crc;
+} async_packet_t;

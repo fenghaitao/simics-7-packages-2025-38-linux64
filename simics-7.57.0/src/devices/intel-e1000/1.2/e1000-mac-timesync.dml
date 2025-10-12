@@ -1,0 +1,291 @@
+/*
+  e1000-mac-timesync.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "io-memory.dml";
+import "utility.dml";
+
+parameter TIME_SYNC_PERIOD_IN_NS = 1000.0 / 48.0;
+
+parameter TM_RX_TYPE_V2_ON_L2   = 0b000;
+parameter TM_RX_TYPE_V1_ON_L4   = 0b001;
+parameter TM_RX_TYPE_V2_ON_L2_L4= 0b010;
+parameter TM_RX_TYPE_ALL        = 0b100;
+parameter TM_RX_TYPE_V2_EVENT   = 0b101;
+
+// ICH Time Sync Registers
+bank csr {
+if ($HAS_TIMESYNC) {
+    register systiml @ 0x0B600 "System Time Register Low";
+    register systimh @ 0x0B604 "System Time Register High";
+    register timinca @ 0x0B608 "Increment Attributes Register";
+    register timadjl @ 0x0B60C "Time Adjustment Offset Register Low";
+    register timadjh @ 0x0B610 "Time Adjustment Offset Register High";
+    register tsynctxctl @ 0x0B614 "TX Time Sync Control Register";
+    register txstmpl @ 0x0B618 "TX Time Stamp Low";
+    register txstmph @ 0x0B61C "TX Time Stamp High";
+    register tsyncrxctl @ 0x0B620 "RX Time Sync Control Register";
+    register rxstmpl @ 0x0B624 "RX Time Stamp Low";
+    register rxstmph @ 0x0B628 "RX Time Stamp High";
+    register rxsatrl @ 0x0B62C "RX Time Stamp Attributes Low";
+    register rxsatrh @ 0x0B630 "RX Time Stamp Attributes High";
+    register rxcfgl  @ 0x0B634 "RX Ethertype and Message Type";
+    register rxudp   @ 0x0B638 "RX UDP Port";
+
+    register timadjl is (unimplemented);
+    register timadjh is (unimplemented);
+}
+}
+
+bank csr {
+if ($HAS_TIMESYNC) {
+    register timinca {
+        field iv[23:0]  "Increment Value";
+        field ip[31:24] "Increment Period";
+    }
+
+    register timadjh {
+        field tadjh[30:0]   "Time Adjustment Value High";
+        field sign[31]      "Sign";
+    }
+
+    register tsynctxctl {
+        field sequenceid[31:16] "Sequence ID";
+        field txtt[0]   "TX Time Stamp Valid";
+        field en[4]     "Enable TX Timestamp";
+    }
+
+    register tsyncrxctl {
+        field rxtt[0]   "RX Time Stamp Valid";
+        field type[3:1] "Type";
+        field en[4]     "Enable RX Time Stamp";
+    }
+
+    register rxsatrh {
+        field sourceidh[15:0]   "Source UUID High";
+        field sequenceid[31:16] "Sequence ID";
+    }
+
+    register rxcfgl {
+        field ptpl2[15:0]   "PTP L2 EtherType to Time Stamp";
+        field v1[23:16]     "V1 Control to Time Stamp";
+        field v2[31:24]     "V2 MessageId to Time Stamp";
+
+        field ptpl2 { parameter hard_reset_value = 0xF788; }
+    }
+
+    register rxudp {
+        field uport[15:0]   "UDP Port Number to Time Stamp";
+
+        field uport { parameter hard_reset_value = 0x1903; }
+    }
+
+    register txstmph {
+        method after_read(generic_transaction_t *memop) {
+            if ($tsynctxctl.txtt != 0) {
+                log "info", 3: "TX time stamp valid bit is cleared";
+                $tsynctxctl.txtt = 0;
+            }
+        }
+    }
+
+    register rxstmph {
+        method after_read(generic_transaction_t *memop) {
+            if ($tsyncrxctl.rxtt != 0) {
+                log "info", 3: "RX time stamp valid bit is cleared";
+                $tsyncrxctl.rxtt = 0;
+            }
+        }
+    }
+
+    method check_timesync_before_send(dbuffer_t *frame,tcp_ip_data_desc_t *td) {
+        local bool   locked;
+        local uint64 counter;
+
+        if (td->desc.dext == 0b1 && td->desc.dtyp == 0b0001
+            && td->desc.ts == 0b1 && $tsynctxctl.en) {
+            inline $check_tx_stamp_lock() -> (locked);
+            if (locked)
+                return;
+            log "info", 4: "try to time stamp a TX packet with its TD at 0x%x",
+                $tx_descriptor.daddr;
+            inline $get_sys_time_in_incr() -> (counter);
+            if (counter > 0) {
+                $txstmpl = $systiml = counter & ((1 << 32) - 1);
+                $txstmph = $systimh = counter >> 32;
+                $tsynctxctl.txtt = 1;
+                log "info", 3: "time stamp a TX packet at time 0x%x:0x%x",
+                    $systimh, $systiml;
+            }
+        }
+    }
+
+    // Check PTP message overy layer 2
+    method check_timesync_post_l1_parse(dbuffer_t *buf, const uint8 *frame,
+                                       frame_info_t *info) {
+        local const uint8 *msg;
+        if ($tsyncrxctl.en == 0) {
+            info->drop_it = true;
+            log "info", 3: "RX time stamp is disabled, drop a PTP packet";
+        }
+        info->l2_parse = false;
+        info->drop_it = false;
+        msg = dbuffer_read(buf, 14, dbuffer_len(buf) - 14);
+        inline $parse_ptp_message(msg, 2) -> (info->tst);
+    }
+
+    // Check PTP message overy layer 4
+    method check_timesync_post_l3_parse(const dbuffer_t *buf,
+                                        frame_info_t *info) {
+        local int len;
+        local const uint8 *msg;
+
+        if ($tsyncrxctl.en == 0) {
+            info->drop_it = true;
+            log "info", 3:
+                "RX time stamp is disabled, drop a PTP packet over layer 4";
+            return;
+        }
+
+        len = dbuffer_len(buf) - info->l4_index;
+        if (len <= 0) {
+            log "info", 3: "%s %zd is not longer than layer 4 offset %d",
+                "packet length", dbuffer_len(buf), info->l4_index;
+            info->drop_it = false;
+            return;
+        }
+        info->drop_it = false;
+        msg = dbuffer_read(cast(buf, dbuffer_t *), info->l4_index, len);
+        inline $parse_ptp_message(msg, 4) -> (info->tst);
+    }
+
+    // Parse V1/V2 PTP message and compare its fields to see whether to stamp
+    method parse_ptp_message(const uint8 *msg, int layer) -> (uint1 stamped) {
+        local bool   locked;
+        local bool   passed;
+        local uint64 counter;
+        local const ptp_v1_message_header_t *p1;
+        local const ptp_v2_message_header_t *p2;
+
+        p1 = cast(msg, const ptp_v1_message_header_t *);
+        p2 = cast(msg, const ptp_v2_message_header_t *);
+
+        stamped = 0;
+        if (p1->ver_ptp == 1) {
+            if (p1->control == $rxcfgl.v1) {
+                inline $check_rx_stamp_lock() -> (locked);
+                if (locked && $tsyncrxctl.type != $TM_RX_TYPE_ALL)
+                    return;
+                if ((($tsyncrxctl.type != $TM_RX_TYPE_V1_ON_L4)
+                      && $tsyncrxctl.type != $TM_RX_TYPE_ALL)
+                    || ($tsyncrxctl.type == $TM_RX_TYPE_V1_ON_L4 && layer != 4)
+                   ) {
+                    log "info", 3: "this V1 PTP on layer %d is omitted", layer;
+                    return;
+                }
+                inline $get_sys_time_in_incr() -> (counter);
+                if (counter > 0) {
+                    $tsyncrxctl.rxtt = 1;
+                    stamped = ($tsyncrxctl.type == $TM_RX_TYPE_ALL) ? 0 : 1;
+                    $rxstmpl = $systiml = counter & ((1 << 32) - 1);
+                    $rxstmph = $systimh = counter >> 32;
+                    $rxsatrl = UNALIGNED_LOAD_BE32(&p1->src_uuid[2]);
+                    $rxsatrh.sourceidh = UNALIGNED_LOAD_BE16(&p1->src_uuid[0]);
+                    $rxsatrh.sequenceid = UNALIGNED_LOAD_BE16(&p1->seq_id);
+                    log "info", 3: "time stamp a RX packet at time 0x%x:0x%x",
+                        $systimh, $systiml;
+                }
+            } else {
+                log "info", 3: "%s 0x%x in this V1 PTP message is not %s %d",
+                    "control field", p1->control, "the expected", $rxcfgl.v1;
+            }
+        } else if (p2->ver_ptp == 2) {
+            if (p2->msg_id == $rxcfgl.v2) {
+                inline $check_rx_stamp_lock() -> (locked);
+                if (locked && $tsyncrxctl.type != $TM_RX_TYPE_ALL)
+                    return;
+                passed = false;
+                if (($tsyncrxctl.type == $TM_RX_TYPE_V2_ON_L2 && layer == 2)
+                    || ($tsyncrxctl.type == $TM_RX_TYPE_V2_ON_L2_L4
+                        && layer == 4)
+                    || ($tsyncrxctl.type == $TM_RX_TYPE_V2_EVENT
+                        && (((p2->msg_id >> 3) & 0x1) == 0))
+                    || ($tsyncrxctl.type == $TM_RX_TYPE_ALL))
+                    passed = true;
+                if (!passed) {
+                    log "info", 3: "this V2 PTP on layer %d is omitted", layer;
+                    return;
+                }
+                inline $get_sys_time_in_incr() -> (counter);
+                if (counter > 0) {
+                    $tsyncrxctl.rxtt = 1;
+                    stamped = ($tsyncrxctl.type == $TM_RX_TYPE_ALL) ? 0 : 1;
+                    $rxstmpl = $systiml = counter & ((1 << 32) - 1);
+                    $rxstmph = $systimh = counter >> 32;
+                    $rxsatrl = UNALIGNED_LOAD_BE32(&p2->src_uuid[2]);
+                    $rxsatrh.sourceidh = UNALIGNED_LOAD_BE16(&p2->src_uuid[0]);
+                    $rxsatrh.sequenceid = UNALIGNED_LOAD_BE16(&p2->seq_id);
+                    log "info", 3: "time stamp a RX packet at time 0x%x:0x%x",
+                        $systimh, $systiml;
+                }
+            } else {
+                log "info", 3: "%s 0x%x in this V2 PTP message is not %s %d",
+                    "message ID", p2->msg_id, "the expected", $rxcfgl.v2;
+            }
+        } else {
+            log "info", 3: "PTP version(%d %s, %d %s) is not 1 or 2",
+                p1->ver_ptp, "in V1 format", p2->ver_ptp, "in V2 format";
+        }
+    }
+
+    // Get hardware system time in the unit of incremental, 0 if no incremental
+    method get_sys_time_in_incr() -> (uint64 counter) {
+        local double cur_time = SIM_time($dev.obj);
+        local double unit_in_ns;
+
+        if ($timinca.ip > 0) {
+            unit_in_ns = $timinca.ip * $TIME_SYNC_PERIOD_IN_NS;
+            counter = cur_time * 1e9 * $timinca.iv / unit_in_ns;
+            log "info", 4: "%s: %f seconds, %s: %f ns, %s: 0x%x",
+                "current time", cur_time,
+                "time per incremental", unit_in_ns,
+                "counter of time stamp", counter;
+        } else {
+            log "info", 2: "increment period is 0, no system time counted";
+            counter = 0;
+        }
+    }
+
+    method check_rx_stamp_lock() -> (bool locked) {
+        locked = false;
+        if ($tsyncrxctl.rxtt == 1) {
+            log "info", 2: "%s is locked in TimeSync registers, %s",
+                "one RX time stamp", "please read it to free it";
+            locked = true;
+        }
+    }
+
+    method check_tx_stamp_lock() -> (bool locked) {
+        locked = false;
+        if ($tsynctxctl.txtt == 1) {
+            log "info", 2: "%s is locked in TimeSync registers, %s",
+                "one TX time stamp", "please read it to free it";
+            locked = true;
+        }
+    }
+
+}
+}

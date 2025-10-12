@@ -1,0 +1,223 @@
+/*
+  © 2018 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  toggle-i2c  : I2C device that reports the state of a toggle in a system panel
+              : Part of Simics training materials
+
+              : Version 3 change - using uint64 instead of signal interface
+
+*/
+
+dml 1.4;
+
+device toggle_i2c;
+
+param desc = "toggle on I2C bus";
+
+param documentation = "I2C device that reports the state of a toggle. " +
+                      "Assume that the toggle is simulated in a System Panel.";
+
+
+//=============================================================================
+// I2C interface
+// 
+// Writes do nothing
+// Reads report the state of the attached toggle as "1" or "0"
+//
+//-----------------------------------------------------------------------------
+import "utility.dml";
+import "simics/devs/i2c.dml";
+import "simics/model-iface/state.dml"; 
+
+
+loggroup i2c_comms;
+
+// I2C link connection - back towards master
+connect i2c_link {
+    param desc = "I2C link Connection";
+    param configuration = "optional";
+    interface i2c_master_v2;
+}
+
+port i2c_in {
+    param desc = "Inbound I2C traffic";
+
+    // i2c_slave_v2 interface - inbound to this device 
+    implement i2c_slave_v2 {
+        method start(uint8 address) {
+            log info, 4, i2c_comms: "i2c_slave.start_request(0x%x)", address;
+    
+            // is this for this device?
+            if (address[7:1] == dev.address.val) {
+                // acknowledge start request
+                log info, 2, i2c_comms: "i2c start message targeting device received (addr=0x%.2x)", address;
+                
+                // Comms now inside a transaction 
+                i2cregs.transaction_state.active.set_val(1);            
+                
+                // and then send ack to master that we did indeed get it 
+                i2c_link.i2c_master_v2.acknowledge(I2C_ack);
+            } else {
+                // OK, start was for some other device. 
+                // Make sure that we are not thinking we are active. 
+                i2cregs.transaction_state.active.set_val(0);  
+                // And send a noack 
+                i2c_link.i2c_master_v2.acknowledge(I2C_noack);
+            }
+        }
+    
+        method read() {
+            // Log that we receive
+            log info, 4, i2c_comms: "read incoming";
+                            
+            // Check if we are in a transaction at all
+            if (i2cregs.transaction_state.active.get_val() == 1) {
+                local uint8 readvalue;
+                readvalue = i2cregs.toggle_state.val; 
+                
+                // some helpful logging
+                log info, 2, i2c_comms: "I2C read received, inside transaction";
+                log info, 3 : "I2C read of toggle value: replying with %d", readvalue;
+                
+                // Reply with the current toggle value
+                i2c_link.i2c_master_v2.read_response(readvalue);
+                
+            } 
+            else
+            {
+                // Active is zero but we got a read
+                log spec_viol, 1, i2c_comms: "I2C read seen without preceding start, replying zero";
+                i2c_link.i2c_master_v2.read_response(0);            
+            }
+            
+        }
+    
+        method write(uint8 value) {
+            // Log that we receive
+            log info, 4, i2c_comms: "write incoming";
+            
+            // Check if we are in a transaction at all
+            if (i2cregs.transaction_state.active.get_val() == 1) {
+                // This is ours
+                log info, 2, i2c_comms: "I2C write received, inside transaction, value = 0x%.2x", value;
+                
+                // acknowledge write request
+                i2c_link.i2c_master_v2.acknowledge(I2C_ack);
+    
+                // save last written byte for diagnostics
+                written_value.val = value;
+    
+                // And log that we do not care about writes, this is a read-only device
+                log spec_viol, 1: "I2C toggle does not have any writable registers";
+            
+            } 
+            else
+            {
+                // Active is zero but we got a write
+                log spec_viol, 1, i2c_comms: "I2C write seen without preceding start, ignoring";
+            }
+        }
+    
+        method stop() {
+            // Log that we see a stop - 
+            // i2c in Simics makes ALL devices see this, even if they were
+            // not the device targeted by the current transaction 
+            log info, 4, i2c_comms: "stop incoming";
+            
+            // If we are active, log that we got a stop
+            if (i2cregs.transaction_state.active.get_val() == 1) {
+                log info, 2, i2c_comms: "stop received inside transaction, setting device state to inactive";
+                // terminate the transaction
+                i2cregs.transaction_state.active.set_val(0);
+                // do not send an ACK - I2C protocol is done once we see
+                // the stop message and does not expect or accept an ack from here 
+            }
+        }
+    
+        method addresses() -> (attr_value_t) {
+            local attr_value_t result;
+            result = SIM_make_attr_list(
+                2, SIM_make_attr_uint64(address.val * 2),
+                SIM_make_attr_uint64(address.val * 2 + 1));
+            return result;
+        }
+    }
+} // end of port
+
+attribute address is (uint64_attr) {
+    param documentation = "7-bit address on the i2c bus. It can be any "
+        + "valid i2c address in range of [0, 127].";
+    param configuration = "required";
+}
+
+
+//=============================================================================
+// Uint64 interface from the system panel (or other source)
+// 
+// Note that the device needs to keep track of the current state locally, 
+// since signal interfaces only report changes, not the current state. 
+//
+//-----------------------------------------------------------------------------
+port toggle_in {
+    param desc = "Toggle stat update (typically from a panel)";
+    
+    implement uint64_state {
+        method set(uint64 val) {
+            if(val>1) {
+                log error: "Toggle state set attempted for %d !=[0,1]", val;
+                i2cregs.toggle_state.val = 1;
+            } else {
+                log info, 2: "Toggle state change to %d", val;
+                i2cregs.toggle_state.val = val;
+            }
+        }
+    }
+}
+
+
+
+//=============================================================================
+// Device registers 
+// - The registers could be done as attributes as they are not memory-mapped
+// - Putting them with addresses in a bank makes them visible to various
+//   inspection tools
+// - Register offsets are old-school byte-packed
+//-----------------------------------------------------------------------------
+
+bank i2cregs {
+    // Put I2C registers into a register bank for debug access from Simics
+    // Note that this is not how most i2c devices do their modeling
+    param desc = "Register bank holding I2C state (not software addressable)";
+    
+    param register_size = 1;
+    
+    register toggle_state @ 0x00 is (read_only) "Current state of the toggle";
+        
+    register transaction_state @ 0x03 is (read_only)  {
+        field active   @ [0]   {
+            param desc = "Are we in an active transaction?";
+        }            
+        field rsv  @ [7:1] is (reserved);
+    }
+}
+
+
+
+// For debug and test purposes
+attribute written_value is (uint64_attr) {
+    param documentation = "Last byte written to this device.";
+}
+

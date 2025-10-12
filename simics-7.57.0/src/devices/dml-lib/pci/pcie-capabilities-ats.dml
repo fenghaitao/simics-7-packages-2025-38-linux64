@@ -1,0 +1,338 @@
+/*
+  © 2020 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "dml12-compatibility.dml";
+
+template defining_pcie_ats_capability {
+    is providing_pcie_ats_methods;
+    param ats_offset default undefined;
+    param ats_next_ptr default undefined;
+
+    register ats_capability_header size 4 @ (ats_offset + 0x0) {
+        param documentation = "Capability Header";
+        field id       @ [15:0] is (constant) "Capability ID" {
+            param init_val = 0xf;
+        }
+        field version @ [19:16] is (constant) "Capability Version" {
+            param init_val = 1;
+        }
+        field next_ptr @ [31:20] is (read_only) "Next Capability Offset" {
+            param init_val = ats_next_ptr;
+        }
+    }
+    register ats_capability size 2 @ (ats_offset + 0x4) {
+        field relaxed_ordering_supported  @ [7];
+        field global_invalidate_supported @ [6];
+        field page_aligned_request        @ [5];
+        field invalidate_queue_depth    @ [4:0];
+    }
+    register ats_control size 2 @ (ats_offset + 0x6) {
+        field enable @  [15];
+        field stu    @ [4:0];
+    }
+
+}
+
+template providing_pcie_ats_methods {
+    method ats_translate(uint8 *buf, uint64 addr, uint64 size, uint32 pasid)
+        -> (exception_type_t, pcie_error_t, uint32) {
+        /* Performs an ATS Translation Request. The caller is responsible for
+           setting the fields of the address. The returned exception maps as
+           for all other PCI interfaces, iff Sim_PE_IO_Error is returned further
+           information about the exception can be obtained from the
+           pcie_exception_type_t. The actual number of bytes read is also
+           returned. The payload is written to 'buf'. */
+        try {
+            require_pci_bus();
+            require_pcie_upstream();
+            pci_config_bank.bus_address.update();
+        } catch {
+            return (Sim_PE_IO_Not_Taken, PCIE_Error_Not_Set, 0);
+        }
+
+        local pcie_byte_count_ret_t bc;
+        local pcie_error_ret_t perr;
+        local atom_t atoms[10] = {
+            ATOM_pcie_type(PCIE_Type_Mem),
+            ATOM_pcie_requester_id(get_pcie_rid()),
+            ATOM_pcie_at(PCIE_AT_Translation_Request),
+            ATOM_data(buf),
+            ATOM_size(size),
+            ATOM_pcie_error_ret(&perr),
+            ATOM_pcie_byte_count_ret(&bc),
+            ATOM_initiator(dev.obj),
+            pasid > 0 ? ATOM_pcie_pasid(pasid) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t = { .atoms = atoms, ... };
+        local exception_type_t ex =
+            SIM_issue_transaction(pci_bus.upstream, &t, addr);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "ATS Translation Req %d bytes @ 0x%x failed:"
+                + " %s (%d, %d)", size, addr,
+                describe_pcie_exception(ex, perr.val), ex, perr.val;
+        }
+        return (ex, perr.val, bc.val);
+    }
+
+    method ats_memory_access(uint8 *buf, uint64 addr, uint64 size,
+                             transaction_flags_t flags, pcie_at_t at,
+                             uint32 pasid) -> (exception_type_t) {
+        /* Performs a Memory Request with AT field of the TLP header as
+           specified in the input argument 'at', this should be either of
+           PCIE_AT_Untranslated or PCIE_AT_Translated; to make a translation
+           request use the method 'ats_translate'. The returned exception maps
+           as for all other PCI interfaces, the payload is stored in 'buf'. */
+        try {
+            require_pci_bus();
+            require_pcie_upstream();
+            pci_config_bank.bus_address.update();
+        } catch {
+            return Sim_PE_IO_Not_Taken;
+        }
+
+        if (at != PCIE_AT_Translated && at != PCIE_AT_Untranslated) {
+            log error: "'at' must be either of PCIE_AT_Untranslated or"
+                + " PCIE_AT_Translated when calling ats_memory_access";
+            return Sim_PE_IO_Not_Taken;
+        }
+
+        local atom_t atoms[9] = {
+            ATOM_pcie_type(PCIE_Type_Mem),
+            ATOM_pcie_requester_id(get_pcie_rid()),
+            ATOM_pcie_at(at),
+            ATOM_flags(flags),
+            ATOM_data(buf),
+            ATOM_size(size),
+            ATOM_initiator(dev.obj),
+            pasid > 0 ? ATOM_pcie_pasid(pasid) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t = { .atoms = atoms, ... };
+        local exception_type_t ex =
+            SIM_issue_transaction(pci_bus.upstream, &t, addr);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "Mem%s %d bytes @ 0x%x (%s) fail: %s (%d)",
+                (flags & Sim_Transaction_Write) > 0 ? "Wr" : "Rd",
+                size, addr,
+                at == PCIE_AT_Untranslated ? "Untranslated" : "Translated",
+                describe_pcie_exception(ex, PCIE_Error_Not_Set), ex;
+        }
+        return ex;
+    }
+
+    method ats_invalidate(uint64 translated_addr, uint16 device_id,
+                          uint32 pasid) -> (exception_type_t) {
+        /* This method is used by an RC to send an ATS invalidation message to
+           an endpoint to invalidate a translated address. The caller is
+           responsible for setting the fields of the address. The returned
+           exception maps as for all other PCI interfaces. */
+        try {
+            require_pci_bus();
+            require_pcie_downstream();
+            pci_config_bank.bus_address.update();
+        } catch {
+            return Sim_PE_IO_Not_Taken;
+        }
+
+        local uint8 buf[8];
+        local atom_t atoms[9] = {
+            ATOM_pcie_type(PCIE_Type_Msg),
+            ATOM_pcie_requester_id(get_pcie_rid()),
+            ATOM_pcie_msg_route(PCIE_Msg_Route_ID),
+            ATOM_pcie_msg_type(PCIE_ATS_Invalidate),
+            ATOM_size(8),
+            ATOM_data(buf),
+            ATOM_initiator(dev.obj),
+            pasid > 0 ? ATOM_pcie_pasid(pasid) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t = { .atoms = atoms, ... };
+        SIM_set_transaction_value_le(&t, translated_addr);
+
+        /* The DeviceID must be in the upper 16 bits of the 64-bit address
+           since the lower bits are used to carry data for some message
+           types */
+        local exception_type_t ex = SIM_issue_transaction(
+            pcie_downstream.map_target, &t, device_id << 48);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "Invalidation of 0x%llx (%d:%d.%d) fail: %s (%d)",
+                translated_addr,
+                device_id[15:8], device_id[7:3], device_id[2:0],
+                describe_pcie_exception(ex, PCIE_Error_Not_Set), ex;
+        }
+        return ex;
+    }
+
+    shared method ats_invalidate_received(transaction_t *t, uint64 addr)
+        -> (exception_type_t) default {
+        /* If the device has the template 'providing_pcie_message_port' this
+           method will be called when an ATS Invalidate Msg is received on the
+           pcie_message port */
+        local uint64 invalidated_addr = SIM_get_transaction_value_le(t);
+        log unimpl: "ATS Invalidate for 0x%llx, PASID:%d",
+            invalidated_addr, ATOM_get_transaction_pcie_pasid(t);
+        return Sim_PE_IO_Error;
+    }
+
+    shared method ats_transaction_received(transaction_t *t, uint64 addr)
+        -> (exception_type_t) default {
+        /* If the device has the template 'providing_pcie_upstream_port' this
+           method will be called when a PCIe ATS transaction is received on the
+           upstream port */
+        local pcie_at_t at = ATOM_get_transaction_pcie_at(t);
+        log unimpl: "ATS %s Request for 0x%llx, PASID:%d",
+            at == PCIE_AT_Untranslated ? "Untranslated" :
+            at == PCIE_AT_Translation_Request ? "Translation" :
+            at == PCIE_AT_Translated ? "Translated" : "Invalid",
+            addr, ATOM_get_transaction_pcie_pasid(t);
+
+        local pcie_error_ret_t *pex = ATOM_get_transaction_pcie_error_ret(t);
+        if (pex)
+            pex->val = PCIE_Error_Completer_Abort;
+
+        local pcie_byte_count_ret_t *bc =
+            ATOM_get_transaction_pcie_byte_count_ret(t);
+        if (bc)
+            bc->val = 0;
+
+        return Sim_PE_IO_Error;
+    }
+}
+
+template defining_pcie_prs_capability {
+    is providing_pcie_prs_methods;
+    param prs_offset default undefined;
+    param prs_next_ptr default undefined;
+    register prs_capability_header size 4 @ (prs_offset + 0x0) {
+        param documentation = "Capability Header";
+        field id       @ [15:0] is (constant) "Capability ID" {
+            param init_val = 0x13;
+        }
+        field version @ [19:16] is (constant) "Capability Version" {
+            param init_val = 1;
+        }
+        field next_ptr @ [31:20] is (read_only) "Next Capability Offset" {
+            param init_val = prs_next_ptr;
+        }
+    }
+    register prs_control size 2 @ (prs_offset + 0x4) {
+        field reset  @ [1] is (read_zero);
+        field enable @ [0];
+    }
+    register prs_status size 2 @ (prs_offset + 0x6) {
+        field pasid   @ [15] is (read_only) "PRG Response PASID Required";
+        field stopped @ [8] is (read_only) "Stopped" {
+            param init_val = 1;
+        }
+        field uprgi @ [1] is (write_1_clears) "Unexpected PRGI received";
+        field rf    @ [0] is (write_1_clears) "Response Failure";
+    }
+    register prs_capacity size 4 @ (prs_offset + 0x8) is (read_only);
+    register prs_alloc size 4 @ (prs_offset + 0xc);
+
+}
+
+template providing_pcie_prs_methods {
+    method page_request(uint64 addr, uint32 pasid) -> (exception_type_t) {
+        /* Sends a Page Request message on the PCIe bus upstream port. The
+           caller is responsible for setting the Page Address, PRGI, L, W and R
+           fields of the requested address. The returned exception maps as for
+           all other PCI Interfaces */
+        try {
+            require_pci_bus();
+            require_pcie_upstream();
+            pci_config_bank.bus_address.update();
+        } catch {
+            log error: "Page Request not sent, PCIe bus not connected";
+            return Sim_PE_No_Exception;
+        }
+
+        local atom_t atoms[7] = {
+            ATOM_pcie_type(PCIE_Type_Msg),
+            ATOM_pcie_requester_id(get_pcie_rid()),
+            ATOM_pcie_msg_route(PCIE_Msg_Route_Upstream),
+            ATOM_pcie_msg_type(PCIE_PRS_Request),
+            ATOM_initiator(dev.obj),
+            pasid > 0 ? ATOM_pcie_pasid(pasid) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t = { .atoms = atoms, ... };
+        local exception_type_t ex =
+            SIM_issue_transaction(pci_bus.upstream, &t, addr);
+
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "PCIe Page Request for 0x%x fail: %s (%d)",
+                addr, describe_pcie_exception(ex, PCIE_Error_Not_Set), ex;
+        }
+        return ex;
+    }
+
+    method page_response(uint64 addr, uint32 pasid) -> (exception_type_t) {
+        /* Sends a Page Response message on the PCIe bus downstream port. The
+           caller is responsible for setting the Device ID, Response Code and
+           PRGI fields of 'addr' (which corresponds to DW3 and DW4). The
+           returned exception maps as for all other PCI Interfaces */
+        try {
+            require_pci_bus();
+            require_pcie_downstream();
+            pci_config_bank.bus_address.update();
+        } catch {
+            log error: "Page Request not sent, PCIe bus not connected";
+            return Sim_PE_No_Exception;
+        }
+
+        local atom_t atoms[7] = {
+            ATOM_pcie_type(PCIE_Type_Msg),
+            ATOM_pcie_requester_id(get_pcie_rid()),
+            ATOM_pcie_msg_route(PCIE_Msg_Route_ID),
+            ATOM_pcie_msg_type(PCIE_PRS_Response),
+            ATOM_initiator(dev.obj),
+            pasid > 0 ? ATOM_pcie_pasid(pasid) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t = { .atoms = atoms, ... };
+        local exception_type_t ex = SIM_issue_transaction(
+            pcie_downstream.map_target, &t, addr);
+
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "PCIe Page Response for 0x%x fail: %s (%d)",
+                addr, describe_pcie_exception(ex, PCIE_Error_Not_Set), ex;
+        }
+        return ex;
+    }
+
+    shared method page_request_received(transaction_t *t, uint64 addr)
+        -> (exception_type_t) default {
+        /* If the device has the template 'providing_pcie_message_port' this
+           method will be called when a PRS Page Request is received on the
+           pcie_message port*/
+        log unimpl: "Page Request Message: Page Address 0x%x, PRGI:%d %s%s%s"
+            + " PASID:%d", addr[63:12] << 12, addr[11:3],
+            addr[2] ? "L" : "", addr[1] ? "W" : "", addr[0] ? "R" : "",
+            ATOM_get_transaction_pcie_pasid(t);
+        return Sim_PE_IO_Error;
+    }
+
+    shared method page_response_received(transaction_t *t, uint64 addr)
+        -> (exception_type_t) default {
+        /* If the device has the template 'providing_pcie_message_port' this
+           method will be called when a PRS Page Response is received on the
+           pcie_message port*/
+        log unimpl: "PRG Response Message: Response Code %d, PRGI:%d PASID:%d",
+            addr[47:44], addr[40:32], ATOM_get_transaction_pcie_pasid(t);
+        return Sim_PE_IO_Error;
+    }
+}

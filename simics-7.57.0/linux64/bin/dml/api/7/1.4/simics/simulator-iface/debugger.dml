@@ -1,0 +1,67 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/simulator-iface/debugger.h>
+%}
+
+import "simics/device-api.dml";
+import "simics/pywrap.dml";
+import "simics/base/cbdata.dml";
+import "simics/processor/types.dml";
+
+extern typedef int debugger_error_t;
+constant Debugger_No_Error = 0;
+constant Debugger_Not_Allowed_In_Execution_Context = 1;
+constant Debugger_Unknown_Context = 2;
+constant Debugger_Not_Supported_For_Context = 3;
+constant Debugger_Context_Does_Not_Have_State = 4;
+constant Debugger_Context_Is_Not_Active = 5;
+constant Debugger_Lookup_Failure = 6;
+constant Debugger_Failed_To_Get_Stack_Frame = 7;
+constant Debugger_Failed_To_Get_PC = 8;
+constant Debugger_Failed_To_Read = 9;
+constant Debugger_Failed_To_Write = 10;
+constant Debugger_Frame_Outside_Of_Known_Stack = 11;
+constant Debugger_Failed_To_Evaluate_Expression = 12;
+constant Debugger_Incorrect_Type = 13;
+constant Debugger_Incorrect_Size = 14;
+constant Debugger_Incorrect_Context_Query = 15;
+constant Debugger_Unknown_Id = 16;
+constant Debugger_Source_Not_Found = 17;
+constant Debugger_File_Not_Found = 18;
+constant Debugger_Unrecognized_File_Format = 19;
+constant Debugger_Unsupported_For_File_Format = 20;
+constant Debugger_Failed_To_Open_File = 21;
+constant Debugger_Not_Relocatable = 22;
+constant Debugger_Segment_Info_Missing = 23;
+constant Debugger_Section_Info_Missing = 24;
+constant Debugger_Segment_Not_Found = 25;
+constant Debugger_Section_Not_Found = 26;
+constant Debugger_Already_Running = 27;
+constant Debugger_Failed_To_Continue = 28;
+constant Debugger_No_Context_For_Object = 29;
+constant Debugger_Invalid_Path = 30;
+constant Debugger_Missing_Object = 31;
+constant Debugger_Unexpected_Error = 32;
+constant Debugger_Step_Interrupted = 33;
+extern typedef struct { attr_value_t (*notify_context_creation)(conf_object_t *obj, char const *query, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id, bool updated), cbdata_register_t data); attr_value_t (*notify_context_destruction)(conf_object_t *obj, char const *query, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id), cbdata_register_t data); attr_value_t (*notify_location)(conf_object_t *obj, char const *query, char const *location, uint32 size, access_t access, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id, conf_object_t *cpu, uint64 instruction_address, uint64 data_address, uint32 size), cbdata_register_t data); attr_value_t (*notify_address)(conf_object_t *obj, char const *query, uint64 address, uint32 size, access_t access, bool physical, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id, conf_object_t *cpu, uint64 instruction_address, uint64 data_address, uint32 size), cbdata_register_t data); attr_value_t (*notify_line)(conf_object_t *obj, char const *query, char const *file, uint32 line, uint32 column, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id, conf_object_t *cpu, uint64 instruction_address, uint64 data_address, uint32 size), cbdata_register_t data); attr_value_t (*notify_activated)(conf_object_t *obj, char const *query, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id, conf_object_t *cpu), cbdata_register_t data); attr_value_t (*notify_deactivated)(conf_object_t *obj, char const *query, void (*cb)(cbdata_call_t data, conf_object_t *obj, char const *ctx_id, conf_object_t *cpu), cbdata_register_t data); attr_value_t (*notify_callbacks_done)(conf_object_t *obj, void (*cb)(cbdata_call_t data, conf_object_t *obj), cbdata_register_t data); attr_value_t (*cancel)(conf_object_t *obj, debug_cancel_id_t cid); } debug_notification_interface_t;
+extern typedef struct { attr_value_t (*add_symbol_file)(conf_object_t *obj, char const *query, char const *symbol_file, uint64 address, bool absolute_address); attr_value_t (*add_symbol_segment)(conf_object_t *obj, char const *query, char const *symbol_file, uint32 segment, uint64 address, bool absolute_address); attr_value_t (*add_symbol_section)(conf_object_t *obj, char const *query, char const *symbol_file, char const *section, uint64 address, bool absolute_address); attr_value_t (*remove_symbol_file)(conf_object_t *obj, debug_setup_id_t id); void (*clear_symbol_files)(conf_object_t *obj); attr_value_t (*symbol_files)(conf_object_t *obj); attr_value_t (*symbol_files_for_ctx)(conf_object_t *obj, char const *ctx_id); attr_value_t (*list_all_mappings)(conf_object_t *obj, char const *ctx_id); attr_value_t (*add_path_map_entry)(conf_object_t *obj, char const *query, char const *source, char const *dest); attr_value_t (*remove_path_map_entry)(conf_object_t *obj, debug_setup_id_t id); void (*clear_path_map_entries)(conf_object_t *obj); attr_value_t (*path_map_entries)(conf_object_t *obj); attr_value_t (*path_map_entries_for_ctx)(conf_object_t *obj, char const *ctx_id); attr_value_t (*apply_path_map)(conf_object_t *obj, char const *ctx_id, char const *filename); } debug_setup_interface_t;
+extern typedef struct { attr_value_t (*matching_contexts)(conf_object_t *obj, char const *query); attr_value_t (*get_context_group)(conf_object_t *obj, char const *ctx_id); attr_value_t (*get_context_parent)(conf_object_t *obj, char const *ctx_id); attr_value_t (*get_context_children)(conf_object_t *obj, char const *ctx_id); attr_value_t (*query_for_context_group)(conf_object_t *obj, char const *ctx_id); attr_value_t (*query_for_context_id)(conf_object_t *obj, char const *ctx_id); attr_value_t (*query_for_context_tree)(conf_object_t *obj, char const *ctx_id); attr_value_t (*context_name)(conf_object_t *obj, char const *ctx_id); attr_value_t (*context_id_for_object)(conf_object_t *obj, conf_object_t *ctx_obj); attr_value_t (*object_for_context)(conf_object_t *obj, char const *ctx_id); attr_value_t (*context_has_state)(conf_object_t *obj, char const *ctx_id); attr_value_t (*get_active_processor)(conf_object_t *obj, char const *ctx_id); } debug_query_interface_t;
+extern typedef struct { attr_value_t (*instruction_into)(conf_object_t *obj, char const *ctx_id); attr_value_t (*into)(conf_object_t *obj, char const *ctx_id); attr_value_t (*instruction_over)(conf_object_t *obj, char const *ctx_id); attr_value_t (*over)(conf_object_t *obj, char const *ctx_id); attr_value_t (*out)(conf_object_t *obj, char const *ctx_id); attr_value_t (*reverse_instruction_into)(conf_object_t *obj, char const *ctx_id); attr_value_t (*reverse_into)(conf_object_t *obj, char const *ctx_id); attr_value_t (*reverse_instruction_over)(conf_object_t *obj, char const *ctx_id); attr_value_t (*reverse_over)(conf_object_t *obj, char const *ctx_id); attr_value_t (*reverse_out)(conf_object_t *obj, char const *ctx_id); } debug_step_interface_t;
+extern typedef struct { attr_value_t (*address_source)(conf_object_t *obj, char const *ctx_id, uint64 address, uint64 size, void (*cb)(cbdata_call_t data, attr_value_t code_area), cbdata_register_t data); attr_value_t (*source_address)(conf_object_t *obj, char const *ctx_id, char const *filename, uint32 line, uint32 column, void (*cb)(cbdata_call_t data, attr_value_t code_area), cbdata_register_t data); attr_value_t (*address_symbol)(conf_object_t *obj, char const *ctx_id, uint64 address); attr_value_t (*stack_depth)(conf_object_t *obj, char const *ctx_id); attr_value_t (*stack_frames)(conf_object_t *obj, char const *ctx_id, int min, int max); attr_value_t (*local_variables)(conf_object_t *obj, char const *ctx_id, int frame); attr_value_t (*local_arguments)(conf_object_t *obj, char const *ctx_id, int frame); attr_value_t (*expression_value)(conf_object_t *obj, char const *ctx_id, int32 frame, uint64 address_scope, char const *expr); attr_value_t (*expression_type)(conf_object_t *obj, char const *ctx_id, int32 frame, uint64 address_scope, char const *expr); attr_value_t (*type_info)(conf_object_t *obj, char const *ctx_id, uint64 address_scope, char const *type); attr_value_t (*type_to_string)(conf_object_t *obj, attr_value_t type); attr_value_t (*symbol_address)(conf_object_t *obj, char const *ctx_id, int32 frame, char const *symbol); attr_value_t (*address_string)(conf_object_t *obj, char const *ctx_id, uint64 address, int maxlen); attr_value_t (*lvalue_write)(conf_object_t *obj, char const *ctx_id, int32 frame, char const *symbol, attr_value_t value); attr_value_t (*address_write)(conf_object_t *obj, char const *ctx_id, uint64 address, attr_value_t value); attr_value_t (*address_read)(conf_object_t *obj, char const *ctx_id, uint64 address, uint32 size); attr_value_t (*struct_members)(conf_object_t *obj, char const *ctx_id, uint64 address_scope, char const *struct_name); attr_value_t (*struct_field)(conf_object_t *obj, char const *ctx_id, uint64 address_scope, char const *struct_name, char const *field); attr_value_t (*list_functions)(conf_object_t *obj, char const *ctx_id); attr_value_t (*list_global_variables)(conf_object_t *obj, char const *ctx_id); attr_value_t (*list_source_files)(conf_object_t *obj, char const *ctx_id); } debug_symbol_interface_t;
+extern typedef struct { attr_value_t (*open_symbol_file)(conf_object_t *obj, char const *filename, uint64 address, bool absolute_address); attr_value_t (*close_symbol_file)(conf_object_t *obj, char const *ctx_id); attr_value_t (*symbol_file_info)(conf_object_t *obj, char const *ctx_id); attr_value_t (*sections_info)(conf_object_t *obj, char const *ctx_id); attr_value_t (*segments_info)(conf_object_t *obj, char const *ctx_id); attr_value_t (*open_symbol_section)(conf_object_t *obj, char const *filename, char const *section, uint64 address, bool absolute_address); } debug_symbol_file_interface_t;
+extern typedef uint64 debug_cancel_id_t;
+extern typedef int64 debug_setup_id_t;

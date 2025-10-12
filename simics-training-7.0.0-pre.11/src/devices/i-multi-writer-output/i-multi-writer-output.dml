@@ -1,0 +1,319 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i_multi_writer_output;
+
+param desc = "multi writer output device";
+
+param documentation = "Simple device that write characters to a console and "
+                    + "colors them depending on the processor ID atom of the writer.";
+
+import "simics/simulator-iface/probe-interface.dml";
+import "simics/devs/serial-device.dml";
+
+import "utility.dml";
+import "i-processor-id-atom.dml";
+
+param max_writers = 8;
+
+header %{
+#include "simics/simulator/processor.h"
+%}
+
+extern conf_object_t* SIM_current_clock();
+
+attribute current_id is int64_attr "ID of current access." {
+    param internal = true;
+}
+
+attribute max_writers_attr is (pseudo_attr, read_only_attr) {
+    param type = "i";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(max_writers);
+    }
+}
+
+attribute fg_colors[i < max_writers] is uint64_attr "Foreground text color for each ID." {
+    method set(attr_value_t value) throws {
+        default(value);
+        if (val > 255) {
+            log error: "Only 24-bit colors codes are accepted.";
+            throw;
+        }
+    }
+}
+
+attribute bg_colors[i < max_writers] is uint64_attr "Background text color for each ID." {
+    method set(attr_value_t value) throws {
+        default(value);
+        if (val > 255) {
+            log error: "Only 24-bit colors codes are accepted.";
+            throw;
+        }
+    }
+}
+
+attribute stall_cycles[i < max_writers] is uint64_attr "Stall cycles per ID.";
+
+attribute total_console_bytes_written is read_only_attr "Total number of bytes written to the console across all IDs (session)." {
+    param type = "i";
+    method get() -> (attr_value_t) {
+        local uint64 rv = 0;
+        for (local uint32 i = 0; i < max_writers; i++) {
+            rv += console.chars_written[i];
+        }
+        return SIM_make_attr_uint64(rv);
+    }
+}
+
+method init() {
+    current_id.val = -1;
+    for (local uint32 i = 0; i < max_writers; i++) {
+        fg_colors[i].val = 0x0;
+        bg_colors[i].val = i + 8;
+    }
+}
+
+//
+// Connection to a serial console object to send text to 
+session char num_to_char[10] = { '0', '1', '2', '3', '4', '5',
+                                 '6', '7', '8', '9' };
+connect console "Serial console to send characters to for the display" {
+    param configuration = "optional";
+    interface serial_device;
+    session uint64 chars_written[max_writers];
+    
+    session char color_sequence[33] = {0x1b, '[','3', '8', ';', '5', ';', 0, 0, 0, 'm',
+                                       0x1b, '[','4', '8', ';', '5', ';', 0, 0, 0, 'm',
+                                       0,
+                                       0x1b, '[','3', '9', 'm',
+                                       0x1b, '[','4', '9', 'm'};
+    
+    method insert_digit_wise(char* buf, uint8 r) {
+        for (local uint32 i = 0; i < 3; i++) {
+            local uint8 digit = r % 10;
+            buf[2-i] = num_to_char[digit];
+            r = (r - digit) / 10;
+        }
+    }
+
+    method send(bool no_color) {
+        if (obj) {
+            local char* seq;
+            local uint32 num_chars;
+            color_sequence[22] = cast(regs.char_out.val, char);
+            if (current_id.val == -1 || no_color) {
+                if (!no_color)
+                    log spec_viol: "Access without processor ID. Not sending color code for char '%c'.",  cast(regs.char_out.val, char);
+                num_chars = 1;
+                seq = &color_sequence[22];
+            } else {
+                log info, 3: "Access with processor ID %lld. Sending fg/bg color code 0x%llx/0x%llx for char '%c'.",  current_id.val,
+                                                                                                       fg_colors[current_id.val].val,
+                                                                                                       bg_colors[current_id.val].val,
+                                                                                                       cast(regs.char_out.val, char);
+                num_chars = sizeof(color_sequence)/sizeof(color_sequence[0]);
+                seq = &color_sequence[0];
+                insert_digit_wise(&seq[7],  cast(fg_colors[current_id.val].val, uint8));
+                insert_digit_wise(&seq[18], cast(bg_colors[current_id.val].val, uint8));
+            }
+            for (local uint32 i = 0; i < num_chars; i++) {
+                log info, 4: "Sending '%c' (0x%x) to console object", seq[i], seq[i];
+                local int success = serial_device.write(seq[i]);
+                if (success == 0) {
+                    log error: "Console write failed. This is not supported." +
+                               " Ensure the connected console is free of (virtual) output delays.";
+                    break;
+                } else {
+                    chars_written[current_id.val]++;
+                }
+            }
+        } else {
+            log info, 3: "Nothing connected to console. Dropping: %c", cast(regs.char_out.val, char);
+        }
+    }
+}
+
+port probes_per_id[i < max_writers] {
+    implement probe_index { 
+        method num_indices() -> (int) {
+            return 2;
+        }
+        method value(int idx) -> (attr_value_t) {
+            switch(idx) {
+              case 0:
+                return SIM_make_attr_uint64(regs.access_count[i]);
+              case 1:
+                return SIM_make_attr_uint64(console.chars_written[i]);
+              default:
+                log critical: "Unexpected index.";
+                return SIM_make_attr_uint64(0);
+            }
+        }
+        method properties(int idx) -> (attr_value_t) {
+            switch(idx) {
+              case 0:
+                return SIM_make_attr_list(4,
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Kind),
+                        SIM_make_attr_string("dev.mem_access_count.per_id")
+                    ),
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Type),
+                        SIM_make_attr_string("int")
+                    ),
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Description),
+                        SIM_make_attr_string("Memory accesses towards the device per processor ID.")
+                    ),
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Display_Name),
+                        SIM_make_attr_string("Memory accesses per ID")
+                    )
+                );
+              case 1:
+                return SIM_make_attr_list(4,
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Kind),
+                        SIM_make_attr_string("dev.con_bytes_written.per_id")
+                    ),
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Type),
+                        SIM_make_attr_string("int")
+                    ),
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Description),
+                        SIM_make_attr_string("Bytes written to console per processor ID.")
+                    ),
+                    SIM_make_attr_list(2,
+                        SIM_make_attr_uint64(Probe_Key_Display_Name),
+                        SIM_make_attr_string("Console bytes written per ID")
+                    )
+                );
+              default:
+                log critical: "Unexpected index.";
+                return SIM_make_attr_list(0);
+            }
+        }
+    }
+}
+
+implement serial_device {
+    method write(int value) -> (int)
+    {
+        // if anything is written to use, we just drop it
+        local int success = 1;
+        return success;
+    }
+    method receive_ready()
+    {
+    }
+}
+
+bank regs {
+
+    param use_io_memory = false;
+    session uint64 access_count[max_writers];
+
+    // Intercept transactions to the bank to retrieve the transaction ID and stash it,
+    // before calling the standard implementations of registers. 
+    method transaction_access(transaction_t *t, uint64 offset, void *aux) -> (exception_type_t) {
+        log info, 4: "Access through memory path via transaction access ().";
+        
+        // read value - makes sense for writes, should be zero for writes
+        local uint64 tval = SIM_get_transaction_value_le(t);
+        if (current_id.val != -1) {
+            log error: "Start of a new output sequence while the previous output sequence is still being written is not supported." +
+                       " Ensure the connected console is free of (virtual) output delays.";
+            return Sim_PE_IO_Not_Taken;
+        }
+        // Log operation type, size, and data if applicable 
+        local uint32 tsize = SIM_transaction_size(t);
+        if(SIM_transaction_is_read(t)) {
+            log info, 4 : "Read: offset=0x%x size=%d", offset, tsize;
+        } else {
+            local uint64 tval = SIM_get_transaction_value_le(t);            
+            log info, 4 : "Write: offset=0x%x size=%d value=0x%x", offset, tsize, tval;
+        }
+        // Check ID
+        if (ATOM_transaction_training_processor_id(t)) {
+            current_id.val = ATOM_get_transaction_training_processor_id(t);
+            log info, 3: "Incoming transaction carried ID: 0x%x", current_id.val;
+        }
+        // Check inquiry
+        if (!SIM_transaction_is_inquiry(t)) {
+            access_count[current_id.val]++;
+        } else {
+            log info, 4: "Inquiry access. Suppressing side effects.";
+        }
+        local exception_type_t rv = default(t, offset, aux);
+        current_id.val = -1;
+        return rv;
+    }
+
+    // Output register:
+    // -- send output to the shared console
+    // -- with a prefix setting colors
+    register char_out size 1 @ 0x0000 is (read, write) {
+        method write(uint64 val) {
+            default(val);
+            log info, 4: "%s - Write access (i.e., performing side effects).", this.name;
+            console.send(false); // send with color
+            local uint64 to_stall = stall_cycles[current_id.val].val;
+            if ((to_stall != 0) && (SIM_current_clock() != NULL)) {
+                log info, 3: "Stalling clock %s for %d cycles", SIM_object_name(SIM_current_clock()), to_stall;
+                SIM_stall_cycle(SIM_current_clock(), to_stall);
+            }
+        }
+        method set(uint64 v) {
+            log info, 4: "%s - Value set (i.e., no side effects) (val=0x%x).", this.name, v;
+            default(v);
+        }
+        method get() -> (uint64) {
+            log info, 4: "%s - Value get (i.e., no side effects) (val=0x%x).", this.name, this.val;
+            return default();
+        }        
+    }
+
+    // Do not leave an area unmapped
+    register _reserved0 size 3 @ 0x0001 is (constant) {
+        param init_val = 0xff_ffff;  // 3 bytes, remember?
+    }
+
+    register char_out_no_color size 1 @ 0x0004 is (read, write) {
+        param configuration = "pseudo";
+        method write(uint64 val) {
+            char_out.val = val;
+            this.val = val;
+            console.send(true); // send without color
+        }
+    }
+
+    // Do not leave an area unmapped
+    register _reserved1 size 3 @ 0x0005 is (constant) {
+        param init_val = 0xff_ffff;  // 3 bytes, remember?
+    }
+
+    // Own ID register: 
+    // -- return the ID from the incoming transaction 
+    // -- Allows code to determine its current ID with a simple read
+    register reader_id size 8 @ 0x0008 is (read_only, read) {
+        method read() -> (uint64) {
+            return current_id.val;
+        }
+    }
+}
+

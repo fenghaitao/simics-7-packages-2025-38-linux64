@@ -1,0 +1,60 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/util/crafflib.h>
+%}
+
+import "simics/base-types.dml";
+import "simics/util/vect.dml";
+
+extern int craff_close(craff_file_t *cf);
+extern craff_file_t *craff_creat(craff_error_t *ce, char const *file, uint64 size, craff_params_t *params);
+extern craff_error_t *craff_file_error(craff_file_t *cf);
+extern char const *craff_file_get_error(craff_file_t *cf);
+extern int craff_flush(craff_file_t *cf);
+extern void craff_free_error(craff_error_t *ce);
+extern char const *craff_get_error(craff_error_t *ce);
+extern craff_errclass_t craff_get_error_class(craff_error_t *ce);
+extern void craff_get_info(craff_file_t *cf, craff_info_t *info);
+extern craff_error_t *craff_new_error(void);
+extern uint64 craff_next_data(craff_file_t *cf, uint64 ofs, uint64 limit);
+extern craff_file_t *craff_open(craff_error_t *ce, char const *file, craff_mode_t mode);
+extern int craff_read(craff_file_t *cf, void *buf, uint64 ofs, size_t len, craff_interv_vec_t *gaps);
+extern int craff_recover(craff_file_t *cf);
+extern int craff_write(craff_file_t *cf, void const *buf, uint64 ofs, size_t len);
+extern typedef int craff_compr_t;
+constant Compr_None = 0;
+constant Compr_Gz = 2;
+extern typedef int craff_errclass_t;
+constant Craff_Err_Success = 0;
+constant Craff_Err_Nospace = 1;
+constant Craff_Err_Corrupt = 2;
+constant Craff_Err_Notcraff = 3;
+constant Craff_Err_Notdmg = 4;
+constant Craff_Err_ReadOnly = 5;
+constant Craff_Err_Notfound = 6;
+constant Craff_Err_Nosupport = 7;
+constant Craff_Err_Other = 8;
+extern typedef int craff_mode_t;
+constant Craff_Read_Only = 0;
+constant Craff_Read_Write = 1;
+constant Craff_Read_Write_Allow_Compression = 2;
+extern typedef struct { } craff_file_t;
+extern typedef struct { int block_bits; int sub_bits; int directory_bits; craff_compr_t compression; } craff_params_t;
+extern typedef struct { uint64 size; int block_bits; int sub_bits; int directory_bits; craff_compr_t compression; int version; } craff_info_t;
+extern typedef struct { uint64 ofs; uint64 len; } craff_interv_t;
+extern typedef struct { char *msg; craff_errclass_t errclass; } craff_error_t;
+extern typedef struct { int size; int used; craff_interv_t *elements; } craff_interv_vec_t;

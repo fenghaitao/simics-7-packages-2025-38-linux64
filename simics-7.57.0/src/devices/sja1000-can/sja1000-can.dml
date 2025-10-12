@@ -1,0 +1,646 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device sja1000_can;
+
+parameter desc = "model of SJA1000 CAN controller";
+parameter documentation = "The <class>sja1000_can</class>"
+    + "class provides a model of SJA1000 which is a stand-alone controller"
+    + " for the Controller Area Network (CAN)";
+
+parameter limitations = "<ul>"
+    + "<li> BasicCan mode is unimplemented.</li>"
+    + "<li> Bus sleep is not supported.</li>"
+    + "<li> Assume can-bus is perfect, there is no"
+    + " Active/Passive Error and Bus-off status.</li>"
+    + "<li> No re-send for the frames.</li>"
+    + "</ul>";
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+import "simics/devs/map-demap.dml";
+import "can-interface.dml";
+
+constant POS_TXB = 64;  // start position of internal RAM for TX buffer
+
+method gen_irq() {
+    local bool raised;
+    local uint32 irsts;
+
+    inline $regs_peli.ir.get() -> (irsts);
+    raised = (irsts > 0);
+    if ($signal_raised != raised) {
+        log "info", 3:
+            "%s interrupt with ir: 0x%x",
+            raised ? "raising" : "clearing",
+            irsts;
+            
+        if ($irq_target.obj == NULL) {
+            static uint8 log_level = 1;
+            log "info", log_level: "no interrupt target for CAN controller";
+            log_level = 4;
+            return;
+        }
+    
+        if (raised)
+            $irq_target.signal.signal_raise();
+        else
+            $irq_target.signal.signal_lower();
+
+        $signal_raised = raised;
+    }
+}
+
+connect irq_target {
+    parameter desc = "Interrupt output, used to interrupt the microcontroller";
+    parameter configuration = "optional";
+    interface signal;
+}
+
+connect can_link {
+    parameter documentation = "CAN link";
+    parameter configuration = "optional";
+    interface can_link;
+}
+
+attribute signal_raised {
+    parameter documentation = "Interrupt is currently raised ";
+    parameter allocate_type = "bool";
+    parameter configuration = "optional";
+}
+
+attribute pos_free_rxfifo {
+    parameter documentation = "Start position of free RXFIFO.";
+    parameter allocate_type = "uint8";
+    parameter configuration = "optional";
+}
+
+// common register for Basic mode and Peli mode
+bank regs {
+    parameter register_size = 1;
+    register cdr @ 0x1f is (read_write) "Clock divider register";
+}
+
+// Bank declaration for BasicCan mode
+bank regs_basic {
+    parameter register_size = 1;
+
+    register control @ 0x00 is (read_write) "Control register";
+    register command @ 0x01 is (unimplemented) "Command register";
+    register status @ 0x02 is (unimplemented) "Status register";
+    register ir @ 0x03 is (unimplemented) "Interrupt register";
+    register acr @ 0x04 is (unimplemented) "Acceptance code register";
+    register amr @ 0x05 is (unimplemented) "Acceptance mask register";
+    register btr0 @ 0x06 is (unimplemented) "Bus timing register 0";
+    register btr1 @ 0x07 is (unimplemented) "Bus timing register 1";
+    register oc @ 0x08 is (unimplemented) "Output control";
+    register test @ 0x09 is (unimplemented) "Test register";
+    register txb_id1 @ 0x0a is (unimplemented) "Identifier (10 to 3) of"
+                                               + " transmit buffer";
+    register txb_id0 @ 0x0b is (unimplemented) "Identifier (2 to 0), RTR and"
+                                               + " DLC of transmit buffer";
+    register txb_byte[8] @ (0x0c + $i) is (unimplemented) "Data byte of"
+                                                          + " transmit buffer";
+    register rxb_id1 @ 0x14 is (unimplemented) "Identifier (10 to 3)"
+                                               + " of receive buffer";
+    register rxb_id0 @ 0x15 is (unimplemented) "Identifier (2 to 0), RTR and"
+                                               + " DLC of receive buffer";
+    register rxb_byte[8] @ (0x16 + $i) is (unimplemented) "Data byte of"
+                                                          + " receive buffer";
+    register res @ 0x1e is (unimplemented) "Reserved register";
+}
+
+// Bank declaration for PeliCan mode
+bank regs_peli {
+    parameter register_size = 1;
+
+    register mode @ 0x00 is (read_write) "Mode register";
+    register command @ 0x01 is (read_write) "Command register";
+    register status @ 0x02 is (read_write) "Status register";
+    register ir @ 0x03 is (read_only) "Interrupt register";
+    register ier @ 0x04 is (read_write) "Interrupt enable register";
+    register res0 @ 0x05 is (ignore_write) "Reserved";
+    register btr0 @ 0x06 is (read_write) "Bus timing 0";
+    register btr1 @ 0x07 is (read_write) "Bus timing 1";
+    register ocr @ 0x08 is (read_write) "Output control register";
+    register test @ 0x09 is (read_write) "Test register";
+    register res1 @ 0x0a is (read_write) "Reserved";
+    register alc @ 0x0b is (read_write) "Arbitration lost capture";
+    register ecc @ 0x0c is (read_write) "Error code capture";
+    register ewlr @ 0x0d is (read_write) "Error warning limit register";
+    register rxerr @ 0x0e is (read_write) "Receive error counter";
+    register txerr @ 0x0f is (read_write) "Transmit error counter";
+    // following 13 registers' layouts vary in different mode 
+    register rxb_txb[13] @ (0x10 + $i) is (read_write) "Public use: RX/TX"
+                                                       + " buffer, acceptance";
+    register rmc @ 0x1d is (read_write) "RX message counter";
+    register rbsa @ 0x1e is (read_write) "RX buffer start address";
+    register inter_ram[80] @ (0x20 + $i) is (read_write) "Internal RAM";
+}
+
+// registers layout of acceptance for Peli, software-invisible
+bank regs_acceptance {
+    parameter register_size = 1;
+
+    register acr[4] @ (0x00 + $i) "Acceptance code";
+    register amr[4] @ (0x04 + $i) "Acceptance mask";
+}
+
+implement can_device {
+    method receive(can_frame_t *frame) {
+        call $on_receive(frame);
+    }
+}
+
+// This function works as the global HW acceptance filter for incoming messages
+// on the device controller. A value of "1" for a particular bit position of the
+// acceptance mask means don't care (i.e. the incoming message Id could have a
+// value of zero or one for this bit position); otherwise, a value of "0" means 
+// the corresponding bit of the message Id/data must match the acceptance code
+// identically.
+method filter(can_frame_t *frame) -> (bool value) {
+    if ($regs_peli.mode.afm == 1) {  // single filter
+        local uint32 result = 0;
+        local uint32 msg = 0;
+        local uint32 code = 0;
+        local uint32 mask = 0;
+
+        if (frame->extended) {
+            msg[31:3] = (frame->identifier)[28:0];
+            mask[31:24] = $regs_acceptance.amr[0];
+            mask[23:16] = $regs_acceptance.amr[1];
+            mask[15:8] = $regs_acceptance.amr[2];
+            mask[7:0] = $regs_acceptance.amr[3];
+        } else {  // standard frame
+            msg[31:21] = (frame->identifier)[10:0];
+            if (frame->rtr) {  // remote frame
+                msg[20] = 1;
+                mask[15:0] = 0xffff;  // don't care data fields for remote frame
+            } else {  // data frame
+                msg[20] = 0;
+                msg[15:8] = cast(frame->data[0], uint8);
+                msg[7:0] = cast(frame->data[1], uint8);
+                mask[15:8] = $regs_acceptance.amr[2];
+                mask[7:0] = $regs_acceptance.amr[3];
+            }
+            mask[31:24] = $regs_acceptance.amr[0];
+            mask[23:16] = $regs_acceptance.amr[1];
+        }
+        code[31:24] = $regs_acceptance.acr[0];
+        code[23:16] = $regs_acceptance.acr[1];
+        code[15:8] = $regs_acceptance.acr[2];
+        code[7:0] = $regs_acceptance.acr[3];
+        result = ((~(msg ^ code)) | mask);
+        if (result == 0xffffffff)
+            value = true;
+        else
+            value = false;
+    } else {  // dual filter
+        local uint16 msg = 0;
+        local uint16 result1 = 0;
+        local uint16 code1 = 0;
+        local uint16 mask1 = 0;
+        local uint16 result2 = 0;
+        local uint16 code2 = 0;
+        local uint16 mask2 = 0;
+
+        if (frame->extended) {
+            msg = (frame->identifier)[28:13];
+            code1[15:8] = $regs_acceptance.acr[0];
+            code1[7:0] = $regs_acceptance.acr[1];
+            mask1[15:8] = $regs_acceptance.amr[0];
+            mask1[7:0] = $regs_acceptance.amr[1];
+            code2[15:8] = $regs_acceptance.acr[2];
+            code2[7:0] = $regs_acceptance.acr[3];
+            mask2[15:8] = $regs_acceptance.amr[2];
+            mask2[7:0] = $regs_acceptance.amr[3];
+        } else {  // standard frame
+            msg[15:5] = (frame->identifier)[10:0];
+            if (frame->rtr)  // remote frame
+                msg[4] = 1;
+            code1[15:8] = $regs_acceptance.acr[0];
+            code1[7:0] = $regs_acceptance.acr[1];
+            mask1[15:8] = $regs_acceptance.amr[0];
+            mask1[7:4] = $regs_acceptance.amr[1][7:4];
+            mask1[3:0] = 0xf;  // don't care 0~3 bits
+            code2[15:8] = $regs_acceptance.acr[2];
+            code2[7:0] = $regs_acceptance.acr[3];
+            mask2[15:8] = $regs_acceptance.amr[2];
+            mask2[7:4] = $regs_acceptance.amr[3][7:4];
+            mask2[3:0] = 0xf;  // don't care 0~3 bits
+        }
+        result1 = ((~(msg ^ code1)) | mask1);
+        result2 = ((~(msg ^ code2)) | mask2);
+        if ((result1 == 0xffff) || (result2 == 0xffff))
+            value = true;
+        else
+            value = false;
+    }    
+}
+
+method in_reset() {
+    if ($regs.cdr.can_mode == 1) {  // peli mode
+        $regs_peli.command.srr = 0;
+        $regs_peli.command.cdo = 0;
+        $regs_peli.command.rrb = 0;
+        $regs_peli.command.at = 0;
+        $regs_peli.command.tr = 0;
+
+        $regs_peli.status.tbs = 1;
+        $regs_peli.status.dos = 0;
+        $regs_peli.status.rbs = 0;
+
+        $regs_peli.ir.bei = 0;
+        $regs_peli.ir.ali = 0;
+        $regs_peli.ir.epi = 0;
+        $regs_peli.ir.wui = 0;
+        $regs_peli.ir.doi = 0;
+        $regs_peli.ir.ti = 0;
+        $regs_peli.ir.ri = 0;
+
+        $regs_peli.rmc = 0;
+        call $gen_irq();
+    }
+}
+
+method out_reset() {
+    if ($regs.cdr.can_mode == 1) {  // peli mode
+        $regs_peli.status.ts = 0;
+        $regs_peli.status.rs = 0;
+    }
+}
+
+method on_receive(can_frame_t *frame) {
+    local bool is_full = false;
+    local bool is_accepted;
+
+    log "info", 4: "receive a frame: id=%d, ext=%s, rtr=%s, length=%d",
+                    frame->identifier,
+                    (frame->extended ? "true" : "false"),
+                    (frame->rtr ? "true" : "false"),
+                    frame->data_length;
+
+    call $filter(frame) -> (is_accepted);
+
+    if (!is_accepted) {
+        log "info", 4: "receive a frame which is not accepted";
+        return;
+    }
+
+    local uint8 recv[13];
+    local uint8 buf_len = 0;
+    local uint8 data_len = 0;
+    local uint8 i = 0;
+    memset(recv, 0, 13);
+
+    if (frame->rtr)
+        recv[0][6] = 1;
+
+    if ((frame->data_length) <= 8)
+        data_len = frame->data_length;
+    else
+        log "error": "data length shouldn't be greater than 8 bytes";
+    recv[0][3:0] = data_len;
+
+    if (frame->extended) {
+        buf_len = 5 + data_len;
+        recv[0][7] = 1;
+        recv[1] = (frame->identifier)[28:21];
+        recv[2] = (frame->identifier)[20:13];
+        recv[3] = (frame->identifier)[12:5];
+        recv[4][7:3] = (frame->identifier)[4:0];
+        for (i = 0; i < data_len; i++)
+            recv[5 + i] = cast(frame->data[i], uint8);
+    } else {
+        buf_len = 3 + data_len;
+        recv[1] = (frame->identifier)[10:3];
+        recv[2][7:5] = (frame->identifier)[2:0];
+        for (i = 0; i < data_len; i++)
+            recv[3 + i] = cast(frame->data[i], uint8);
+    }
+
+    if (($regs_peli.rmc > 0)
+        && ($pos_free_rxfifo == $regs_peli.rbsa)) {  // fifo is full
+        is_full = true;
+    } else {
+        local uint8 fifo_left;
+        if ($pos_free_rxfifo < $regs_peli.rbsa) {
+            fifo_left = $regs_peli.rbsa - $pos_free_rxfifo;
+        } else {
+            fifo_left = $regs_peli.rbsa + 64 - $pos_free_rxfifo;
+        }
+
+        if (fifo_left < buf_len) {
+            is_full = true;
+        }  else {
+            for (i = 0; i < buf_len; i++) {
+                $regs_peli.inter_ram[$pos_free_rxfifo] = recv[i];
+                $pos_free_rxfifo++;
+                if ($pos_free_rxfifo > 63)
+                    $pos_free_rxfifo -= 64;
+            }
+        }
+    }
+
+    if (is_full) {
+        log "info", 2: "RX FIFO is full";
+        $regs_peli.status.dos = 1;
+        if ($regs_peli.ier.doie) {  // launch an overrun interrupt
+            $regs_peli.ir.doi = 1;
+            call $gen_irq();
+        }
+    } else {
+        $regs_peli.status.rbs = 1;
+        $regs_peli.rmc++;
+        if ($regs_peli.ier.rie) {
+            log "info", 3: "launch receive interrupt";
+            $regs_peli.ir.ri = 1;
+            call $gen_irq();
+        }
+    }
+}
+
+bank regs {
+    register cdr {
+        field cd [2:0] "Clock divider";
+        field clk_off [3] "Clock off";
+        field res [4] is (ignore_write) "Reserved";
+        field rxinten [5] "Allows TX1 used as recv interrupt output";
+        field cbp [6] "Allows to bypass the CAN input comparator";
+        field can_mode [7] "Defines CAN mode" {
+            method write(value) {
+                if (value != $this) {
+                    // switch mode, write only possible in reset mode
+                    if (((value == 1) && ($regs_basic.control.rr == 1))
+                        || ((value == 0) && ($regs_peli.mode.rm == 1)))
+                        $this = value;
+
+                    if ((value == 1) && ($regs_basic.control.rr == 1))
+                        $regs_peli.mode.rm = 1;
+                }
+            }
+        }
+    }
+
+    method miss_access(generic_transaction_t *memop, physical_address_t offset,
+                       physical_address_t size) {
+        if ($cdr.can_mode == 0)
+            call $regs_basic.access(memop, offset, size);
+        else
+            call $regs_peli.access(memop, offset, size);
+    }
+}
+
+// Implementation of registers for BasicCan mode
+bank regs_basic {
+    register control {
+        field rr [0] "Reset Request";
+        field rie [1] "Receive Interrupt Enable";
+        field tie [2] "Transmit Interrupt Enable";
+        field eie [3] "Error Interrupt Enable";
+        field oie [4] "Overrun Interrupt Enable";
+    }
+}
+
+// Implementation of registers for PeliCan mode
+bank regs_peli {
+    register mode {
+        field rm [0] "Reset mode" {
+            method write(value) {
+                if ($this != value) {
+                    if (value == 1)
+                        call $in_reset();
+                    else
+                        call $out_reset();
+                    $this = value;
+                }
+            }
+        }
+        field lom [1] "Listen only mode";
+        field stm [2] "Self test mode";
+        field afm [3] "Acceptance filter mode";
+        field sm [4] "Sleep mode";
+    }
+
+    register command {
+        field tr [0] is (read_zero) "Transmission request";
+        field at [1] is (read_zero) "Abort transmission";
+        field rrb [2] is (read_zero) "Release receive buffer";
+        field cdo [3] is (read_zero) "Clear data overrun";
+        field srr [4] is (read_zero) "Self reception request";
+
+        method after_write(memop) {
+            if ($cdo == 1)
+                $status.dos = 0;
+
+            if (($rrb == 1) && ($rmc > 0)) {
+                local bool ext;
+                local uint8 offset;
+                ext = $inter_ram[$rbsa][7] == 1;
+                offset = (($inter_ram[$rbsa][3:0] > 8)
+                    ? 8 : $inter_ram[$rbsa][3:0]);
+                if (ext)
+                    offset = 5 + offset;  // frame_info=1byte,id=4bytes
+                else
+                    offset = 3 + offset;  // frame_info=1byte,id=2bytes
+                $rbsa += offset;
+                if ($rbsa > 63)
+                    $rbsa -= 64;
+                $rmc--;
+                if ($rmc == 0) {  // fifo is empty,clear status
+                    log "info", 3: "released all occupied buffer";
+                    $ir.ri = 0;
+                    $status.rbs = 0;
+                    call $gen_irq();
+                }
+            }
+
+            if (($tr == 1) || ($srr == 1)) {
+                local can_frame_t frame;
+                local uint32 id = 0;
+                local uint8 i = 0;
+                memset(&frame, 0, sizeoftype(can_frame_t));
+                frame.extended = $inter_ram[POS_TXB][7] == 1;
+                frame.rtr = $inter_ram[POS_TXB][6] == 1;
+                frame.data_length = $inter_ram[POS_TXB][3:0];
+
+                if (frame.rtr)  // remote frame, force the length to 0
+                    frame.data_length = 0;
+                else if (frame.data_length > 8)
+                    frame.data_length = 8;
+
+                if (frame.extended) {
+                    id[31:24] = $inter_ram[POS_TXB + 1];
+                    id[23:16] = $inter_ram[POS_TXB + 2];
+                    id[15:8] = $inter_ram[POS_TXB + 3];
+                    id[7:0] = $inter_ram[POS_TXB + 4];
+                    frame.identifier = id[31:3];
+                    for (i = 0; i < frame.data_length; i++)
+                        frame.data[i] = $inter_ram[POS_TXB + 5 + i];
+                } else {
+                    id[15:8] = $inter_ram[POS_TXB + 1];
+                    id[7:0] = $inter_ram[POS_TXB + 2];
+                    frame.identifier = id[15:5];
+                    for (i = 0; i < frame.data_length; i++)
+                        frame.data[i] = $inter_ram[POS_TXB + 3 + i];
+                }
+
+                if ($can_link.obj == NULL) {
+                    log "info", 2: "not connected to CAN bus";
+                } else {
+                    log "info", 4: "transmit a frame: id=%d, ext=%s,"
+                                   + " rtr=%s, length=%d",
+                                   frame.identifier,
+                                   (frame.extended ? "true" : "false"),
+                                   (frame.rtr ? "true" : "false"),
+                                   frame.data_length;
+                    $can_link.can_link.send(&frame);
+                    if (($ier.tie == 1) && ($tr == 1)) {
+                        log "info", 3: "launch transmit interrupt";
+                        $ir.ti = 1;
+                        call $gen_irq();
+                    }
+                }
+                
+                // setting srr tr bits simultaneously
+                // will ignore the set srr bit
+                if (($srr == 1) && ($tr == 0)) {
+                    log "info", 4: "self reception";
+                     // in self-reception, transmit interrupt may happen
+                     // even though the device is not connected with bus
+                    if ($ier.tie == 1) {
+                        log "info", 3: "launch transmit interrupt";
+                        $ir.ti = 1;
+                        call $gen_irq();
+                    }
+                    call $on_receive(&frame);
+                }
+            }
+        }
+    }
+
+    register status {
+        field rbs [0] "Receive buffer status";
+        field dos [1] "Data overrun status";
+        field tbs [2] "Transmit buffer status" {
+            parameter hard_reset_value = 1;  // Transmit buffer is released
+        }
+        field tcs [3] "Transmission complete status" {
+            parameter hard_reset_value = 1;
+        }
+        field rs [4] "Receive status";
+        field ts [5] "Transmit status";
+        field es [6] "Error status";
+        field bs [7] "Bus status";
+    }
+
+    register ir {
+        field ri [0] "Receive interrupt";
+        field ti [1] "Transmit interrupt";
+        field ei [2] "Error warning interrupt";
+        field doi [3] "Data overrun interrupt";
+        field wui [4] "Wake-up interrupt";
+        field epi [5] "Error passive interrupt";
+        field ali [6] "Arbitration lost interrupt";
+        field bei [7] "Bus error interrupt";
+        method after_read(mop) {
+            local uint8 val;
+            inline $ir.get() -> (val);
+            // after read, all bits except for receive interrupt are reset
+            val &= 0x01;
+            inline $ir.set(val);
+            call $gen_irq();
+        }
+    }
+
+    register ier {
+        field rie [0] "Receive interrupt enable" {
+            method write(value) {
+                if ($this != value) {
+                    if (value) {
+                        if ($rmc > 0) {
+                            log "info", 3:
+                                "the receive FIFO is not empty when"
+                                + " enable receive interrupt";
+                            $ir.ri = 1;
+                            call $gen_irq();
+                        }
+                    } else {
+                        if ($rmc == 0) {
+                            log "info", 3:
+                                "disable receive interrupt when"
+                                + " receive FIFO is empty";
+                            $ir.ri = 0;
+                            $status.rbs = 0;
+                            call $gen_irq();
+                        }
+                    }
+                }
+                $this = value;
+            }
+        }
+        field tie [1] "Transmit interrupt enable";
+        field eie [2] "Error warning interrupt enable";
+        field doie [3] "Data overrun interrupt enable";
+        field wuie [4] "Wake-up interrupt enable";
+        field epie [5] "Error passive interrupt enable";
+        field alie [6] "Arbitration lost interrupt enable";
+        field beie [7] "Bus error interrupt enable";
+    }
+
+    register rxb_txb[13] {
+        method write_access(memop, msb1, lsb, value) {
+            if ($regs_peli.mode.rm == 1) {  // reset mode
+                if ($i < 8) {
+                    call $regs_acceptance.write(memop, $i, 1, value);
+                }
+            } else {  // operation mode, copy to corresponding internal ram
+                $inter_ram[POS_TXB + $i] = value;
+            }
+        }
+
+        method read_access(memop, msb1, lsb) -> (value) {
+            if ($regs_peli.mode.rm == 1)  // reset mode
+                call $regs_acceptance.read(memop, $i, 1) -> (value);
+            else  // operation mode, copy from internal ram
+                value = $inter_ram[$rbsa + $i];
+        }
+    }
+}
+
+port SRESET {
+    implement signal {
+        method signal_raise() {
+            log "info", 2: "SJA1000 soft reset.";
+            call $dev.soft_reset();
+            call $gen_irq();
+        }
+
+        method signal_lower() {
+        }
+    }
+}
+
+port HRESET {
+    implement signal {
+        method signal_raise() {
+            log "info", 2: "SJA1000 hard reset.";
+            call $dev.hard_reset();
+            call $gen_irq();
+        }
+
+        method signal_lower() {
+        }
+    }
+}

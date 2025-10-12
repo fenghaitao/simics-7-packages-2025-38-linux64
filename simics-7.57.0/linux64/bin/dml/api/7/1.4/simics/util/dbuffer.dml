@@ -1,0 +1,53 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/util/dbuffer.h>
+%}
+
+import "simics/base/types.dml";
+
+extern uint8 *dbuffer_append(dbuffer_t *dbuffer, size_t len);
+extern void dbuffer_append_data(dbuffer_t *buf, void const *data, size_t nmemb);
+extern uint8 *dbuffer_append_external_data(dbuffer_t *dbuffer, void *data, size_t len, bool adopt);
+extern uint8 *dbuffer_append_value(dbuffer_t *dbuffer, int value, size_t len);
+extern bytes_t dbuffer_bytes(dbuffer_t *dbuffer);
+extern void dbuffer_clear(dbuffer_t *dbuffer);
+extern dbuffer_t *dbuffer_clone(dbuffer_t *dbuffer);
+extern void dbuffer_copy_append(dbuffer_t *dst, dbuffer_t *src, size_t offset, size_t len);
+extern void dbuffer_copy_prepend(dbuffer_t *dst, dbuffer_t *src, size_t offset, size_t len);
+extern void dbuffer_free(dbuffer_t *dbuffer);
+extern uint8 *dbuffer_insert(dbuffer_t *dbuffer, size_t offset, size_t len);
+extern size_t dbuffer_len(dbuffer_t const *dbuffer);
+extern uint8 *dbuffer_prepend(dbuffer_t *dbuffer, size_t len);
+extern uint8 *dbuffer_prepend_external_data(dbuffer_t *dbuffer, void *data, size_t len, bool adopt);
+extern uint8 *dbuffer_prepend_value(dbuffer_t *dbuffer, int value, size_t len);
+extern uint8 const *dbuffer_read(dbuffer_t *dbuffer, size_t offset, size_t len);
+extern uint8 const *dbuffer_read_all(dbuffer_t *dbuffer);
+extern uint8 const *dbuffer_read_some(dbuffer_t *dbuffer, size_t offset, size_t len, size_t *actual_len);
+extern void dbuffer_remove(dbuffer_t *dbuffer, size_t offset, size_t remove_len);
+extern void dbuffer_remove_head(dbuffer_t *dbuffer, size_t remove_len);
+extern void dbuffer_remove_tail(dbuffer_t *dbuffer, size_t remove_len);
+extern uint8 *dbuffer_replace(dbuffer_t *dbuffer, size_t offset, size_t len);
+extern uint8 *dbuffer_replace_all(dbuffer_t *dbuffer);
+extern uint8 *dbuffer_replace_some(dbuffer_t *dbuffer, size_t offset, size_t len, size_t *actual_len);
+extern void dbuffer_set(dbuffer_t *dbuffer, int val, size_t len);
+extern dbuffer_t *dbuffer_split(dbuffer_t *dbuffer, size_t offset);
+extern void dbuffer_truncate(dbuffer_t *dbuffer, size_t new_size);
+extern uint8 *dbuffer_update(dbuffer_t *dbuffer, size_t offset, size_t len);
+extern uint8 *dbuffer_update_all(dbuffer_t *dbuffer);
+extern uint8 *dbuffer_update_some(dbuffer_t *dbuffer, size_t offset, size_t len, size_t *actual_len);
+extern dbuffer_t *new_dbuffer(void);
+extern typedef struct { } dbuffer_t;

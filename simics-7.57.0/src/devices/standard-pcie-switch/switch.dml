@@ -1,0 +1,110 @@
+/*
+  switch.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+//:: pre switch {{
+dml 1.4;
+
+device standard_pcie_switch;
+param classname = "standard-pcie-switch";
+
+param desc = "standard PCIe switch";
+
+param documentation = "A standard PCIe switch with 4 downstream slots that"
+                    + " contains the mandatory capabilities for a PCIe"
+                    + " function in all ports.";
+
+import "pcie/common.dml";
+
+param pcie_version = 6.0;
+
+
+template switch_port is pcie_port {
+    bank pcie_config {
+        register device_id { param init_val = 0x0370; }
+        register vendor_id { param init_val = 0x8086; }
+        register capabilities_ptr { param init_val = 0x40; }
+
+        register bar0 @ 0x10 is (memory_base_address_64) {
+            param size_bits = 14;
+        }
+
+        is defining_pm_capability;
+        param pm_offset = capabilities_ptr.init_val;
+        param pm_next_ptr = pm_offset + 0x08;
+
+        is defining_msix_capability;
+        param msix_offset = pm_next_ptr;
+        param msix_next_ptr = msix_offset + 0x0C;
+        param msix_num_vectors = 32;
+        param msix_table_offset_bir = 0;
+        param msix_pba_offset_bir = (0x10 * msix_num_vectors) << 3;
+        param msix_data_bank = msix_data;
+
+        is defining_exp_capability;
+        param exp_offset = msix_next_ptr;
+        param exp_next_ptr = 0x0;
+        group exp {
+            param has_links = true;
+            group link {
+                param max_link_speed = PCIE_Link_Speed_32;
+                param max_link_width = PCIE_Link_Width_x8;
+            }
+        }
+
+        is defining_dlf_capability;
+        param dlf_offset = 0x100;
+        param dlf_next_ptr = dlf_offset + 0x0C;
+        is defining_pl16g_capability;
+        param pl16g_offset = dlf_next_ptr;
+        param pl16g_next_ptr = pl16g_offset + 0x28;
+        param pl16g_max_link_width = PCIE_Link_Width_x8;
+        param pl16g_max_lanes = PCIE_Link_Width_x8;
+        is defining_pl32g_capability;
+        param pl32g_offset = pl16g_next_ptr;
+        param pl32g_next_ptr = 0;
+        param pl32g_max_lanes = PCIE_Link_Width_x8;
+    }
+
+    bank msix_data is msix_table {
+        param msix_bank = pcie_config;
+    }
+}
+
+subdevice usp is (pcie_upstream_port, switch_port) {
+    bank pcie_config {
+        param exp_dp_type = PCIE_DP_Type_UP;
+    }
+}
+
+subdevice dsp[i < 4] is (pcie_downstream_port, pcie_link_training,
+                         switch_port, post_init) {
+    bank pcie_config {
+        param exp_dp_type = PCIE_DP_Type_DP;
+
+        group exp {
+            param has_hotplug_capable_slot = true;
+            param has_attention_button_slot = true;
+            group slot {
+                param has_power_indicator = true;
+            }
+        }
+    }
+
+
+    method post_init() {
+        pcie_device.connected(usp.downstream_port.obj, i << 3);
+    }
+}
+// }}

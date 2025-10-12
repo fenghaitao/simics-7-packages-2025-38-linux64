@@ -1,0 +1,55 @@
+// sample-device-dml.dml - sample DML code for a Simics device
+
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_device_dml;
+
+// short, one-line description
+param desc = "sample DML device";
+
+// long description
+param documentation = "This is a very simple device.";
+
+import "sample-interface.dml";
+
+// simple attribute
+attribute int_attr is int64_attr "An integer attribute" {
+    method set(attr_value_t val) throws {
+        default(val);
+        log info: "attribute int_attr updated";
+    }
+}
+
+// simple interface implementation
+implement sample {
+    saved int call_count = 0;
+    method simple_method(int arg) {
+        log info: "sample_method() was called with arg %d", arg;
+            // checkpointed variable
+            call_count++;
+    }
+}
+
+// example bank with a register
+bank regs {
+    param desc = dev.desc + "custom desc";
+    register r1 size 4 @ 0x0000 is read {
+        method read() -> (uint64) {
+            log info: "read from r1";
+            return 42 + sample.call_count;
+        }
+    }
+}

@@ -1,0 +1,338 @@
+/*
+ * sample-i3c-target.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_i3c_target;
+param classname= "sample-i3c-target";
+
+param documentation = "Sample i3c target device";
+param desc = "I3C target device";
+
+import "simics/devs/i3c.dml";
+import "utility.dml";
+
+param INVALID_ADDRESS = 0xFF;
+param INVALID_COMMAND = 0x1FF;
+
+param St_Idle        = 0;
+param St_IBI         = 1;
+param St_I2C_Read    = 2;
+param St_I2C_Write   = 3;
+param St_I3C_Read    = 4;
+param St_I3C_Write   = 5;
+param St_I3C_Cmd     = 6;
+param St_Wait_DA     = 7;
+param St_Listening   = 8;
+
+param CCC_DISEC  = 0x01;
+param CCC_RSTDAA = 0x06;
+param CCC_ENTDAA = 0x07;
+param CCC_GETMWL = 0x8B;
+param CCC_GETMRL = 0x8C;
+param CCC_GETPID = 0x8D;
+param CCC_GETBCR = 0x8E;
+param CCC_GETDCR = 0x8F;
+param CCC_SETDASA = 0x87;
+
+param BCR = 8;
+param DEFAULT_READ_VAL = 0xA5;
+
+connect bus {
+    param documentation = "Connect to I3C bus";
+    param configuration = "optional";
+    interface i3c_master;
+}
+
+attribute provisional_id is uint64_attr {
+    param documentation = "Unique ID for dynamic address assigning, "
+                            + "only the lower 48 bits are valid";
+}
+
+attribute static_address is uint64_attr {
+    param documentation =
+            "7 bits static address, set as 0xff to disable it";
+}
+
+attribute dcr is uint64_attr {
+    param documentation = "I3C Device Characteristic Register";
+}
+
+attribute read_value is uint64_attr {
+    param documentation = "8-bit value for read response";
+}
+
+
+saved uint4 i3c_status;
+saved uint8 dynamic_address;
+saved uint9 command;
+
+template sample_fifo {
+    param fifo_size;
+    saved uint32 tail;
+    saved uint32 len;
+    #if (true) {
+        saved uint8 fifo_buf[fifo_size];
+    }
+
+    method push(uint8 value) throws default {
+        if (len >= fifo_size) throw;
+        fifo_buf[tail + len++ % fifo_size] = value;
+    }
+
+    method pop() -> (uint8) throws default {
+        if (len == 0) throw;
+        local uint8 value = fifo_buf[tail];
+        tail = (tail + 1) % fifo_size;
+        --len;
+        return value;
+    }
+    method clear() { len = 0; }
+    method is_empty() -> (bool) { return len == 0; }
+}
+
+group data_fifo {
+    is sample_fifo;
+    param fifo_size = 100;
+
+    method get_data() -> (uint8) {
+        local uint8 byte;
+        try {
+            return pop();
+        } catch {
+            return read_value.val;
+        }
+    }
+
+    method store_data(uint8 byte) {
+        try {
+            this.push(byte);
+        } catch {}
+    }
+}
+
+implement i3c_slave {
+    method ibi_start() {
+        log info, 4: "Received IBI start from host controller";
+        log info, 3: "Send IBI address (0x%x) to host controller", ibi.val;
+        bus.i3c_master.ibi_address(ibi.val);
+    }
+
+    method ibi_acknowledge(i3c_ack_t ack) {
+        log info, 4:
+            "Received %s from host controller", ack == I3C_ack ? "ACK" : "NACK";
+        if (i3c_status == St_IBI) {
+            if (ack == I3C_ack) {
+                i3c_status = (ibi.val & 1) == 0 ? St_I3C_Write : St_I3C_Read;
+            } else
+                i3c_status = St_Listening;
+            ibi.val = INVALID_ADDRESS;
+            return;
+        }
+        log spec_viol: "Unexpected acknowledge from host controller";
+    }
+
+    method start(uint8 address) {
+        local uint8 addr = address >> 1;
+        local bool read = (address & 1) != 0;
+        local bool ack = true;
+
+        log info, 4: "Received %sstart (0x%x)",
+            i3c_status == St_Idle ? "" : "repeated ", addr;
+        if (match_address(static_address.val, addr)) {
+            if (!read && command == CCC_SETDASA)
+                i3c_status = St_I3C_Write;
+            else
+                i3c_status = read ? St_I2C_Read : St_I2C_Write;
+        } else if (match_address(dynamic_address, addr)) {
+            i3c_status = read ? St_I3C_Read : St_I3C_Write;
+        } else if (addr == 0x7e) {
+            if (!read) {
+                command = INVALID_COMMAND;
+                i3c_status = St_I3C_Cmd;
+            } else if (command == CCC_ENTDAA
+                       && dynamic_address != INVALID_ADDRESS) {
+                ack = false;
+                i3c_status = St_Listening;
+            } else {
+                if (command != CCC_ENTDAA)
+                    ack = false;
+                i3c_status = ack ? St_I3C_Read : St_Listening;
+            }
+        } else {
+            i3c_status = St_Listening;
+            ack = false;
+        }
+        log info, 4: "Send %sACK to the master, st=%d", ack ? "" : "N", i3c_status;
+        acknowledge(ack ? I3C_ack : I3C_noack);
+    }
+
+    method write(uint8 data) {
+        local i3c_ack_t ack = I3C_noack;
+        log info, 4: "Received i2c write (0x%x) from master", data;
+        if (i3c_status == St_I2C_Write) {
+            data_fifo.store_data(data);
+            ack = I3C_ack;
+        } else if (i3c_status == St_Wait_DA) {
+            dynamic_address = data >> 1;
+            log info, 3: "New dynamic address 0x%02x", dynamic_address;
+            ack = I3C_ack;
+        } else {
+            log spec_viol, 1: "Unexpected I2C write request";
+        }
+        acknowledge(ack);
+    }
+
+    method sdr_write(bytes_t buf) {
+        log info, 4: "Received i3c write (%zd bytes)", buf.len;
+        if (i3c_status == St_I3C_Cmd || i3c_status == St_I3C_Write) {
+            local int i;
+            for (i = 0; i < buf.len; i++) {
+                if (i3c_status == St_I3C_Cmd) {
+                    command = buf.data[i];
+                    i3c_status = St_I3C_Write;
+                    log info, 3: "Received I3C command 0x%02X", command;
+                    handle_ccc(command);
+                } else if (i3c_status == St_I3C_Write && command == CCC_SETDASA) {
+                    dynamic_address = buf.data[0] >> 1;
+                    log info, 3: "New dynamic address 0x%02x", dynamic_address;
+                } else {
+                    log info, 4: "Received I3C data 0x%02X", buf.data[i];
+                    data_fifo.store_data(buf.data[i]);
+                }
+            }
+        } else {
+            log spec_viol: "Unexpected i3c write request, st=%d", i3c_status;
+        }
+    }
+
+    method read() {
+        log info, 4: "Received read request from the master";
+        if (i3c_status == St_I2C_Read) {
+            local uint8 data = data_fifo.get_data();
+            log info, 4: "Send i2c data (0x%x)", data;
+            read_response(data, true);
+        } else if (i3c_status == St_I3C_Read) {
+            local uint8 data = data_fifo.get_data();
+            log info, 4: "Send i3c data (0x%x)", data;
+            read_response(data, !data_fifo.is_empty());
+        } else {
+            log spec_viol: "Unexpected read request";
+        }
+    }
+
+    method daa_read() {
+        log info, 4: "Received DAA read request from the master";
+        if (i3c_status == St_I3C_Read && command == CCC_ENTDAA) {
+            log info, 4: "Send daa data (0x%012X%02x%02X)", provisional_id.val, BCR, dcr.val;
+            i3c_status = St_Wait_DA;
+            daa_response(provisional_id.val, BCR, dcr.val);
+        } else {
+            log spec_viol: "Unexpected DAA read request";
+        }
+    }
+
+    method stop() {
+        log info, 4: "Received stop from master";
+        i3c_status = St_Idle;
+        command = INVALID_COMMAND;
+        if (ibi.val != INVALID_ADDRESS)
+            ibi.request();
+    }
+}
+
+attribute ibi is (uint64_attr) {
+    method set(attr_value_t value) throws {
+        default(value);
+        if (this.val == INVALID_ADDRESS)
+            return;
+        if (bus.obj == NULL) {
+            log spec_viol, 1:
+                "Cannot request the IBI for it doesn't connect to i3c bus";
+            return;
+        }
+        if (i3c_status == St_Idle)
+            request();
+    }
+
+    method request() {
+        log info, 3: "Issue start request to the master";
+        i3c_status = St_IBI;
+        bus.i3c_master.ibi_request();
+    }
+}
+
+method match_address(uint8 addr, uint8 recv) -> (bool) {
+        return (addr != INVALID_ADDRESS) && (addr == recv);
+}
+
+method acknowledge(i3c_ack_t ack) {
+    bus.i3c_master.acknowledge(ack);
+}
+
+method read_response(uint8 value, bool more) {
+    bus.i3c_master.read_response(value, more);
+}
+
+method daa_response(uint64 id, uint8 bcr, uint8 dcr) {
+    bus.i3c_master.daa_response(id, bcr, dcr);
+}
+
+method handle_ccc(uint8 ccc) {
+    data_fifo.clear();
+
+    switch (ccc) {
+    case CCC_RSTDAA:
+        log info, 3: "CCC RSTDAA";
+        dynamic_address = INVALID_ADDRESS;
+        break;
+    case CCC_GETMWL:
+    case CCC_GETMRL:
+        log info, 3: "CCC GETM[WR]L";
+        try {
+            data_fifo.push(8);
+            data_fifo.push(0);
+        } catch { }
+        break;
+    case CCC_GETBCR:
+        log info, 3: "CCC GETBCR";
+        try {
+            data_fifo.push(BCR);
+        } catch { }
+        break;
+    case CCC_GETDCR:
+        log info, 3: "CCC GETDCR";
+        try {
+            data_fifo.push(dcr.val);
+        } catch { }
+        break;
+    case CCC_GETPID:
+        log info, 3: "CCC GETPID";
+        local int i;
+        for (i = 0; i < 6; i++) {
+            try {
+                data_fifo.push((provisional_id.val >> ((5 - i) * 8)) & 0xFF);
+            } catch { }
+        }
+        break;
+    }
+}
+
+method init() {
+    static_address.val = INVALID_ADDRESS;
+    ibi.val = INVALID_ADDRESS;
+    dynamic_address = INVALID_ADDRESS;
+    command = INVALID_COMMAND;
+}

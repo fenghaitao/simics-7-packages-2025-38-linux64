@@ -1,0 +1,755 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device generic_hpet;
+
+param desc = "generic x86 HPET";
+param documentation = "High precision event timer.";
+
+import "utility.dml";
+import "simics/devs/interrupt.dml";
+import "simics/devs/memory-space.dml";
+import "simics/devs/pci.dml"; 
+import "simics/model-iface/transaction.dml";
+import "io-apic.dml";
+
+param num_of_timer default 8; // Must be 4 or 8
+
+param COUNTER_CLK_PERIOD     = 6.984127871e-8;
+param FREQ_MHZ               = 14.318179941;
+param MAX64                  = 0xFFFFFFFFFFFFFFFF;
+param MAX32                  = 0x00000000FFFFFFFF;
+param VAL_MASK_32B           = MAX32;
+
+is (hreset, sreset);
+
+method soft_reset() {
+    hard_reset();
+}
+
+connect intc_apic {
+    param documentation = "Connection to APIC interrupt controller.";
+    param required = true;
+    interface ioapic;
+}
+
+attribute bdf_for_memory_space_msi[i < 8] is uint64_attr {
+    param configuration = "optional";
+}
+
+connect msi_transaction_tgt{
+    param documentation = "Object used for FSB interrupt delivery" +
+        "used if the memory space is not used for FSB interrupt delivery.";
+    param configuration = "optional";
+    interface transaction;
+}
+
+connect memory_space {
+    param documentation = "Memory space used for FSB interrupt delivery.";
+    interface memory_space;
+}
+
+/* forward INT0 and INT8 in non-legacy replacement mode */
+implement simple_interrupt {
+    method interrupt(int irq) {
+        assert (irq == 0 || irq == 8);
+        if (regs.gen_conf.leg_rt_cnf.val != 0)
+            return;
+        intc_apic.ioapic.interrupt((irq == 0) ? 2 : 8);
+    }
+    method interrupt_clear(int irq) {
+        assert (irq == 0 || irq == 8);
+        if (regs.gen_conf.leg_rt_cnf.val != 0)
+            return;
+        intc_apic.ioapic.interrupt_clear((irq == 0) ? 2 : 8);
+    }
+}
+
+attribute start_time is double_attr {
+    param documentation = "Latest start time of the main counter";
+}
+
+attribute comp_write_slow_cycles {
+    param documentation = "Number of cycles the cpu should be " +
+        "stalled when the comparator register is written (performance " +
+        "optimization)";
+    //parameter allocate_type = "uint32";
+    session uint32 val;
+    param type = "i";
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(val);
+    }
+    method set(attr_value_t v) throws {
+        val = SIM_attr_integer(v);
+    }
+}
+
+// next timer overflow
+event tim_event is simple_time_event {
+    method event() {
+        regs.on_event();
+    }
+}
+
+// stall support
+extern void do_stall(conf_object_t *obj, uint32 cycles);
+header %{
+#include <simics/model-iface/step.h>
+
+static void do_stall(conf_object_t *initiator, uint32 cycles) {
+    const stall_interface_t *si = SIM_c_get_interface(initiator, "stall");
+    // initiator is not required to implement stall interface
+    if (si != NULL)
+        si->set_stall_cycles(initiator, cycles);
+}
+%}
+method stall(conf_object_t *initiator, uint32 cycles) 
+{
+    // this is performance opt only, ignore silently
+    if (cycles > 0 && initiator != NULL)
+        do_stall(initiator, cycles);
+}
+
+bank regs {
+    param register_size = 8;
+    param partial = true;
+    param use_io_memory = false;
+
+    register gcap_id    @ 0x0  "General Capabilities and Id Register";
+    register gen_conf   @ 0x10 "General Configure Register";
+    register gintr_sta  @ 0x20 "General Interrupt Status Register";
+    register main_cnt   @ 0xF0 "Main Counter Value Register";
+    register tim_conf[i < num_of_timer] @ (0x100 + i * 0x20) 
+                "Timer n Configuration and Capabilities";
+    register tim_comp [i < num_of_timer] @ (0x108 + i * 0x20) 
+                "Timer n Comparator Value Register";
+    register fsb_int_rout [i < num_of_timer] @ (0x110 + i * 0x20) 
+                "Timer n FSB Interrupt Route Register";
+
+    register tim_comp [i < num_of_timer] {
+        // 0xFFFF-FFFF for 32-bits; 0xFFFF-FFFF-FFFF-FFFF for 64-bits
+        param init_val = (i == 0) ? MAX64 : MAX32;
+    }
+}
+
+bank regs {
+    session conf_object_t* last_initiator = NULL;
+    method transaction_access(transaction_t *t, uint64 offset, void *aux)
+           -> (exception_type_t) {
+        last_initiator = SIM_transaction_initiator(t);
+        return default(t, offset, aux);
+    }
+    register gcap_id {
+        is read_only;
+
+        field counter_clk    @ [63:32] "Main Counter Tick Period";
+        field vendor_id      @ [31:16] "Vendor ID Capability";
+        field leg_rt         @ [15]    "Legacy Replacement Rout Capable";
+        field count_size     @ [13]    "Counter Size Capability";
+        field num_tim        @ [12:8]  "Number of Timer Capability";
+        field rev_id         @ [7:0]   "Revision Identification";
+
+        field counter_clk   { param init_val = 69841279; }
+        field vendor_id     { param init_val = 0x8086; }
+        field leg_rt        { param init_val = 0b1; }
+        field count_size    { param init_val = 0b1; }
+        field num_tim       { param init_val = num_of_timer - 1; }
+        field rev_id        { param init_val = 0x01; }
+    }
+
+    register gen_conf {
+        field leg_rt_cnf     @ [1] "Legacy Replacement Rout";
+        field enable_cnf     @ [0] "Overall Enable";
+
+        field leg_rt_cnf {
+            is write;
+            method write(uint64 value) {
+                if (value == this.val)
+                    return;
+                clear_irq_pin(0);
+                clear_irq_pin(1);
+                this.val = value;
+            }
+        }
+
+        field enable_cnf {
+            is write;
+            method write(uint64 value) {
+                log info, 3 : "writing overall-enable field to: %d", value;
+                if (this.val == value)
+                    return;
+                if (value == 1) {
+                    // main counter start
+                    start_time.val = SIM_time(dev.obj);
+                } else {
+                    // main counter stop
+                    main_cnt.on_before_stop();
+                }
+                this.val = value;
+            }
+        }
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            update_interrupts();
+            update_event();
+        }
+    }
+
+    register gintr_sta {
+        field status @ [num_of_timer - 1:0] "Timer interrupt status" {
+            is write;
+            method write(uint64 value) {
+                this.val &= ~value;
+                update_interrupts();
+            }
+        }
+    }
+
+    register main_cnt {
+        is write;
+        method write(uint64 value) {
+            log info, 3: "main counter set to: 0x%x", value;
+            this.val = handled_tick.val = value;
+
+            if (gen_conf.enable_cnf.val == 1) { 
+                log spec_viol, 2: 
+                    "main counter written while counter is running";
+                update_event();
+            }
+        }
+        is read;
+        method read() -> (uint64) {
+            local uint64 value;
+            value = get_main_cnt();
+            if (cast(handled_tick.val - value, int64) > 0) {
+                // ensure the counter is monotonically increasing with
+                // respect to already handled comparator matches
+                value = handled_tick.val;
+            }
+            return value;
+        }
+        method get() -> (uint64) {
+            return this.val;
+        }
+
+        // get the running main cnt value
+        method get_main_cnt() -> (uint64) {
+            local uint64 value;
+            value = this.val;
+            if (gen_conf.enable_cnf.val != 0) {
+                local double delta = SIM_time(dev.obj) - start_time.val + 1.0e-8;
+                local uint64 cnt = cast(delta / COUNTER_CLK_PERIOD, uint64);
+                value += cnt;
+            }
+            return value;
+        }
+        // renormalize counter to keep precision
+        method renormalize_main_cnt() {
+            this.val = get_main_cnt();
+            start_time.val = SIM_time(dev.obj);
+        }
+        
+        method on_before_stop() {
+            this.val = get_main_cnt();
+        }
+    }
+
+    register running_main_cnt {
+        param configuration = "pseudo";
+        is unmapped;
+        method get() -> (uint64) {
+            local uint64 value;
+            value = main_cnt.get_main_cnt();
+            return value;
+        }
+    }
+
+    register fsb_int_rout[i < num_of_timer] {
+        field fsb_int_addr           @ [63:32] "FSB Interrupt Address";
+        field fsb_int_val            @ [31:0]  "FSB Interrupt Value";
+    }
+
+    register tim_conf[i < num_of_timer] {
+        field timer_intr_rout_cap    @ [63:32] "Timer Interrupt Route Capability";
+        field timer_fsb_int_del_cap  @ [15]    "FSB Interrupt Delivery Capability";
+        field timer_fsb_en_cnf       @ [14]    "FSB Interrupt Enable";
+        field timer_intr_rout_cnf    @ [13:9]  "Interrupt Rout";
+        field timer_32mode_cnf       @ [8]     "Timer 32-bit Mode";
+        field timer_val_set_cnf      @ [6]     "Timer Value Set";
+        field timer_size_cap         @ [5]     "Timer Size";
+        field timer_period_intr_cap  @ [4]     "Timer Periodic Interrupt Capable";
+        field timer_type_cnf         @ [3]     "Timer Type";
+        field timer_intr_en_cnf      @ [2]     "Timer Interrupt Enable";
+        field timer_intr_type        @ [1]     "Timer Interrupt Type";
+
+        field timer_intr_rout_cap {
+            is read_only;
+            param init_val = 
+                (i < 2) ? (0xf << 20) :
+                (i == 2) ? (0xf << 20) | (1 << 11) :
+                (i == 3) ? (0xf << 20) | (1 << 12) :
+                0 /* only FSB delivery for timer 4-7 */;
+        }
+        field timer_fsb_int_del_cap {
+            is read_only; param init_val = 1;
+        }
+        field timer_size_cap {
+            is read_only; param init_val = (i == 0) ? 1 : 0;
+        }
+        field timer_period_intr_cap {
+            is read_only; param init_val = (i == 0) ? 1 : 0;
+        }
+
+        field timer_intr_type { 
+            is write;
+            method write(uint64 value) {
+                if (i >= 4 && value != 0) {
+                    log spec_viol, 1: "invalid interrupt type";
+                    return;
+                }
+                if (this.val == value)
+                    return;
+                this.val = value;
+                clear_irq_pin(i);
+            }
+        }
+
+        field timer_intr_en_cnf {
+            is write;
+            method write(uint64 value) {
+                if (this.val == value)
+                    return;
+                this.val = value;
+                clear_irq_pin(i);
+            }
+        }
+
+        field timer_fsb_en_cnf {
+            is write;
+            method write(uint64 value) {
+                if (this.val == value)
+                    return;
+                this.val = value;
+                clear_irq_pin(i);
+            }
+        }
+
+        field timer_intr_rout_cnf {
+            is write;
+            method write(uint64 value) {
+                if (value != 0 && timer_intr_rout_cap.val[value] == 0) {
+                    log spec_viol, 1: "invalid interrupt routing";
+                    return;
+                }
+                if (this.val == value)
+                    return;
+                this.val = value;
+                clear_irq_pin(i);
+            }
+        }
+
+        field timer_32mode_cnf  {
+            is write;
+            method write(uint64 value) {
+                // only supported for 64-bit timers
+                if (tim_conf[i].timer_size_cap.val != 1)
+                    return;
+
+                if ((this.val == 0) && (value == 1))
+                    tim_comp[i].val &= VAL_MASK_32B;
+                this.val = value;
+            }
+        }
+
+        field timer_val_set_cnf {
+            is write;
+            method write(uint64 value) {
+                // only supported for periodical timers
+                if (tim_conf[i].timer_period_intr_cap.val == 1)
+                    this.val = value;
+            }
+        }
+
+        field timer_type_cnf {
+            is write;
+            method write(uint64 value) {
+                //only supported for periodical timer
+                if (tim_conf[i].timer_period_intr_cap.val == 1)
+                    this.val = value;
+            }
+        }
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            local uint64 regVal;
+            regVal = this.get();
+            log info, 2 : "setting timer %d conf reg to 0x%x", i, regVal;
+            update_event();
+            // raise newly enabled interrupts
+            update_interrupt(i);
+        }
+    }
+
+    register tim_comp[i < num_of_timer] {
+        is write;
+        method write(uint64 value) {
+            local bool stall_mop = false;
+            log info, 3 : "writing timer %d comparator to: 0x%x", i, value;
+
+            local uint64 mask;
+            mask = get_mask(i);
+            value &= mask;
+
+            local bool is_periodic;
+            is_periodic = bank.is_periodic(i);
+
+            if (is_periodic) {
+                if (tim_conf[i].timer_val_set_cnf.val != 0) {
+                    tim_conf[i].timer_val_set_cnf.val = 0;
+                    this.val = value;
+                    // the specs are not crystal clear - it may be that
+                    // the period should be set here too, simultaneously
+                } else {
+                    tim_period[i].val = value;
+                }
+            } else {
+                stall_mop = true;
+                this.val = value;
+            }
+            update_event();
+
+            if (stall_mop) {
+                stall(last_initiator, comp_write_slow_cycles.val);
+            }
+        }
+    }
+
+    register irq_pins[i < num_of_timer] is (unmapped) 
+        "Timer n IRQ output state (level interrupts only)" { 
+        field apic_irq @ [7:0];
+        field i8259_irq @ [15:8];
+        field raised @ [16];
+        
+        method hard_reset() {
+            clear_irq_pin(i);
+        }
+    }
+
+    // highest main counter tick which has been handled. Also
+    // used as a lower bound for main counter reads (rounding
+    // error protection)
+    register handled_tick is (unmapped);
+
+    // timer period (valid for periodic timers only)
+    register tim_period[i < num_of_timer] is (unmapped);
+
+    // main counter tick corresponding to the posted event
+    register event_tick {
+        is unmapped;
+        session bool posted;       // event_tick value valid
+        method set(uint64 value) {
+            default(value);
+            posted = tim_event.posted();
+        }
+        method hard_reset() {
+            if (SIM_object_is_configured(dev.obj))
+                tim_event.remove();
+            posted = false;
+            this.val = 0;
+        }
+    }
+
+    // find next comparator match tick
+    method next_match_tick() -> (uint64) {
+        local uint64 now;
+        now = main_cnt.get_main_cnt();
+
+        local uint64 offs = MAX64;
+        local int i;
+        for (i = 0; i < num_of_timer; i++) {
+            local uint64 diff = regs.tim_comp[i].val - now;
+            local uint64 mask;
+            mask = get_mask(i);
+            diff &= mask;
+
+            // already handled?
+            if (cast(now + diff - handled_tick.val, int64) <= 0) {
+                if (mask < offs)
+                    offs = mask + 1;
+                continue;
+            }
+
+            if (diff < offs)
+                offs = diff;
+        }
+        return now + offs;
+    }
+
+    // move event to the next comparator match
+    method update_event() {
+        if (gen_conf.enable_cnf.val != 1) {
+            if (event_tick.posted) {
+                tim_event.remove();
+                event_tick.posted = false;
+            }
+            return;
+        }
+        local uint64 match_tick;
+        match_tick = next_match_tick();
+
+        if (event_tick.posted) {
+            // avoid reposting the same event
+            if (event_tick.val == match_tick)
+                return;
+            tim_event.remove();
+        }
+        
+        // post new event
+        local uint64 offs = match_tick - main_cnt.val;
+        local double delay = (offs * COUNTER_CLK_PERIOD
+                              - (SIM_time(dev.obj) - start_time.val));
+        // delay can actually become slightly negative...
+        if (delay < 0)
+            delay = 0;
+
+        log info, 4: "posting event at tick 0x%x (expires in %fs)",
+            match_tick, delay;
+        tim_event.post(delay);
+
+        event_tick.posted = true;
+        event_tick.val = match_tick;
+    }
+
+    // comparator match event
+    method on_event() {
+        log info, 4: "comparator match at tick 0x%lx", event_tick.val;
+        event_tick.posted = false;
+
+        // trigger all comparator matches in the interval [event_tick, now]
+        local uint64 now;
+        now = main_cnt.get_main_cnt();
+        main_cnt.renormalize_main_cnt();    // improves precision
+        local uint64 start = (event_tick.val < now) ? event_tick.val : now;
+        local uint64 end = (event_tick.val > now) ? event_tick.val : now;
+        local uint64 xdiff = end - start;
+
+        local int i;
+        for (i = 0; i < num_of_timer; i++) {
+            local uint64 mask;
+            mask = get_mask(i);
+            local uint64 diff = (tim_comp[i].val - start) & mask;
+            if (diff <= xdiff)
+                comparator_match(i);
+        }
+        handled_tick.val = end;
+        update_event();
+    }
+
+    method comparator_match(int index) {
+        // update comparator for periodic interrupts
+        local bool is_periodic;
+        is_periodic = this.is_periodic(index);
+        if (is_periodic) {
+            local uint64 mask;
+            mask = get_mask(index);
+            tim_comp[index].val += tim_period[index].val & mask;
+        }
+
+        // set interrupt status for level interrupts
+        local bool is_level;
+        is_level = this.is_level(index);
+        if (is_level) {
+            if (gintr_sta.status.val[index] == 1)
+                return;
+            gintr_sta.status.val[index] = 1;
+        }
+        if (tim_conf[index].timer_intr_en_cnf.val == 1)
+            send_interrupt(index);
+    }
+
+    method update_interrupt(int index) {
+        assert index < num_of_timer;
+        local bool is_level;
+        is_level = this.is_level(index);
+        local bool enabled = gen_conf.enable_cnf.val != 0 
+            && tim_conf[index].timer_intr_en_cnf.val == 1;
+        local bool active;
+
+        if (is_level)
+            active = enabled && (gintr_sta.status.val[index] == 1);
+        else {
+            // pin status should not be changed for edge
+            // triggered interrupts (unless the irq is disabled)
+            active = enabled && irq_pins[index].raised.val != 0;
+        }
+
+        if (irq_pins[index].raised.val != cast(active, uint1)) {
+            if (active)
+                set_irq_pin(index);
+            else
+                clear_irq_pin(index);
+        }
+    }
+
+    method update_interrupts() {
+        local int i;
+        for (i = 0; i < num_of_timer; i++)
+            update_interrupt(i);
+    }
+
+    method send_fsb_int(int index) {
+        local uint32 val = fsb_int_rout[index].fsb_int_val.val;
+        local physical_address_t dst = fsb_int_rout[index].fsb_int_addr.val;
+
+        if (memory_space.obj) {
+            local exception_type_t ex = memory_space.memory_space.access_simple(
+                dev.obj, dst, cast(&val, uint8 *), 4, Sim_RW_Write,
+                Sim_Endian_Host_From_LE);
+            if (ex != Sim_PE_No_Exception) {
+                log error:
+                    "An error occurred when writing to memory @ 0x%x: %d",
+                    dst, cast(ex, int);
+            }
+            log info, 3 : "timer %d sent an FSB interrupt (0x%x @ %08lx)",
+                index, val, dst;
+        } else {
+            if (!msi_transaction_tgt.obj) {
+                log error:
+                    "Error sending HPET MSI (memory_space/transaction_target not connected)";
+                return;
+            }
+
+            log info, 3: "sending HPET-%d MSI (0x%x) -> 0x%lx",
+                index, val, dst;
+
+            local uint8 buf[4];
+            local pcie_error_ret_t er;
+            local atom_t atoms[8] = {
+                ATOM_pcie_type(PCIE_Type_Mem),
+                ATOM_flags(Sim_Transaction_Write),
+                ATOM_data(buf),
+                ATOM_size(4),
+                ATOM_pcie_requester_id(bdf_for_memory_space_msi[index].val),
+                ATOM_initiator(dev.obj),
+                ATOM_pcie_error_ret(&er),
+                ATOM_list_end(0),
+            };
+
+            local transaction_t t;
+            t.atoms = atoms;
+            SIM_set_transaction_value_le(&t, val);
+
+            local pci_memory_transaction_t trans;
+            memset(&trans, 0, sizeof(trans));
+            
+            local exception_type_t ex =
+                msi_transaction_tgt.transaction.issue(&t, dst);
+
+            if (ex == Sim_PE_No_Exception)
+                return;
+            if (ex == Sim_PE_IO_Not_Taken) {
+                log info, 1: "Master Abort while sending MSI to %lx", dst;
+            } else if (ex == Sim_PE_IO_Error) {
+                log info, 1: "Target Abort while sending MSI to %lx", dst;
+            } else {
+                log info, 1: "Unknown exception while sending MSI to %lx", 
+                    dst;
+            }
+        }
+    }
+
+    // all enable flags handling etc should have been done previously
+    method send_interrupt(int index) {
+        // FSB delivery (MSI)
+        if (tim_conf[index].timer_fsb_en_cnf.val != 0) {
+            send_fsb_int(index);
+            return;
+        }
+
+        local bool is_level;
+        is_level = this.is_level(index);
+
+        // edge interrupts: clear interrupt line and raise immediately
+        if (!is_level)
+            clear_irq_pin(index);
+
+        set_irq_pin(index);
+    }
+    
+    method set_irq_pin(int index) {
+        local uint32 apic_no;
+        local uint32 i8259_no;
+        (i8259_no, apic_no) = get_irq_route(index);
+
+        // don't raise interrupts if there IRQ routing is set to 0
+        if (apic_no == 0) {
+            log spec_viol, 1 : 
+                "Can't raise IRQ for timer %d (no IRQ routing set)", index;
+            return;
+        }
+
+        // new output pin state
+        irq_pins[index].apic_irq.val = apic_no;
+        irq_pins[index].i8259_irq.val = i8259_no;
+        irq_pins[index].raised.val = true;
+
+        // to IOAPIC
+        intc_apic.ioapic.interrupt(apic_no);
+        log info, 3 :
+            "timer %d raised interrupt %d to IO-APIC",
+            index, apic_no;
+    }
+
+    // lower (level) interrupt, if raised
+    method clear_irq_pin(int i) {
+        assert i < num_of_timer;
+        if (irq_pins[i].raised.val != 0) {
+            intc_apic.ioapic.interrupt_clear(irq_pins[i].apic_irq.val);
+            local uint32 i8259_no = irq_pins[i].i8259_irq.val;
+            irq_pins[i].raised.val = 0;
+            log info, 3 :
+                "timer %d lowered interrupt %d on IO-APIC",
+                i, irq_pins[i].apic_irq.val;
+        }
+    }
+
+    // helpers
+    method get_irq_route(uint32 index) -> (uint32, uint32) /* i8259_no, apic_no */ {
+        local uint32 i8259_no;
+        local uint32 apic_no;
+        if (gen_conf.leg_rt_cnf.val == 1 && index < 2) {
+            apic_no = (index == 0) ? 2 : 8;
+            i8259_no = (index == 0) ? 0 : 8;
+        } else {
+            i8259_no = apic_no = tim_conf[index].timer_intr_rout_cnf.val;
+        }
+        return (i8259_no, apic_no);
+    }
+
+    method is_periodic(int i) -> (bool)  {
+        return tim_conf[i].timer_type_cnf.val == 1;
+    }
+
+    method is_level(int i) -> (bool) {
+        return (tim_conf[i].timer_intr_type.val == 1
+                 && tim_conf[i].timer_fsb_en_cnf.val == 0);
+    }
+    
+    method get_mask(int i) -> (uint64) {
+        return ((tim_conf[i].timer_size_cap.val == 1)
+                 && tim_conf[i].timer_32mode_cnf.val == 0) ?
+            MAX64 : MAX32;
+    }
+}

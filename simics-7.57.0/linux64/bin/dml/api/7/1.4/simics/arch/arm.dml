@@ -1,0 +1,114 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/arch/arm.h>
+%}
+
+import "simics/base/transaction.dml";
+import "simics/processor/types.dml";
+import "simics/pywrap.dml";
+
+extern atom_t ATOM_arm_device_id(uint64 val);
+extern atom_t ATOM_arm_memory_attributes(uint64 val);
+extern atom_t ATOM_arm_nonsecure(bool val);
+extern atom_t ATOM_arm_nsaid(uint64 val);
+extern atom_t ATOM_arm_privileged(bool val);
+extern atom_t ATOM_arm_smmu_attributes(uint64 val);
+extern uint64 ATOM_get_transaction_arm_device_id(transaction_t const *t);
+extern uint64 ATOM_get_transaction_arm_memory_attributes(transaction_t const *t);
+extern bool ATOM_get_transaction_arm_nonsecure(transaction_t const *t);
+extern uint64 ATOM_get_transaction_arm_nsaid(transaction_t const *t);
+extern bool ATOM_get_transaction_arm_privileged(transaction_t const *t);
+extern uint64 ATOM_get_transaction_arm_smmu_attributes(transaction_t const *t);
+extern uint64 const *ATOM_transaction_arm_device_id(transaction_t const *t);
+extern uint64 const *ATOM_transaction_arm_memory_attributes(transaction_t const *t);
+extern bool const *ATOM_transaction_arm_nonsecure(transaction_t const *t);
+extern uint64 const *ATOM_transaction_arm_nsaid(transaction_t const *t);
+extern bool const *ATOM_transaction_arm_privileged(transaction_t const *t);
+extern uint64 const *ATOM_transaction_arm_smmu_attributes(transaction_t const *t);
+extern arm_memory_transaction_t *SIM_arm_mem_trans_from_generic(generic_transaction_t *mop);
+extern uint64 pywrap_arm_device_id_from_atom(atom_t *a);
+extern uint64 pywrap_arm_memory_attributes_from_atom(atom_t *a);
+extern bool pywrap_arm_nonsecure_from_atom(atom_t *a);
+extern uint64 pywrap_arm_nsaid_from_atom(atom_t *a);
+extern bool pywrap_arm_privileged_from_atom(atom_t *a);
+extern uint64 pywrap_arm_smmu_attributes_from_atom(atom_t *a);
+extern atom_t pywrap_atom_from_arm_device_id(uint64 val);
+extern atom_t pywrap_atom_from_arm_memory_attributes(uint64 val);
+extern atom_t pywrap_atom_from_arm_nonsecure(bool val);
+extern atom_t pywrap_atom_from_arm_nsaid(uint64 val);
+extern atom_t pywrap_atom_from_arm_privileged(bool val);
+extern atom_t pywrap_atom_from_arm_smmu_attributes(uint64 val);
+extern typedef int arm_mem_instr_origin_t;
+constant Instr_Normal_Arm = 0;
+constant Instr_Unprivileged_Load = 1;
+constant Instr_Unprivileged_Store = 2;
+constant Instr_ldrex = 3;
+constant Instr_strex = 4;
+constant Instr_ldxp = 5;
+constant Instr_stxp = 6;
+constant Instr_At = 7;
+constant Instr_Atomic = 8;
+constant Instr_Cache_Maintenance = 9;
+constant Instr_Count = 10;
+extern typedef int arm_trustzone_mode_t;
+constant Arm_Trustzone_Secure = 0;
+constant Arm_Trustzone_Non_Secure = 1;
+extern typedef int arm_mem_type_t;
+constant Arm_MemType_Normal = 0;
+constant Arm_MemType_Device = 1;
+extern typedef int arm_device_type_t;
+constant Arm_DeviceType_nGnRnE = 0;
+constant Arm_DeviceType_nGnRE = 1;
+constant Arm_DeviceType_nGRE = 2;
+constant Arm_DeviceType_GRE = 3;
+constant Arm_DeviceType_Unknown = 4;
+extern typedef int arm_mem_attr_t;
+constant Arm_MemAttr_NC = 0;
+constant Arm_MemAttr_WT = 2;
+constant Arm_MemAttr_WB = 3;
+constant Arm_MemAttr_Unknown = 4;
+extern typedef int arm_mem_hint_t;
+constant Arm_MemHint_No = 0;
+constant Arm_MemHint_WA = 1;
+constant Arm_MemHint_RA = 2;
+constant Arm_MemHint_RWA = 3;
+constant Arm_MemHint_Unknown = 4;
+extern typedef int arm_mem_transient_t;
+constant Arm_Transient_True = 0;
+constant Arm_Transient_False = 1;
+constant Arm_Transient_Unknown = 2;
+extern typedef int arm_translation_regime_t;
+constant Arm_TR_EL3 = 0;
+constant Arm_TR_EL2 = 1;
+constant Arm_TR_EL20 = 2;
+constant Arm_TR_EL10 = 3;
+extern typedef struct { generic_transaction_t s; processor_mode_t mode; int rotate; arm_mem_instr_origin_t instr_origin; } arm_memory_transaction_t;
+extern typedef struct { uint64 (*read_register_mode)(conf_object_t *processor_obj, int reg_num, int mode); void (*write_register_mode)(conf_object_t *processor_obj, int reg_num, int mode, uint64 value); } arm_interface_t;
+extern typedef struct { void (*process_data)(conf_object_t *obj, uint32 CRd, uint32 opcode_1, uint32 CRn, uint32 CRm, uint32 opcode_2, int type); void (*load_coprocessor)(conf_object_t *obj, uint32 CRd, uint32 N, uint32 Options, uint32 value, int type); uint32 (*read_register)(conf_object_t *obj, uint32 opcode_1, uint32 CRn, uint32 CRm, uint32 opcode_2, int type); void (*write_register)(conf_object_t *obj, uint32 value, uint32 opcode_1, uint32 CRn, uint32 CRm, uint32 opcode_2, int type); uint64 (*read_register_64_bit)(conf_object_t *obj, uint32 opcode_1, uint32 CRm, int type); void (*write_register_64_bit)(conf_object_t *obj, uint64 value, uint32 opcode_1, uint32 CRm, int type); uint32 (*store_coprocessor)(conf_object_t *obj, uint32 CRd, uint32 N, uint32 Options, int type); void (*reset)(conf_object_t *obj, int hard_reset); } arm_coprocessor_interface_t;
+extern typedef struct { int valid; uint32 address; } arm_avic_t;
+extern typedef struct { arm_avic_t (*get_interrupt_address)(conf_object_t *obj); } arm_avic_interface_t;
+extern typedef struct { arm_trustzone_mode_t (*get_security_mode)(conf_object_t *obj); arm_trustzone_mode_t (*mem_op_security_mode)(conf_object_t *obj, generic_transaction_t *memop); } arm_trustzone_interface_t;
+extern typedef struct { void (*handle_semihosting)(conf_object_t *obj); uint64 (*read_reg)(conf_object_t *obj, int offset); void (*write_reg)(conf_object_t *obj, int offset, uint64 v); } arm_external_debug_interface_t;
+extern typedef struct { bool fmo_set; bool imo_set; bool irq_set; bool fiq_set; bool ns; int el; uint32 mpidr; } arm_cpu_state_t;
+extern typedef struct { int op1; int crn; int crm; int op2; arm_cpu_state_t cpu_state; } gic_reg_info_t;
+extern typedef struct { uint64 (*read_register)(conf_object_t *obj, gic_reg_info_t reg_info, bool inquiry); void (*write_register)(conf_object_t *obj, gic_reg_info_t reg_info, uint64 value); void (*cpu_state_changed)(conf_object_t *obj, arm_cpu_state_t cpu_state); } arm_gic_interface_t;
+extern typedef struct { arm_cpu_state_t (*get_cpu_state)(conf_object_t *obj); } arm_gic_cpu_state_interface_t;
+extern typedef struct { void (*mark_exclusive)(conf_object_t *obj, physical_address_t address, physical_address_t size); bool (*clear_and_probe_exclusive)(conf_object_t *obj, physical_address_t clear_address, physical_address_t clear_size, physical_address_t probe_address, physical_address_t probe_size); } arm_cpu_group_exclusive_interface_t;
+extern typedef struct { void (*signal_event)(conf_object_t *obj); } arm_cpu_group_event_interface_t;
+extern typedef struct { void (*invalidate_tlb)(conf_object_t *obj, arm_translation_regime_t translation_regime, bool by_virtual_address, logical_address_t virtual_address); } arm_cpu_group_tlb_interface_t;
+extern typedef struct { struct { uint2 memory_type; uint3 device_type; uint3 inner_cacheability; uint3 inner_allocation_hint; uint2 inner_transcience_hint; uint3 outer_cacheability; uint3 outer_allocation_hint; uint2 outer_transcience_hint; uint1 shareable; uint1 outer_shareable; } u; uint64 u64; } arm_memory_attributes_encoding_t;
+extern typedef struct { struct { uint32 sid; uint20 ssid; uint1 secsid; uint1 ssidv; uint1 atst; } u; uint64 u64; } arm_smmu_attributes_t;

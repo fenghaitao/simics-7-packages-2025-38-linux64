@@ -1,0 +1,54 @@
+--- /usr/fmt/core.h	2024-01-10 17:07:07.789896240 +0100
++++ src/devices/c++-api/fmt/fmt/core.h	2024-01-16 12:58:58.112000914 +0100
+@@ -344,6 +344,9 @@
+ FMT_NORETURN FMT_API void assert_fail(const char* file, int line,
+                                       const char* message);
+ 
++#ifdef __COVERITY__
++#  define FMT_ASSERT(condition, message) assert(condition)
++#endif
+ #ifndef FMT_ASSERT
+ #  ifdef NDEBUG
+ // FMT_ASSERT is not empty to avoid -Wempty-body.
+@@ -784,6 +787,7 @@
+     -> Container& {
+   using base = std::back_insert_iterator<Container>;
+   struct accessor : base {
++    // coverity[copy_instead_of_move]
+     accessor(base b) : base(b) {}
+     using base::container;
+   };
+@@ -943,6 +947,7 @@
+       : Traits(n), buffer<T>(data_, 0, buffer_size), out_(out) {}
+   iterator_buffer(iterator_buffer&& other)
+       : Traits(other), buffer<T>(data_, 0, buffer_size), out_(other.out_) {}
++  iterator_buffer& operator=(iterator_buffer&&) = delete;
+   ~iterator_buffer() { flush(); }
+ 
+   auto out() -> OutputIt {
+@@ -1963,6 +1968,7 @@
+ 
+   /** Returns the argument with the specified id. */
+   FMT_CONSTEXPR auto get(int id) const -> format_arg {
++    /* coverity[var_decl] arg.value_ depends on arg.type_ */
+     format_arg arg;
+     if (!is_packed()) {
+       if (id < max_size()) arg = args_[id];
+--- /usr/fmt/format.h	2024-01-10 17:07:01.353911507 +0100
++++ src/devices/c++-api/fmt/fmt/format.h	2024-01-16 13:01:46.856766988 +0100
+@@ -2647,6 +2647,7 @@
+       *it++ = static_cast<Char>(exp_char);
+       return write_exponent<Char>(output_exp, it);
+     };
++    // coverity[integer_overflow]
+     return specs.width > 0 ? write_padded<align::right>(out, specs, size, write)
+                            : base_iterator(out, write(reserve(out, size)));
+   }
+@@ -2663,6 +2664,7 @@
+       if (num_zeros > 0) size += to_unsigned(num_zeros);
+     }
+     auto grouping = Grouping(loc, fspecs.locale);
++    // coverity[integer_overflow]
+     size += to_unsigned(grouping.count_separators(exp));
+     return write_padded<align::right>(out, specs, size, [&](iterator it) {
+       if (sign) *it++ = detail::sign<Char>(sign);

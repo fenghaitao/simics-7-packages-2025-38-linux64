@@ -1,0 +1,36 @@
+/*
+  i82576EB-mac-statistics.dml
+
+  © 2013 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+bank csr {
+    register rpthc  @ 0x04104 "Rx packets to host count";
+    register dbgc1  @ 0x04108 "Debug counter 1";
+    register dbgc2  @ 0x0410c "Debug counter 2";
+    register dbgc3  @ 0x04110 "Debug counter 3";
+    register hgptc  @ 0x04118 "Host good packets transmitted count";
+    register dbgc4  @ 0x0411c "Debug counter 4";
+    register rxdmtc @ 0x04120 "RX descriptor minimum threshold count";
+    register htcbdpc @ 0x04124 "Host tx circuit breaker dropped packets count";
+
+    register rpthc    is (statistics_register);
+    register dbgc1    is (statistics_register);
+    register dbgc2    is (statistics_register);
+    register dbgc3    is (statistics_register);
+    register hgptc    is (statistics_register);
+    register dbgc4    is (statistics_register);
+    register rxdmtc   is (statistics_register);
+    register htcbdpc  is (statistics_register);
+}

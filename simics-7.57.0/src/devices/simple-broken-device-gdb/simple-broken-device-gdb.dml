@@ -1,0 +1,65 @@
+/*
+  simple-broken-device-gdb.dml - sample broken DML code for the GDB
+  debugging example
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device simple_broken_device_gdb;
+
+// short, one-line description
+param desc = "sample broken DML device for GDB debugging";
+
+// long description
+param documentation = "This is a very simple broken device.";
+//:: pre simple-broken-device-gdb.dml {{
+method two(int *val) {
+    local int bar = *val;
+    log info: "method \"two\" called %d", bar;
+}
+
+method one() {
+    local int *foo = NULL;
+    log info: "method \"one\" called";
+    two(foo);
+}
+
+attribute int_attr is int64_attr "An integer attribute" {
+    method set(attr_value_t val) throws {
+        default(val);
+        after_set();
+    }
+    method after_set() throws {
+        log info: "attribute int_attr updated";
+        one();
+    }
+}
+
+bank regs {
+    register reg size 4 @ 1000 {
+        param init_val = 54;
+        method set(uint64 val) {
+            default(val);
+        }
+    }
+    register reg_array[i < 4] size 4 @ 2000 + i * 4 {
+        param init_val = 78 + i;
+    }
+    group reg_group[i < 4] {
+        register reg_array[j < 4] size 4 @ 3000 + i * 20 + j * 4 {
+            param init_val = 78 + i * 10 + j;
+        }
+    }
+}
+// }}

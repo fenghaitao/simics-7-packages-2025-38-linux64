@@ -1,0 +1,61 @@
+/*
+  ns16x50-reset.dml - Support for resetting devices via signal ports
+                   SRESET and HRESET.
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+method before_hard_reset() default {}
+method before_soft_reset() default {}
+method after_hard_reset() default {}
+method after_soft_reset() default {}
+
+port HRESET "simulates resetting by power loss" {
+    implement signal {
+        method signal_raise()
+        {
+            call $before_hard_reset();
+            call $hard_reset();
+            call $after_hard_reset();
+        }
+
+        method signal_lower() {
+        }
+    }
+}
+
+port SRESET  "simulates resetting, raising the MR input signal" {
+    implement signal {
+        method signal_raise()
+        {
+            call $before_soft_reset();
+            call $soft_reset();
+            call $after_soft_reset();
+        }
+
+        method signal_lower() {
+        }
+    }
+}
+
+port Reset "legacy support, use SRESET instead" {
+    implement signal {
+        method signal_raise() {
+            call $SRESET.signal.signal_raise();
+        }
+        method signal_lower() {
+            call $SRESET.signal.signal_lower();
+        }
+    }
+}

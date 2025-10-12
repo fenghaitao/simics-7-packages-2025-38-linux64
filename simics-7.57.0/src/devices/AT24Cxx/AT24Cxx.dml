@@ -1,0 +1,451 @@
+/*
+  © 2011 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device AT24Cxx;
+parameter desc = "model of serial EEPROM";
+parameter documentation = ("The <class>AT24Cxx</class> class implements " 
+                           + "Atmel's AT24C01A/02/04/08/16/32/64/128/256/512/M01 serial EEPROM.");
+
+header %{
+#include <simics/util/bitcount.h>
+%}
+
+import "simics/devs/i2c.dml";
+import "simple-i2c-slave.dml";
+extern void *memcpy(void *dest, const void *src, size_t n);
+
+constant Msg_Set_State_Idle           = 0;
+constant Msg_Set_State_Slave_Transmit = 1;
+constant Msg_Set_State_Slave_Receive  = 2;
+constant Msg_Write_Data               = 3;
+constant Msg_Read_Data                = 4;
+
+constant State_Standby                = 0;
+constant State_Address_hi             = 1;
+constant State_Address_lo             = 2;
+constant State_Write_Data             = 3;
+constant State_Read_Data              = 4;
+
+constant Dont_Care                    = 0xcc;
+constant Bad_Data                     = 0xcd;
+
+// The first four mandatory bits in address hardcoded as 0b1010
+parameter A6A5A4A3 = 0b1010;
+
+connect i2c_bus {
+    parameter documentation
+        = "The I2C bus to which this device is connected.";
+    parameter configuration = "optional";
+    interface i2c_bus;
+}
+
+// This attribute reflects the I2C address of the device.
+attribute i2c_address {
+    parameter documentation = "I2C address of the device.";
+    parameter configuration = "required";
+    parameter allocate_type = "uint8";
+}
+
+attribute page_size {
+    parameter documentation = "The size of the page.";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint32";
+}
+
+/* The number of bytes on the total memory size and one memory page
+   AT24C01A :    128,   8
+   AT24C02  :    256,   8
+   AT24C04  :    512,  16
+   AT24C08  :   1024,  16
+   AT24C16  :   2048,  16
+   AT24C32  :   4096,  32
+   AT24C64  :   8192,  32
+   AT24C128 :  16384,  64
+   AT24C256 :  32768,  64
+   AT24C512 :  65536, 128
+   AT24CM01 : 131072, 256 */
+
+data uint32 memory_size;
+data uint8 address_bits;
+
+attribute memory {
+    parameter documentation = "The on-chip memory bank.";
+    parameter configuration = "required";
+    parameter persistent = true;
+    parameter type = "d";
+
+    data uint8 *mem;
+
+    method set(attr_value_t val) {
+        local uint32 size;
+        size = SIM_attr_data_size(val);
+        if (size < 128 || size > 131072 || !IS_POWER_OF_2(size)) {
+            log error:
+                "supported memory size: 128 ~ 131072 and must be power of 2,"
+                + " got %d", size;
+            throw;
+        }
+        if ($memory_size == 0 || size == $memory_size) {
+            $memory_size = size;
+            $address_bits = LOG2(size);
+            if ($mem == NULL)
+                $mem = new uint8[size];
+            memcpy($mem, SIM_attr_data(val), size);
+            if ($page_size == 0)
+                call $detect_page_size();
+        } else {
+            log error: "wrong memory size, %d, expect %d",
+                size, $memory_size;
+            throw;
+        }
+    }
+
+    method get() -> (attr_value_t val) {
+        val = SIM_make_attr_data($memory_size, $mem);
+    }
+
+    method write(uint8 val) {
+        local uint32 addr = $current_address % $memory_size;
+        log info, 3: "writing 0x%02x to address 0x%x(0x%x)",
+            val, addr, $current_address;
+        $mem[addr] = val;
+        inline $current_address.write_update();
+    }
+
+    method read -> (uint8 val) {
+        local uint32 addr = $current_address % $memory_size;
+        val = $mem[addr];
+        log info, 3: "reading 0x%02x from address 0x%x(0x%x)",
+            val, addr, $current_address;
+        inline $current_address.read_update();
+    }
+}
+
+attribute current_state {
+    parameter documentation = "The current state of the device.";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint32";
+    method next(uint32 next_state) {
+        $this = next_state;
+    }
+}
+
+/* Addressing method of AT24Cxx series devices:
+   Device   | start byte             | address_hi    | address_lo
+   AT24C01A : 1 0 1 0  a2  a1  a0 R/W, --            , X[0] A[6:0]
+   AT24C02  : 1 0 1 0  a2  a1  a0 R/W, --            , A[7:0]
+   AT24C04  : 1 0 1 0  a2  a1  A8 R/W, --            , A[7:0]
+   AT24C08  : 1 0 1 0  a2  A9  A8 R/W, --            , A[7:0]
+   AT24C16  : 1 0 1 0 A10  A9  A8 R/W, --            , A[7:0]
+   AT24C32  : 1 0 1 0  a2  a1  a0 R/W, X[3:0] A[11:8], A[7:0]
+   AT24C64  : 1 0 1 0  a2  a1  a0 R/W, X[2:0] A[12:8], A[7:0]
+   AT24C128 : 1 0 1 0   0  a1  a0 R/W, X[1:0] A[13:8], A[7:0]
+   AT24C256 : 1 0 1 0   0  a1  a0 R/W, X[0]   A[14:8], A[7:0]
+   AT24C512 : 1 0 1 0   0  a1  a0 R/W,        A[15:8], A[7:0]
+   AT24CM01 : 1 0 1 0  a2  a1 A16 R/W,        A[15:8], A[7:0]      */
+attribute current_address {
+    parameter documentation = "The current data address.";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint32";
+    method write_update() {
+        // roll-over to same page
+        $this[LOG2($page_size)-1:0] = $this[LOG2($page_size)-1:0] + 1;
+    }
+    method read_update() {
+        // roll-over to start of memory
+        $this[LOG2($memory_size)-1:0] = $this[LOG2($memory_size)-1:0] + 1;
+    }
+}
+
+is simple_i2c_slave;
+// I2C methods for i2c_link_v2
+method i2c_operation(int msg_type, uint8 msg_param) -> (uint8 value){
+    value = 0;
+    switch ($current_state) {
+    case State_Standby:
+        call $state_handler_standby(msg_type, msg_param);
+        break;
+    case State_Address_hi:
+    case State_Address_lo:
+        call $state_handler_address(msg_type, msg_param);
+        break;
+    case State_Write_Data:
+        call $state_handler_write_data(msg_type, msg_param);
+        break;
+    case State_Read_Data:
+        call $state_handler_read_data(msg_type, msg_param) -> (value);
+        break;
+    default:
+        assert false;
+    }
+}
+
+method i2c_start_request_read() -> (i2c_status_t ack) {
+    local uint8 dont_care;
+    inline $i2c_operation(Msg_Set_State_Slave_Transmit, 0) -> (dont_care);
+    ack = I2C_status_success;
+}
+
+method i2c_start_request_write() -> (i2c_status_t ack) {
+    local uint8 dont_care;
+    inline $i2c_operation(Msg_Set_State_Slave_Receive, 0) -> (dont_care);
+    ack = I2C_status_success;
+}
+
+method i2c_start_request(uint8 addr) -> (i2c_status_t ack) {
+    local uint8 byte_addr = addr;
+
+    if ($current_state != State_Standby) {
+        log info, 3: "repeated start request %d", $current_state;
+        call $current_state.next(State_Standby);
+    }
+
+    // For AT24C04/08/16, the highest 1~3 address bits are provided in start byte
+    // For AT24CM01, the highest 1 address bit is provided in start byte
+    if ($address_bits > 8 && $address_bits < 12) {
+        $current_address[($address_bits - 1):8] = addr[($address_bits - 8):1];
+        byte_addr[($address_bits - 8):1] = 0;
+    } else if ($address_bits == 17) {
+        $current_address[16] = addr[1];
+        byte_addr[1] = 0;
+    }
+
+    // Use correct device address to start request
+    call default(byte_addr) -> (ack);
+}
+
+method i2c_read_request() -> (uint8 value) {
+    local int msg_type;
+    local uint8 msg_param;
+
+    msg_type = Msg_Read_Data;
+    msg_param = Dont_Care;
+    inline $i2c_operation(msg_type, msg_param) -> (value);
+
+    log info, 3: "read data 0x%02x", value;
+}
+
+method i2c_write_request(uint8 value) -> (i2c_status_t ack) {
+    local int msg_type;
+    local uint8 msg_param;
+    local uint8 dont_care;
+
+    log info, 3: "write data 0x%02x", value;
+
+    msg_type = Msg_Write_Data;
+    msg_param = value;
+    inline $i2c_operation(msg_type, msg_param) -> (dont_care);
+    ack = I2C_status_success;
+}
+
+method i2c_stop_request() {
+    local uint8 dont_care;
+    inline $i2c_operation(Msg_Set_State_Idle, 0) -> (dont_care);
+}
+
+method get_slave_address() -> (bool enable, uint8 addr) {
+    enable = true;
+    addr = $i2c_address;
+}
+
+method use_two_bytes_addresses() -> (bool res) nothrow {
+    if ($address_bits >= 12)
+        res = true;
+    else
+        res = false;
+}
+
+method state_handler_standby(int msg_type, uint8 msg_param) {
+    switch (msg_type) {
+    case Msg_Set_State_Idle:
+        // stop request for some other device on the bus, ignore
+        break;
+    case Msg_Set_State_Slave_Receive:
+        // go to the address phase
+        if ($use_two_bytes_addresses())
+            call $current_state.next(State_Address_hi);
+        else
+            call $current_state.next(State_Address_lo);
+        break;
+    case Msg_Set_State_Slave_Transmit:
+        // current address read
+        call $current_state.next(State_Read_Data);
+        break;
+    case Msg_Write_Data:
+    case Msg_Read_Data:
+        log error: "bad I2C protocol";
+        break;
+    default:
+        assert false;
+    }
+}
+
+method state_handler_address(int msg_type, uint8 msg_param) {
+    switch (msg_type) {
+    case Msg_Set_State_Idle:
+        log info, 1:
+            "undefined behavior: START request followed by an immediate STOP request";
+        break;
+    case Msg_Set_State_Slave_Receive:
+    case Msg_Set_State_Slave_Transmit:
+        log error: "unexpected Set_State(%d) signal in Address mode", msg_type;
+        call $current_state.next(State_Standby);
+        break;
+    case Msg_Write_Data:
+        // record the address and wait for possibly more inputs
+        if ($current_state == State_Address_hi) {
+            $current_address[15:8] = msg_param;
+            call $current_state.next(State_Address_lo);
+            log info, 3: "set higher offset bits to 0x%02x", msg_param;
+        } else {
+            $current_address[7:0] = msg_param;
+            call $current_state.next(State_Write_Data);
+            log info, 3: "set offset to 0x%02x", msg_param;
+        }
+        break;
+    case Msg_Read_Data:
+        log error: "unexpected Read_Data signal in Address mode";
+        break;
+    default:
+        assert false;
+    }
+}
+
+method state_handler_write_data(int msg_type, uint8 msg_param) {
+    switch (msg_type) {
+    case Msg_Set_State_Idle:
+        // terminate a write transaction
+        call $current_state.next(State_Standby);
+        break;
+    case Msg_Set_State_Slave_Receive:
+        // spurious signal, simply ignore it
+        break;
+    case Msg_Set_State_Slave_Transmit:
+        // start a read transaction
+        call $current_state.next(State_Read_Data);
+        break;
+    case Msg_Write_Data:
+        // update memory within the same page
+        // and stay in the same state.
+        call $memory.write(msg_param);
+        break;
+    case Msg_Read_Data:
+        log error: "unexpected Read_Data signal in Write mode";
+        break;
+    default:
+        assert false;
+    }
+}
+
+method state_handler_read_data(int msg_type, uint8 msg_param) -> (uint8 data) {
+    switch (msg_type) {
+    case Msg_Set_State_Idle:
+        // terminate a read transaction
+        call $current_state.next(State_Standby);
+        break;
+    case Msg_Set_State_Slave_Receive:
+        // the next address input
+        if ($use_two_bytes_addresses())
+            call $current_state.next(State_Address_hi);
+        else
+            call $current_state.next(State_Address_lo);
+        break;
+    case Msg_Set_State_Slave_Transmit:
+        // spurious signal, simply ignore it
+        break;
+    case Msg_Write_Data:
+        log error: "unexpected Write_Data signal in Read mode";
+        break;
+    case Msg_Read_Data:
+        // fetch data from memory within the same page
+        // and stay in the same state.
+        call $memory.read -> (data);
+        break;
+    default:
+        assert false;
+    }
+}
+
+method detect_page_size() {
+    switch ($address_bits) {
+    case 7: // AT24C01A
+    case 8: // AT24C02
+        $page_size = 0x08;
+        break;
+    case 9: // AT24C04
+    case 10: // AT24C08
+    case 11: // AT24C16
+        $page_size = 0x10;
+        break;
+    case 12: // AT24C32
+    case 13: // AT24C64
+        $page_size = 0x20;
+        break;
+    case 14: // AT24C128
+    case 15: // AT24C256
+        $page_size = 0x40;
+        break;
+    case 16: // AT24C512
+        $page_size = 0x80;
+        break;
+    case 17: // AT24CM01
+        $page_size = 0x100;
+        break;
+    default:
+        assert false;
+    }
+}
+
+method init() {
+    $current_state = State_Standby;
+    $current_address = 0;
+    $page_size = 0; // Invalid value and to be updated later
+}
+
+method post_init() {
+    // Check the i2c address
+    if ($i2c_address[6:3] != 0b1010)
+        log spec_viol:
+            "I2c address 0x%x is not valid, the first four bit should be 1010",
+            $i2c_address;
+
+    // Check the i2c address if it contains memory page address bits
+    if ($address_bits == 9) { // AT24C04
+        if ($i2c_address[0] != 0) {
+            log error: "the least bit of AT24C04 address should be 0,"
+                + " got address 0x%x", $i2c_address;
+            $i2c_address[0] = 0;
+        }
+    } else if ($address_bits == 10) { // AT24C08
+        if ($i2c_address[1:0] != 0) {
+            log error: "the least two bits of AT24C08 address should be 0,"
+                + " got address 0x%x", $i2c_address;
+            $i2c_address[1:0] = 0;
+        }
+    } else if ($address_bits == 11) { // AT24C16
+        if ($i2c_address[2:0] != 0) {
+            log error: "the least three bits of AT24C16 address should be 0,"
+                + " got address 0x%x", $i2c_address;
+            $i2c_address[2:0] = 0;
+        }
+    } else if ($address_bits == 17) {// AT24CM01
+        if ($i2c_address[0] != 0) {
+            log error: "the least bit of AT24CM01 address should be 0,"
+                + " got address 0x%x", $i2c_address;
+            $i2c_address[0] = 0;
+        }
+    }
+
+    call $i2c_register_address($i2c_address);
+}

@@ -1,0 +1,1228 @@
+/*
+  vtd.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "utility.dml";
+import "reset-ports.dml";
+import "io-memory.dml";
+import "simics/devs/apic.dml";
+import "simics/devs/memory-space.dml";
+import "simics/devs/pci.dml";
+
+parameter limitations = "<ul>"
+    + "<li>where Intel&reg; VT-d fault compression for primary fault"
+    + " logging is not implemented.</li>"
+    + "<li>where Intel&reg; VT-d remapping unit does not cache any DMA"
+    + " or interrupt lookups.</li>"
+    + "</ul>";
+
+connect apic_bus {
+    parameter documentation = "The APIC bus to handle the interrupt.";
+    interface apic_bus;
+}
+
+connect memory_space {
+    parameter documentation = "The memory space to read descriptors.";
+    interface memory_space;
+}
+
+connect terminator {
+    parameter documentation = "The object to handle memory transaction termination.";
+    interface memory_space;
+}
+
+
+implement pci_upstream {
+    method operation(generic_transaction_t *mop, addr_space_t space)
+        -> (exception_type_t ex) {
+
+        local bool block;
+        local physical_address_t addr;
+        addr = SIM_get_mem_op_physical_address(mop);
+
+        if (addr >= 0xfee00000 && addr < 0xfef00000) {
+            local uint32 value = SIM_get_mem_op_value_le(mop);
+            call $remap_interrupt(mop, addr & 0xfffff, value) -> (block);
+            ex = block ? Sim_PE_IO_Not_Taken : Sim_PE_No_Exception;
+        } else {
+            local uint8 *save_real_addr = mop->real_address;
+            local physical_address_t save_paddr = addr;
+            local physical_address_t save_size = SIM_get_mem_op_size(mop);
+            local physical_address_t done = 0;
+            
+            // size-0 accesses could potentially trigger VT-d errors
+            do {
+                local physical_address_t cnt;
+                cnt = save_size - done;
+                addr = save_paddr + done;
+                
+                if ((addr & 0xfff) + cnt > 0x1000)
+                    cnt = 0x1000 - (addr & 0xfff);
+
+                mop->size = cnt;
+                SIM_set_mem_op_physical_address(mop, addr);
+
+                if (mop->inverse_endian)
+                    mop->real_address = save_real_addr 
+                        + (save_size - cnt - done);
+                else
+                    mop->real_address = save_real_addr + done;
+
+                call $remap_dma_transaction(mop) -> (block);
+                if (!block)
+                    ex = $memory_space.memory_space.access(mop);
+                else
+                    ex = Sim_PE_IO_Not_Taken;
+
+                done += cnt;
+            } while (done < save_size && ex == Sim_PE_No_Exception);
+
+            mop->size = save_size;
+            SIM_set_mem_op_physical_address(mop, save_paddr);
+            mop->real_address = save_real_addr;
+        }
+    }
+}
+
+attribute next_fault_idx {
+    parameter documentation = "Next fault recording register index.";
+    parameter allocate_type = "uint8";
+}
+
+parameter IOTLB_OFFSET default 0x20;
+parameter FRCD_OFFSET default 0x10;
+parameter FRCD_NUM default 8;
+
+parameter FAULT_ROOT_PRESENT        = 0x1;
+parameter FAULT_CONTEXT_PRESENT     = 0x2;
+parameter FAULT_CONTEXT_INVALID     = 0x3;
+parameter FAULT_ADDRESS_MAX         = 0x4;
+parameter FAULT_WRITE               = 0x5;
+parameter FAULT_READ                = 0x6;
+parameter FAULT_PAGE_ADDR           = 0x7;
+parameter FAULT_ROOT_ADDR           = 0x8;
+parameter FAULT_CONTEXT_ADDR        = 0x9;
+parameter FAULT_ROOT_RESERVED       = 0xA;
+parameter FAULT_CONTEXT_RESERVED    = 0xB;
+parameter FAULT_PAGE_RESERVED       = 0xC;
+parameter FAULT_TRANSLATION_BLOCKED = 0xD;
+parameter FAULT_INT_RESERVED        = 0x20;
+parameter FAULT_INT_IDX_MAX         = 0x21;
+parameter FAULT_INT_PRESENT         = 0x22;
+parameter FAULT_INT_TABLE           = 0x23;
+parameter FAULT_INT_ENTRY_RESERVED  = 0x24;
+parameter FAULT_INT_BLOCKED         = 0x25;
+parameter FAULT_INT_ENTRY_BLOCK     = 0x26;
+
+typedef layout "little-endian" {
+    // stupid DML does not allow more than 64 bits, SIMICS-8881
+    bitfields 64 {
+        uint1  p   @ [0:0];
+        uint52 ctp @ [63:12];
+    } low;
+    bitfields 64 {
+    } high;
+} root_entry_t;
+
+typedef layout "little-endian" {
+    // stupid DML does not allow more than 64 bits, SIMICS-8881
+    bitfields 64 {
+        uint1  p   @ [0:0];
+        uint1  fpd @ [1:1];
+        uint2  t   @ [3:2];
+        uint1  eh  @ [4:4];
+        uint1  alh @ [5:5];
+        uint52 asr @ [63:12];
+    } low;
+    bitfields 64 {
+        uint3  aw  @ [2:0];
+        uint16 did @ [23:8];
+    } high;
+} context_entry_t;
+
+typedef bitfields 64 {
+    uint1  r      @ [0:0];
+    uint1  w      @ [1:1];
+    uint1  sp     @ [7:7];
+    uint1  snp    @ [11:11];
+    uint40 addr   @ [51:12];
+    uint1  tm     @ [62:62];
+} page_table_entry_t;
+
+typedef layout "little-endian" {
+    bitfields 64 {
+        uint1 p      @ [0:0];
+        uint1 fpd    @ [1:1];
+        uint1 dm     @ [2:2];
+        uint1 rh     @ [3:3];
+        uint1 tm     @ [4:4];
+        uint3 dlm    @ [7:5];
+        uint4 avail  @ [11:8];
+        uint8 vector @ [23:16];
+        uint32 dst   @ [63:32];
+    } low;
+    bitfields 64 {
+        uint16 sid @ [15:0];
+        uint2  sq  @ [17:16];
+        uint2  svt @ [19:18]; // X58 says 20:18, VT-d says 19:18
+    } high;
+} interrupt_table_entry_t;
+
+typedef layout "little-endian" {
+    uint64 low;
+    uint64 high;
+} invalidation_desc_t;
+
+bank vtd {
+    parameter function = 0;
+    parameter partial = true;
+
+    register ver      size  4 @ 0x00 "Version";
+    register cap      size  8 @ 0x08 "Capability";
+    register ecap     size  8 @ 0x10 "Extended Capability";
+    register gcmd     size  4 @ 0x18 "Global Command";
+    register gsts     size  4 @ 0x1C "Global Status";
+    register rtaddr   size  8 @ 0x20 "Root-Entry Table Address";
+    register ccmd     size  8 @ 0x28 "Context Command";
+    register fsts     size  4 @ 0x34 "Fault Status";
+    register fectl    size  4 @ 0x38 "Fault Event Control";
+    register fedata   size  4 @ 0x3C "Fault Event Data";
+    register feaddr   size  4 @ 0x40 "Fault Event Address";
+    register feuaddr  size  4 @ 0x44 "Fault Event Upper Address";
+    register aflog    size  8 @ 0x58 "Advanced Fault Log";
+    register pmem     size  4 @ 0x64 "Protected Memory Enable";
+    register plmbase  size  4 @ 0x68 "Protected Low-Memory Base";
+    register plmlimit size  4 @ 0x6C "Protected Low-Memory Limit";
+    register phmbase  size  8 @ 0x70 "Protected High-Memory Base";
+    register phmlimit size  8 @ 0x78 "Protected High-Memory Limit";
+    register iqh      size  8 @ 0x80 "Invalidation Queue Head";
+    register iqt      size  8 @ 0x88 "Invalidation Queue Tail";
+    register iqa      size  8 @ 0x90 "Invalidation Queue Address";
+    register ics      size  4 @ 0x9C "Invalidation Completion Status";
+    register iectl    size  4 @ 0xA0 "Invalidation Event Control";
+    register iedata   size  4 @ 0xA4 "Invalidation Event Data";
+    register ieaddr   size  4 @ 0xA8 "Invalidation Event Address";
+    register ieuaddr  size  4 @ 0xAC "Invalidation Event Upper Address";
+    register irta     size  8 @ 0xB8 "Interrupt Remapping Table Address";
+    register iva      size  8 @ $IOTLB_OFFSET * 16 "Invalidate Address";
+    register iotlb    size  8 @ $IOTLB_OFFSET * 16 + 0x08 "IOTLB Invalidate";
+    register frcd_l[$FRCD_NUM] size 8 @ ($FRCD_OFFSET * 16) + $i * 16 "Fault Recording Registers (low)";
+    register frcd_h[$FRCD_NUM] size 8 @ ($FRCD_OFFSET * 16) + $i * 16 + 8 "Fault Recording Registers (high)";
+}
+
+method after_hard_reset() {
+    $next_fault_idx = 0;
+}
+
+method determine_requester_id(generic_transaction_t *mem_op) -> (uint16 id) {
+    if (SIM_get_mem_op_ini_type(mem_op) != Sim_Initiator_PCI_Device) {
+        local conf_object_t *initiator = SIM_get_mem_op_initiator(mem_op);
+        log "error": "transaction from %s to address 0x%16llx is not a PCI access",
+            initiator ? SIM_object_name(initiator) : "(NULL initiator)",
+            SIM_get_mem_op_physical_address(mem_op);
+        id = 0;
+        return;
+    }
+    id = VT_get_pci_mem_op_requester_id(
+        SIM_pci_mem_trans_from_generic(mem_op));
+}
+
+method memory_read(void *buffer, uint64 address, uint64 size)
+    -> (exception_type_t ex) {
+    if ($memory_space.obj == NULL) {
+        log "error": "no memory_space connected, can not read memory";
+        ex = Sim_PE_IO_Not_Taken;
+        return;
+    }
+
+    ex = $memory_space.memory_space.access_simple(
+        $this.obj, address, buffer, size, Sim_RW_Read, Sim_Endian_Host_From_LE);
+}
+
+method memory_write(void *buffer, uint64 address, uint64 size)
+    -> (exception_type_t ex) {
+    if ($memory_space.obj == NULL) {
+        log "error": "no memory_space connected, can not read memory";
+        ex = Sim_PE_IO_Not_Taken;
+        return;
+    }
+
+    ex = $memory_space.memory_space.access_simple(
+        $this.obj, address, buffer, size, Sim_RW_Write, Sim_Endian_Host_From_LE);
+}
+
+attribute use_vtd_interrupt_decoding {
+    parameter documentation = "Use VT-d address decoding to obtain handles"
+        + " when remapping interrupts, rather than x58 decoding";
+    parameter allocate_type = "bool";
+}
+
+method remap_interrupt(generic_transaction_t *mem_op,
+                       physical_address_t offset, uint64 value)
+    -> (bool block) {
+    local uint8 destination;
+    local apic_destination_mode_t dest_mode;
+    local apic_trigger_mode_t trigger_mode;
+    local uint1 level_assert;
+    local apic_delivery_mode_t delivery_mode;
+    local uint8 vector;
+    local exception_type_t ex;
+
+    block = true;
+
+    if ($vtd.gsts.ires == 0 ||
+        SIM_get_mem_op_ini_type(mem_op) != Sim_Initiator_PCI_Device) {
+        /* remapping disabled or not PCI device access */
+        destination = offset[19:12];
+        dest_mode = offset[2] ? Apic_Destination_Mode_Logical :
+            Apic_Destination_Mode_Physical;
+        trigger_mode = value[15] ? Apic_Trigger_Mode_Level :
+            Apic_Trigger_Mode_Edge;
+        level_assert = value[14];
+        delivery_mode = value[10:8];
+        vector = value[7:0];
+    } else {
+        local uint32 interrupt_handle;
+        local interrupt_table_entry_t int_entry;
+        local uint16 req_id;
+
+        call $determine_requester_id(mem_op) -> (req_id);
+
+        /* Bit 4 determines if it is compatible or remappable format according
+           to VT-d manual. Bit 4 is LSB in the interrupt handle according to
+           the X58 manual.
+
+           If use_vtd_interrupt_decoding is set, decode according to VT-d, otherwise
+           follow X58.
+
+           Also note that $vtd.gsts.cfis should be checked to determine how to
+           handle compatibility format interrupt requests.
+        */
+
+        if ($use_vtd_interrupt_decoding) {
+            interrupt_handle = offset[19:5] + (offset[2] << 15);
+        } else {
+            interrupt_handle = offset[19:4];
+        }
+        if (offset[3]) {
+            // sub-handle valid
+            interrupt_handle += value[15:0];
+        }
+        local int table_entries = 2 << $vtd.irta.sz;
+        if (interrupt_handle >= table_entries) {
+            log "info", 2: "interrupt handle index %d is too big, there are only %d table entries",
+                interrupt_handle, table_entries;
+            inline $generate_fault(0, 0, $FAULT_INT_IDX_MAX, req_id, interrupt_handle << 48);
+            return;
+        }
+
+        if (!$vtd.gsts.irtps) {
+            log "info", 2: "interrupt remapping enabled, but remapping interrupt table address not set";
+            inline $generate_fault(0, 0, $FAULT_INT_TABLE, req_id, interrupt_handle << 48);
+            return;
+        }
+
+        log "info", 4: "looking up interrupt entry: table pointer 0x%llx, interrupt handle 0x%x",
+            $vtd.irta_prg, interrupt_handle;
+        local physical_address_t irta_addr = $vtd.irta_prg + interrupt_handle * 16;
+        call $memory_read(&int_entry, irta_addr, 16) -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            log "info", 2: "interrupt entry lookup error";
+            inline $generate_fault(0, 0, $FAULT_INT_TABLE, req_id, interrupt_handle << 48);
+            return;
+        }
+
+        log "info", 4: "fetched interrupt entry: low 0x%016llx, high 0x%016llx from 0x%llx",
+            int_entry.low, int_entry.high, irta_addr;
+
+        if (int_entry.low.p == 0) {
+            log "info", 2: "interrupt entry not present for handle %d", interrupt_handle;
+            if (int_entry.low.fpd == 0)
+                inline $generate_fault(0, 0, $FAULT_INT_PRESENT, req_id, interrupt_handle << 48);
+            return;
+        }
+
+        local uint16 sid = int_entry.high.sid;
+        local bool validation_pass;
+
+        if (int_entry.high.svt == 0x0) {
+            // no validation
+            validation_pass = true;
+        } else if (int_entry.high.svt == 0x1) {
+            // validate using SID and SQ
+            if (int_entry.high.sq == 0x0)
+                validation_pass = (sid[15:0] == req_id[15:0]);
+            else if (int_entry.high.sq == 0x1)
+                validation_pass = ((sid[15:3] == req_id[15:3]) && (sid[1:0] == req_id[1:0]));
+            else if (int_entry.high.sq == 0x2)
+                validation_pass = ((sid[15:3] == req_id[15:3]) && (sid[0] == req_id[0]));
+            else
+                validation_pass = (sid[15:3] == req_id[15:3]);
+        } else if (int_entry.high.svt == 0x2) {
+            // verify request_id[15:8] is within Startbus# and Endbus#
+            local uint8 start_bus = sid[15:8];
+            local uint8 end_bus = sid[7:0];
+            validation_pass = ((req_id[15:8] >= start_bus) && (req_id[15:8] <= end_bus));
+        } else {
+            // reserved
+            validation_pass = false;
+        }
+
+        if (!validation_pass) {
+            log "info", 2: "validation failed for %d, SID: 0x%x, request ID: 0x%x",
+                interrupt_handle, sid, req_id;
+            if (int_entry.low.fpd == 0)
+                inline $generate_fault(0, 0, $FAULT_INT_ENTRY_BLOCK, req_id, interrupt_handle << 48);
+            return;
+        }
+
+        if ($vtd.ecap.eim == 0) {
+            /* We assume that bits [15:8] contains the APIC destination ID and
+               that bits [7:0] are reserved.
+            */
+            destination = int_entry.low.dst[15:8];
+        } else {
+            log "unimplemented", 1:
+                "extended interrupt mode enabled, handling large destination IDs not supported";
+            destination[7:0] = int_entry.low.dst;
+        }
+        dest_mode = int_entry.low.dm ? Apic_Destination_Mode_Logical :
+            Apic_Destination_Mode_Physical;
+        trigger_mode = int_entry.low.tm ? Apic_Trigger_Mode_Level :
+            Apic_Trigger_Mode_Edge;
+        level_assert = 1;
+        delivery_mode = int_entry.low.dlm;
+        vector = int_entry.low.vector;
+    }
+
+    if ($apic_bus.obj == NULL) {
+        log "error": "no apic_bus connected, can not generate interrupt";
+        return;
+    }
+
+    log "info", 3: "interrupt sent to apic bus (vector %x, destination %x)",
+        vector, destination;
+    log "info", 4: "  destination mode %x", dest_mode;
+    log "info", 4: "  delivery mode %x", delivery_mode;
+    log "info", 4: "  level assert %x", level_assert;
+    log "info", 4: "  trigger mode %x", trigger_mode;
+
+    $apic_bus.apic_bus.interrupt(
+        dest_mode,
+        delivery_mode,
+        level_assert,
+        trigger_mode,
+        vector,
+        destination);
+    block = false;
+}
+
+method generate_interrupt(uint32 iaddr, uint32 iaddru, uint32 idata) {
+    local uint8 destination;
+    local apic_destination_mode_t dest_mode;
+    local apic_trigger_mode_t trigger_mode;
+    local uint1 level_assert;
+    local apic_delivery_mode_t delivery_mode;
+    local uint8 vector;
+
+    if (iaddr[31:20] != 0xFEE) {
+        log "info", 2: "generate interrupt error: address is not 0xFEExxxxx";
+        return;
+    }
+
+    if (iaddru != 0 || idata[31:16] != 0) {
+        log "unimplemented", 1: "handling large destination IDs not supported";
+    }
+
+    destination = iaddr[19:12];
+    dest_mode = iaddr[2] ? Apic_Destination_Mode_Logical :
+        Apic_Destination_Mode_Physical;
+    trigger_mode = idata[15] ? Apic_Trigger_Mode_Level :
+        Apic_Trigger_Mode_Edge;
+    level_assert = idata[14];
+    delivery_mode = idata[10:8];
+    vector = idata[7:0];
+
+    if ($apic_bus.obj == NULL) {
+        log "error": "no apic_bus connected, cannot generate fault interrupt";
+        return;
+    }
+
+    log "info", 2: "generating interrupt";
+    $apic_bus.apic_bus.interrupt(dest_mode, delivery_mode, level_assert,
+                                 trigger_mode, vector, destination);
+}
+
+method generate_fault_event_interrupt() {
+    call $generate_interrupt($vtd.feaddr, $vtd.feuaddr, $vtd.fedata);
+    $vtd.fectl.ip = 0;
+}
+
+method generate_invalidation_interrupt() {
+    call $generate_interrupt($vtd.ieaddr, $vtd.ieuaddr, $vtd.iedata);
+    $vtd.iectl.ip = 0;
+}
+
+method set_pending_fault_event() {
+    $vtd.fectl.ip = 1;
+    if ($vtd.fectl.im == 0)
+        inline $generate_fault_event_interrupt();
+}
+
+method update_ppf_field() {
+    $vtd.fsts.ppf = 0;
+    local int i;
+    for (i = 0; i < $FRCD_NUM; i++) {
+        if ($vtd.frcd_h[i].f) {
+            $vtd.fsts.ppf = 1;
+            break;
+        }
+    }
+}
+
+/* we should not reraise interrupts if there is a fault condition */
+method fault_condition_active() -> (bool active) {
+    active = $vtd.fsts.ppf ||
+             $vtd.fsts.ite || $vtd.fsts.ice || $vtd.fsts.iqe ||
+             $vtd.fsts.apf || $vtd.fsts.afo || $vtd.fsts.pfo ||
+             $vtd.ics.iwc;
+}
+
+method generate_fault(type, addr_type, reason, sid, info) {
+    /* Primary Fault Logging, Advanced not supported by hardware */
+    /* It is unclear if hardware supports compression, therefore we do not
+       implement it. */
+
+    if ($vtd.fsts.pfo) {
+        log "info", 4: "fault overflow, can not generate fault";
+        return;
+    }
+
+    if ($vtd.frcd_h[$next_fault_idx].f) {
+        $vtd.fsts.pfo = 1;
+        log "info", 4: "fault overflow, can not generate fault";
+        return;
+    }
+
+    log "info", 4: "generate fault";
+
+    $vtd.frcd_h[$next_fault_idx].f = 1;
+    $vtd.frcd_h[$next_fault_idx].t = type;
+    $vtd.frcd_h[$next_fault_idx].at = addr_type;
+    $vtd.frcd_h[$next_fault_idx].fr = reason;
+    $vtd.frcd_h[$next_fault_idx].sid = sid;
+    $vtd.frcd_l[$next_fault_idx] = info;
+
+    /* If any of the status fields in the Fault Status register
+       was already set (active == TRUE) at the time of setting 
+       any of these fields, it is not treated as a new interrupt
+       condition */
+    local bool active;
+    inline $fault_condition_active -> (active);
+
+    if ($vtd.fsts.ppf == 0) {
+        $vtd.fsts.ppf = 1;
+        $vtd.fsts.fri = $next_fault_idx;
+    }
+    
+    if (!active)
+        call $set_pending_fault_event();
+
+    $next_fault_idx++;
+    if ($next_fault_idx == $FRCD_NUM)
+        $next_fault_idx = 0;
+}
+
+method generate_iqe_fault() {
+    /* If any of the status fields in the Fault Status register
+       was already set (active == TRUE) at the time of setting 
+       any of these fields, it is not treated as a new interrupt
+       condition */
+    local bool active;
+    inline $fault_condition_active -> (active);
+    $vtd.fsts.iqe = 1;
+    if (!active)
+        call $set_pending_fault_event();
+}
+
+method check_protected_region(generic_transaction_t *mem_op) -> (bool block) {
+    block = false;
+    if ($vtd.pmem.prs == 0)
+        return;
+
+    local physical_address_t mop_l = SIM_get_mem_op_physical_address(mem_op);
+    local physical_address_t mop_h = SIM_get_mem_op_physical_address(mem_op) +
+        SIM_get_mem_op_size(mem_op) - 1;
+
+    if (($vtd.cap.plmr && $vtd.plmbase <= $vtd.plmlimit &&
+        ((mop_l >= $vtd.plmbase && mop_l <= $vtd.plmlimit.limit) ||
+         (mop_h >= $vtd.plmbase && mop_h <= $vtd.plmlimit.limit))) ||
+        ($vtd.cap.phmr && $vtd.phmbase <= $vtd.phmlimit &&
+         ((mop_l >= $vtd.phmbase && mop_l <= $vtd.phmlimit.limit) ||
+          (mop_h >= $vtd.phmbase && mop_h <= $vtd.phmlimit.limit)))) {
+        block = true;
+    }
+}
+
+method remap_dma_transaction(generic_transaction_t *mem_op) -> (bool block) {
+    local physical_address_t pa;
+    local root_entry_t root_entry;
+    local context_entry_t context_entry;
+    local uint1 is_read;
+    local uint8 bus_id;
+    local uint8 dev_id;
+    local uint16 sid;
+    local bool protected_access;
+    local exception_type_t ex;
+
+    block = true;
+
+    /* only translate inbound transactions */
+    if (SIM_get_mem_op_ini_type(mem_op) != Sim_Initiator_PCI_Device) {
+        block = false;
+        return;
+    }
+
+    pa = SIM_get_mem_op_physical_address(mem_op);
+
+    /* do protected region control */
+    call $check_protected_region(mem_op) -> (protected_access);
+    if (protected_access) {
+        log "info", 2: "blocking transaction to 0x%llx, accessing protected region", pa;
+        return;
+    }
+
+    /* translation not enabled */
+    if (!$vtd.gsts.tes) {
+        log "info", 4: "pass through transaction to 0x%llx, translation not enabled", pa;
+        block = false;
+        return;
+    }
+
+    is_read = SIM_mem_op_is_read(mem_op) ? 1 : 0;
+
+    call $determine_requester_id(mem_op) -> (sid);
+    bus_id = sid[15:8];
+    dev_id = sid[7:0];
+
+    log "info", 4: "VT-d remapping of transaction %02x:%02x.%d 0x%llx ",
+        bus_id, dev_id >> 3, dev_id & 7, pa;
+
+    if (!$vtd.gsts.rtps) {
+        log "info", 2: "VT-d remapping enabled, but root-entry table address not set";
+        inline $generate_fault(is_read, 0, $FAULT_ROOT_ADDR, sid, 0);
+        return;
+    }
+
+    // root entry
+    local physical_address_t root_entry_addr = $vtd.rtaddr_prg + (bus_id * 16);
+    call $memory_read(&root_entry, root_entry_addr, 16) -> (ex);
+    if (ex != Sim_PE_No_Exception) {
+        log "info", 2: "root entry lookup error (address 0x%llx)",
+            root_entry_addr;
+        inline $generate_fault(is_read, 0, $FAULT_ROOT_ADDR, sid, 0);
+        return;
+    }
+    log "info", 4: "fetched root entry 0x%016llx:0x%016llx @ 0x%llx",
+        root_entry.high, root_entry.low, root_entry_addr;
+    if (root_entry.low.p == 0) {
+        log "info", 2: "root entry not present for bus %02x", bus_id;
+        inline $generate_fault(is_read, 0, $FAULT_ROOT_PRESENT, sid, 0);
+        return;
+    }
+
+    // context entry
+    local physical_address_t context_ptr = root_entry.low.ctp << 12;
+    local physical_address_t context_entry_addr = context_ptr + (dev_id * 16);
+    call $memory_read(&context_entry, context_entry_addr, 16) -> (ex);
+    if (ex != Sim_PE_No_Exception) {
+        log "info", 2: "context entry lookup error (address 0x%llx)",
+            context_entry_addr;
+        inline $generate_fault(is_read, 0, $FAULT_CONTEXT_ADDR, sid, 0);
+        return;
+    }
+    log "info", 4: "fetched context entry 0x%016llx:0x%016llx @ 0x%llx",
+        context_entry.high, context_entry.low, context_entry_addr;
+    if (context_entry.low.p == 0) {
+        log "info", 2: "context entry not present (%02x:%02x.%d)",
+            bus_id, dev_id >> 3, dev_id & 7;
+        if (context_entry.low.fpd == 0)
+            inline $generate_fault(is_read, 0, $FAULT_CONTEXT_PRESENT,
+                                   sid, context_ptr);
+        return;
+    }
+
+    if (context_entry.low.t == 0x3) {
+        log "info", 2: "context entry, translation type 0x3 is reserved";
+        if (context_entry.low.fpd == 0)
+            inline $generate_fault(is_read, 0, $FAULT_CONTEXT_INVALID,
+                                   sid, context_ptr);
+        return;
+    }
+    if (context_entry.low.t == 0x2) {
+        log "info", 2: "translation pass through set in context entry";
+        block = false;
+        return;
+    }
+    /* Translation will be done when context_entry.low.t == 0x0 or 0x1 */
+
+    if (context_entry.high.aw != 0x2) {
+        /* only 4-level walks supported as that is what ICH10 supports */
+        log "unimplemented", 1: "only 4-level walks supported";
+        if (context_entry.low.fpd == 0)
+            inline $generate_fault(is_read, 0, $FAULT_CONTEXT_INVALID,
+                                   sid, context_ptr);
+        return;
+    }
+
+    if (!($vtd.cap.sps == 0 && $vtd.cap.sagaw == 0x4)) {
+        /* only 4-level walks supported as that is what ICH10 supports */
+        log "unimplemented", 1: "only super pages and 4-level walks supported";
+        if (context_entry.low.fpd == 0)
+            inline $generate_fault(is_read, 0, $FAULT_CONTEXT_INVALID,
+                                   sid, context_ptr);
+        return;
+    }
+
+    if (pa[63:$vtd.cap.mgaw + 1] != 0) {
+        log "info", 2: "address exceeds the maximum guest address width";
+        if (context_entry.low.fpd == 0)
+            inline $generate_fault(is_read, 0, $FAULT_ADDRESS_MAX,
+                                   sid, context_ptr);
+        return;
+    }
+
+    local uint64 t_ptr = context_entry.low.asr << 12;
+    local uint8 levels = context_entry.high.aw + 2;
+    local int l;
+    for (l = 0; l < levels; l++) {
+        local page_table_entry_t page_entry;
+        local physical_address_t page_entry_addr = t_ptr + ((pa >> (levels - l) * 9) & 0xff8);
+        call $memory_read(&page_entry, page_entry_addr, 8) -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            log "info", 2: "page entry lookup error (address 0x%llx)",
+                page_entry_addr;
+            if (context_entry.low.fpd == 0)
+                inline $generate_fault(is_read, 0, $FAULT_PAGE_ADDR, sid, t_ptr);
+            return;
+        }
+        log "info", 4: "fetched page entry 0x%016llx @ 0x%llx",
+            page_entry, page_entry_addr;
+        if (page_entry.sp == 1 && $vtd.cap.sps == 0) {
+            log "info", 2: "page table %d has SP set but Super Pages are not enabled", l;
+            if (context_entry.low.fpd == 0)
+                inline $generate_fault(is_read, 0, $FAULT_PAGE_RESERVED, sid, t_ptr);
+            return;
+        }
+
+        if (is_read && page_entry.r == 0) {
+            log "info", 2: "page table %d is read protected, no translation", l;
+            if (context_entry.low.fpd == 0)
+                inline $generate_fault(is_read, 0, $FAULT_READ, sid, t_ptr);
+            return;
+        }
+
+        if (!is_read && page_entry.w == 0 &&
+            (SIM_get_mem_op_size(mem_op) > 0 || $vtd.cap.zlr == 0)) {
+            log "info", 2: "page table %d is write protected, no translation", l;
+            if (context_entry.low.fpd == 0)
+                inline $generate_fault(is_read, 0, $FAULT_WRITE, sid, t_ptr);
+            return;
+        }
+
+        t_ptr = page_entry.addr << 12;
+    }
+    SIM_set_mem_op_physical_address(mem_op, t_ptr + pa[11:0]);
+    block = false;
+}
+
+method handle_invalidation_queue() {
+    while (true) {
+        if ($vtd.gsts.qies == 0)
+            break;
+        if ($vtd.iqh == $vtd.iqt)
+            break;
+        if ($vtd.fsts.iqe == 1 || $vtd.fsts.ite == 1)
+            break;
+
+        local exception_type_t ex;
+        local invalidation_desc_t desc;
+        local physical_address_t addr = $vtd.iqh + ($vtd.iqa.iqa << 12);
+        call $memory_read(&desc, addr, 16) -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            log "info", 2: "invalidation entry lookup failed (%08llx)", addr;
+            call $generate_iqe_fault();
+            break;
+        }
+        local uint8 type = desc.low[3:0];
+        switch (type) {
+        case 1: /* Context Cache Invalidate Descriptor */
+            log "info", 3: "Context Cache Invalidation %08llx:%08llx",
+                desc.high, desc.low;
+            break;
+        case 2: /* IOTLB Invalidate Descriptor */
+            log "info", 3: "IOTLB Invalidation %08llx:%08llx",
+                desc.high, desc.low;
+            break;
+        case 3: /* Device-IOTLB Invalidate Descriptor */
+            log "info", 3: "Device-IOTLB Invalidation %08llx:%08llx",
+                desc.high, desc.low;
+            break;
+        case 4: /* Interrupt Entry Cache Invalidate Descriptor */
+            log "info", 3: "Interrupt Entry Invalidation %08llx:%08llx",
+                desc.high, desc.low;
+            break;
+        case 5: { /* Invalidation Wait Descriptor */
+            log "info", 3: "Invalidation Wait Descriptor %08llx:%08llx",
+                desc.high, desc.low;
+            local uint1 _if = desc.low[4];
+            local uint1 sw = desc.low[5];
+            if (sw) {
+                /* status write */
+                local uint16 status_data = desc.low[63:32];
+                local uint64 addr = desc.high & ~3;
+                call $memory_write(&status_data, addr, 2) -> (ex);
+                if (ex != Sim_PE_No_Exception) {
+                    log "info", 2: "IWD status write failed (%08llx)", addr;
+                    call $generate_iqe_fault();
+                    return;
+                }
+            }
+            if (_if) {
+                /* raise invalidation interrupt */
+                if ($vtd.ics.iwc == 0) {
+                    $vtd.ics.iwc = 1;
+                    if ($vtd.iectl.im == 0)
+                        call $generate_invalidation_interrupt();                
+                    else
+                        $vtd.iectl.ip = 1;
+                }
+            }
+            break;
+        }
+        default:
+            log "spec_violation", 1: "Invalid Invalidation Descriptor %d", type;
+            call $generate_iqe_fault();
+            return;
+        }
+   
+        /* advance queue head (circular buffer) */
+        $vtd.iqh = ($vtd.iqh + 0x10) & ((1 << ($vtd.iqa.qs + 12)) - 0xf);
+    }
+}
+
+template interrupt_data {
+    method write(value) {
+        if (value[31:16] != 0) {
+            log "spec_violation", 1: "writing reserved bits";
+            value[31:16] = 0;
+        }
+        $this = value;
+    }
+}
+
+template interrupt_addr {
+    method write(value) {
+        if (value[1:0] != 0) {
+            log "spec_violation", 1: "writing reserved bits";
+            value[1:0] = 0;
+        }
+        $this = value;
+    }
+}
+
+template interrupt_uaddr {
+    method write(value) {
+        if ($ecap.eim == 0)
+            log "spec_violation", 1: "extended Interrupt Mode is disabled";
+        $this = value;
+    }
+}
+
+
+bank vtd {
+    register ver { parameter hard_reset_value = 0; }
+    register cap {
+        field drd   [55] is (read_only) { parameter hard_reset_value = 0; }
+        field dwd   [54]  is (read_only) { parameter hard_reset_value = 1; }
+        field mamv  [53:48] is (read_only) { parameter hard_reset_value = 9; }
+        field nfr   [47:40] is (read_only) {
+            /* The documentation is not clear, the "Virtualization Technology
+               for Directed I/O" document implies that the value should be
+               $FRCD_NUM - 1, the X58 and 5500 documents implies that the value
+               should be $FRCD_NUM.
+             */
+            parameter hard_reset_value = $FRCD_NUM - 1;
+        }
+        field psi   [39] is (read_only) { parameter hard_reset_value = 1; }
+        field sps   [37:34] is (read_only) { parameter hard_reset_value = 0; }
+        field fro   [33:24] is (read_only) { parameter hard_reset_value = $FRCD_OFFSET; }
+        field isoch [23] is (read_only) {
+            /* No information about 0x1008. */
+            parameter hard_reset_value = 0;
+        }
+        field zlr   [22] is (read_only) { parameter hard_reset_value = 0; }
+        field mgaw  [21:16] is (read_only) {
+            /* No information about 0x1008. */
+            parameter hard_reset_value = 0x2f;
+        }
+        field sagaw [12:8] is (read_only) {
+            /* No information about 0x1008. The documentation says that the
+               default value should be 2, but it is most likely wrong.*/
+            parameter hard_reset_value = 4;
+        }
+        field cm    [7] is (read_only) { parameter hard_reset_value = 0; }
+        field phmr  [6] is (read_only) { parameter hard_reset_value = 1; }
+        field plmr  [5] is (read_only) { parameter hard_reset_value = 1; }
+        field rwbf  [4] is (read_only) { parameter hard_reset_value = 0; }
+        field afl   [3] is (read_only) { parameter hard_reset_value = 0; }
+        field nd    [2:0] is (read_only) { parameter hard_reset_value = 2; }
+    }
+
+    register ecap {
+        field mhmv [23:20] is (read_only) { parameter hard_reset_value = 0xf; }
+        field ivo  [17:8] is (read_only) {
+            parameter hard_reset_value = $IOTLB_OFFSET;
+        }
+        field sc   [7] is (read_only);
+        field pt   [6] is (read_only) { parameter hard_reset_value = 1; }
+        field ch   [5] is (read_only) { parameter hard_reset_value = 1; }
+        field eim  [4] is (read_only) { parameter hard_reset_value = 0; }
+        field ir   [3] is (read_only) { parameter hard_reset_value = 1; }
+        field di   [2] is (read_only);
+        field qi   [1] is (read_only) { parameter hard_reset_value = 1; }
+        field c    [0] is (read_only) { parameter hard_reset_value = 0; }
+    }
+
+    register gcmd {
+        field te [31] is (read_zero)  "Translation Enable" {
+            method write(value) {
+                $gsts.tes = value;
+            }
+        }
+        field rtp [30] is (read_zero) "Set Root Table Pointer" {
+            method write(value) {
+                if (value) {
+                    $rtaddr_prg = $rtaddr;
+                    $gsts.rtps = 1;
+                }
+            }
+        }
+        field fl [29] is (read_zero)  "Set Fault log" {
+            method write(value) {
+                if (value)
+                    log "error": "setting fault log not supported by hardware";
+            }
+        }
+        field afl [28] is (read_zero)  "Enable Advanced Fault logging" {
+            method write(value) {
+                if (value)
+                    log "error": "enabling advanced fault log not supported by hardware";
+            }
+        }
+        field wbf [27] is (read_zero) "Write Buffer Flush" {
+            method write(value) {
+                if (value) {
+                    if ($cap.rwbf == 0)
+                        log "spec_violation", 1:
+                            "write buffer flush command not supported by hardware";
+                    /* flush write buffer, will first set wbfs and then clear
+                       wbfs when finished, we will only clear */
+                    $gsts.wbfs = 0;
+                }
+            }
+        }
+        field qie [26] is (read_zero) "Queued Invalidation Enable" {
+            method write(value) {
+                if (value == 0)
+                    $vtd.iqh = 0;
+                $gsts.qies = value;
+                if (value)
+                    call $handle_invalidation_queue();
+            }
+        }
+        field ire [25] is (read_zero) "Interrupt Remapping Enable" {
+            method write(value) {
+                $gsts.ires = value;
+            }
+        }
+        field irtp [24] is (read_zero) "Set Interrupt Remap Table Pointer" {
+            method write(value) {
+                if (value) {
+                    $irta_prg = $irta.irta << 12;
+                    $gsts.irtps = 1;
+                }
+            }
+        }
+        field cfi  [23] is (read_zero) "Compatibility Format Interrupt" {
+            method write(value) {
+                $gsts.cfis = value;
+            }
+        }
+    }
+
+    register gsts {
+        field tes   [31] is (read_only);
+        field rtps  [30] is (read_only);
+        field fls   [29] is (read_only);
+        field afls  [28] is (read_only);
+        field wbfs  [27] is (read_only);
+        field qies  [26] is (read_only);
+        field ires  [25] is (read_only);
+        field irtps [24] is (read_only);
+        field cfis  [23] is (read_only);
+    }
+
+    register rtaddr_prg size 8 is (unmapped);
+    register rtaddr {
+        method read() -> (value) {
+            value = $rtaddr_prg;
+        }
+        method write(value) {
+            value[11:0] = 0;
+            $this = value;
+        }
+    }
+
+    register irta_prg size 8 is (unmapped);
+    register irta {
+        field irta [63:12] {
+            method read() -> (value) {
+                value = $irta_prg[63:12];
+            }
+        }
+        field eime [11];
+        field sz   [3:0];
+    }
+
+    register ccmd {
+        field icc  [63]    "Invalidate Context-Cache";
+        field cirg [62:61] "Invalidation Request Granularity";
+        field caig [60:59] is (read_only) "Actual Invalidation Granularity";
+        field fm   [33:32] "Function Mask";
+        field sid  [31:16] "Source ID";
+        field did  [15:0]  "Domain ID";
+
+        method after_write(mop) {
+            if ($icc) {
+                $icc = 0;
+                $caig = $cirg;
+            }
+        }
+    }
+
+    register fsts {
+        field fri [15:8] is (ignore_write) "Fault Record Index";
+        field ite [6] is (write_1_clears) "Invalidation Time-out Error";
+        field ice [5] is (write_1_clears) "Invalidation Complete Error";
+        field iqe [4] is (write_1_clears) "Invalidation Queue Error";
+        field apf [3] is (write_1_clears) "Advanced Pending Fault";
+        field afo [2] is (write_1_clears) "Advanced Fault Overflow";
+        field ppf [1] is (ignore_write) "Primary Pending Fault";
+        field pfo [0] is (write_1_clears) "Primary Pending Overflow";
+        method after_write(memop) {
+            local bool active;
+            call $fault_condition_active() -> (active);
+            if (!active)
+                $fectl.ip = 0;
+        }
+    }
+
+    register fectl {
+        field im [31] "Interrupt Mask" {
+            parameter hard_reset_value = 1;
+            method write(value) {
+                if ($this == 1 && value == 0) {
+                    $this = 0;
+                    if ($ip)
+                        call $generate_fault_event_interrupt();
+                } else
+                    $this = value;
+            }
+        }
+        field ip [30] is (ignore_write) "Interrupt Pending";
+    }
+
+    register fedata is (interrupt_data);
+    register feaddr is (interrupt_addr);
+    register feuaddr is (interrupt_uaddr);
+
+    register aflog {
+        method write(value) {
+            log "error": "writing advanced fault log not supported by hardware";
+        }
+    }
+
+    register pmem {
+        field epm[31] "Enable Protected Memory" {
+            method write(value) {
+                $prs = value;
+            }
+        }
+        field prs [0] is (ignore_write) "Protected Region Status";
+    }
+
+    register plmbase {
+        parameter RESERVED_MASK default 0x001fffff;
+        method write(value) {
+            if ($cap.plmr == 0) {
+                log "spec_violation", 1:
+                    "writing %s, protected low region not supported", $qname;
+                return;
+            }
+            if ($pmem.prs)
+                log "spec_violation", 1:
+                    "writing %s, protected low region not enabled", $qname;
+            $this = value & ~$RESERVED_MASK;
+        }
+    }
+    register plmlimit {
+        data uint32 limit;
+        parameter RESERVED_MASK default 0x00ffffff;
+        method write(value) {
+            if ($cap.plmr == 0) {
+                log "spec_violation", 1:
+                    "writing %s, protected low region not supported", $qname;
+                return;
+            }
+            if ($pmem.prs)
+                log "spec_violation", 1:
+                    "writing %s, protected low region not enabled", $qname;
+            $this = value & ~$RESERVED_MASK;
+            $limit = $this + $RESERVED_MASK;
+        }
+    }
+    register phmbase {
+        parameter RESERVED_MASK default 0x0000000000ffffff;
+        method write(value) {
+            if ($cap.phmr == 0) {
+                log "spec_violation", 1:
+                    "writing %s, protected high region not supported", $qname;
+                return;
+            }
+            if ($pmem.prs)
+                log "spec_violation", 1:
+                    "writing %s, protected high region not enabled", $qname;
+            $this = value & ~$RESERVED_MASK;
+        }
+    }
+    register phmlimit {
+        data uint32 limit;
+        parameter RESERVED_MASK default 0x00000000001fffff;
+        method write(value) {
+            if ($cap.phmr == 0) {
+                log "spec_violation", 1:
+                    "writing %s, protected high region not supported", $qname;
+                return;
+            }
+            if ($pmem.prs)
+                log "spec_violation", 1:
+                    "writing %s, protected high region not enabled", $qname;
+            $this = value & ~$RESERVED_MASK;
+            $limit = $this + $RESERVED_MASK;
+        }
+    }
+
+    register iqh {
+        method write(value) {
+            if ($ecap.qi)
+                $this = value & 0x0007fff0;
+        }
+    }
+    register iqt {
+         method write(value) {
+             if ($ecap.qi) {
+                 $this = value & 0x0007fff0;
+                 call $handle_invalidation_queue();
+             }
+        }
+    }
+
+    register iqa {
+        field iqa [63:12] "Invalidation Queue Base Address" {
+            method write(value) {
+                if ($ecap.qi)
+                    $this = value;
+            }
+        }
+        field qs  [2:0]   "Queue Size" {
+            method write(value) {
+                if ($ecap.qi)
+                    $this = value;
+            }
+        }
+    }
+
+    register ics {
+        field iwc [31] "Invalidation Wait Descriptor Complete" {
+            method write(value) {
+                if ($this == 1) {
+                    $this = 0;
+                    $iectl.ip = 0;
+                }
+            }
+        }
+    }
+    
+    register iectl {
+        field im [31] "Interrupt Mask" {
+            parameter hard_reset_value = 1;
+            method write(value) {
+                if ($this == 1 && value == 0) {
+                    $this = 0;
+                    if ($ip)
+                        call $generate_invalidation_interrupt();
+                } else {
+                    $this = value;
+                }
+            }
+        }
+        field ip [30] is (ignore_write);
+    }
+
+    register iedata is (interrupt_data);
+    register ieaddr is (interrupt_addr);
+    register ieuaddr is (interrupt_uaddr);
+
+    register frcd_l[$FRCD_NUM];
+    register frcd_h[$FRCD_NUM] {
+        field f  [63] is (write_1_clears) "Fault";
+        field t  [62] "Type";
+        field at [61:60] "Address Type";
+        field fr [39:32] "Fault Reason";
+        field sid [15:0] "Source Identifier";
+
+        method after_write(mop) {
+            inline $update_ppf_field();
+        }
+    }
+
+    register iotlb {
+        field ivt  [63];
+        field iirg [61:60];
+        field iaig [58:57];
+        field dr   [49];
+        field dw   [48];
+        field did  [47:32];
+
+        method after_write(mop) {
+            if ($ivt) {
+                $ivt = 0;
+                $iaig = $iirg;
+            }
+        }
+    }
+}

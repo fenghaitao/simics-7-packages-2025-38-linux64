@@ -1,0 +1,4 @@
+This is a test of the DS12887 real-time clock.
+
+These tests are mostly written to illustrate how to write functional
+tests so they are not very comprehensive but well-commented.

@@ -1,0 +1,44 @@
+/*
+  virtio-pcie-fs.dml
+
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device virtio_pcie_fs;
+
+param desc = "model of virtio PCIE file-system device";
+
+param documentation = "Virtio PCIE File System device based on the Virtio " +
+                      "1.2 specification. Implements the base functionality. " +
+                      "Does not implement:" +
+                      "<ul>"+
+                      "<li>VIRTIO_FS_F_NOTIFICATION</li>" +
+                      "</ul>" +
+                      "" +
+                      "This device uses MSI-X for interrupts, and does " +
+                      "currently not support legacy interrupts. " +
+                      "CONFIG_PCI_MSI=y must thus be set in the kernel config.";
+
+import "virtio-pcie-common.dml";
+import "virtio-fs-common.dml";
+
+is pcie_virtio_device;
+is virtio_fs_device;
+
+param DEVICE_ID = VIRTIO_PCI_BASE_ID + VIRTIO_ID_FS;
+param CLASS_CODE = 0x018000;
+
+bank virtio_config {
+    group device_specific is virtio_fs_regs { }
+}

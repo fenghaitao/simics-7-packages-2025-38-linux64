@@ -1,0 +1,895 @@
+/*
+  firewire-bus.dml - FireWire bus
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device firewire_bus;
+bitorder le;
+parameter desc = "model of FireWire bus";
+parameter documentation = "A FireWire bus."
+    + " The bus takes responsibility for all the bus arbitration and"
+    + " assigning ids. It does not keep track of the topology of the bus, so"
+    + " the IDs will be quite arbitrary. Neither does it keep track of the"
+    + " transfer rate limitations, which means that you can transmit as much"
+    + " data per time unit as you want.";
+
+parameter number_of_channels = 64;
+
+header %{
+#include <simics/devs/firewire.h>
+extern hap_type_t hap_transfer;
+extern hap_type_t hap_reset;
+
+typedef enum {
+    Ps_No_Port = 0,     /* no port */
+    Ps_Unconnected = 1, /* port not connected */
+/* every value larger than Ps_Unconnected means the port is connected */
+/* This means that the other_device and other_port fields have to be valid */
+    Ps_Parent = 2,      /* connected to parent */
+    Ps_Child = 3,       /* connected to child */
+    Ps_Unknown = 4      /* unknown connection. masked with 3 -> 0 */
+} port_status_t;
+
+typedef struct port port_t;
+typedef struct connected_device connected_device_t;
+struct port {
+    port_status_t port_status; /* status of the port */
+    connected_device_t *other_device; /* device this port is connected to */
+    uint8 other_port; /* port in other device this one is connected to */
+};
+
+struct connected_device {
+    conf_object_t *dev;   /* Pointer to the device */
+    const firewire_device_interface_t *iface; /* MUST be valid if dev != NULL */
+    uint16 id;            /* The ID assigned to the device */
+    uint16 id_mask;       /* Bits to match to send transfers to the device */
+    uint64 subscriptions; /* channels the device subscribes to */
+
+    /* Fields used during tree construction */
+    int visited;          /* is this visited during the current traversal */
+    port_t ports[16];     /* The ports of this device */
+    uint8 port_count;     /* cached port count */
+};
+
+static UNUSED uint8 identify_nodes(conf_object_t *bus, void *self_ids,
+                                   void *devs);
+%}
+
+import "utility.dml";
+import "firewire-common.dml";
+
+extern hap_type_t hap_transfer;
+extern hap_type_t hap_reset;
+
+extern port_status_t Ps_No_Port;
+extern port_status_t Ps_Unconnected;
+extern port_status_t Ps_Parent;
+extern port_status_t Ps_Child;
+extern port_status_t Ps_Unknown;
+extern typedef int port_status_t;
+
+extern typedef struct {
+    port_status_t port_status; /* status of the port */
+    connected_device_t *other_device; /* device this port is connected to */
+    uint8 other_port; /* port in other device this one is connected to */
+} port_t;
+
+extern typedef struct {
+    conf_object_t *dev;   /* Pointer to the device */
+    const firewire_device_interface_t *iface; /* MUST be valid if dev != NULL */
+    uint16 id;            /* The ID assigned to the device */
+    uint16 id_mask;       /* Bits to match to send transfers to the device */
+    uint64 subscriptions; /* channels the device subscribes to */
+
+    /* Fields used during tree construction */
+    bool visited;         /* is this visited during the current traversal */
+    port_t ports[16];     /* The ports of this device */
+    uint8 port_count;     /* cached port count */
+} connected_device_t;
+
+extern uint8 identify_nodes(conf_object_t *bus, void *self_ids, void *devs);
+
+method init {
+    call $connections.init;
+}
+
+attribute connected_devices  {
+    /*
+      The devices connected to the FireWire bus and
+      their current ids and channel subscriptions.
+      The ids are recalculated after each reset. The channel
+      subscriptions are represented as a bitfield where each bit set
+      represents a channel the device subscribes to. The channels bits
+      are stored from lsb for channel 0 to msb for channel 63.
+      This list is sorted by the name of the devices to keep the order
+      consistent between constructed configurations and checkpoints.
+    */
+    parameter type = "[[oiii]*]";
+    parameter configuration = "pseudo";
+    parameter internal = true;
+
+    data connected_device_t vect v;
+
+    method get() -> (attr_value_t ret) {
+        local int i;
+        ret = SIM_alloc_attr_list(VLEN($v));
+        for (i = 0; i < VLEN($v); i++) {
+            local connected_device_t dev = $v[i];
+            local attr_value_t elem = SIM_make_attr_list(
+                4,
+                SIM_make_attr_object(dev.dev),
+                SIM_make_attr_uint64(dev.id),
+                SIM_make_attr_uint64(dev.id_mask),
+                SIM_make_attr_uint64(dev.subscriptions));
+            SIM_attr_list_set_item(&ret, i, elem);
+        }
+    }
+
+   method add_device(conf_object_t *obj) {
+        local bool connected;
+        call $is_connected(obj) -> (connected);
+        if (connected) {
+            log error: "tried to connect an already connected device";
+            throw;
+        }
+        
+        local connected_device_t con_dev;
+        con_dev.id = 0; /* DML needs this, even though we overwrite it below */
+        con_dev.id_mask = ~0;
+        /* le bitorder avoids confusing dmlc */
+        con_dev.id[15:6] = 0x3ff;
+        con_dev.id[5:0] = VLEN($v);
+        con_dev.subscriptions = 0;
+        con_dev.dev = obj;
+        call $get_fw_dev_iface(con_dev.dev) -> (con_dev.iface);
+        con_dev.port_count = con_dev.iface->get_port_count(con_dev.dev);
+        /*
+          Set all ports to Ps_No_Port. The defined ports will get the right
+          status during reset, but this gives the right value where there
+          isn't a port.
+        */
+        local int i;
+        for (i = 0; i < 16; i++) {
+            con_dev.ports[i].port_status = Ps_No_Port;
+        }
+        inline $insert_in_vector(con_dev);
+    }
+
+    method remove_device(conf_object_t *obj) {
+        local int index = VLEN($v);
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            if ($v[i].dev == obj) {
+                index = i;
+                break;
+            }
+        }
+        if (index == VLEN($v)) {
+            log error: "tried to disconnect an unconnected device";
+            throw;
+        }
+        VDELETE_ORDER($v, index);
+    }
+
+    method insert_in_vector(d) {
+        local int i;
+        inline $find_index_for_device(d) -> (i);
+        VINSERT($v, i, d);
+    }
+
+    method find_index_for_device(d) -> (i) {
+        for (i = 0; i < VLEN($v); i++) {
+            if (strcmp(SIM_object_name(d.dev), SIM_object_name($v[i].dev)) < 0){
+                return;
+            }
+        }
+    }
+
+    method find_device_by_id(uint16 id) -> (connected_device_t *dev) {
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            if ($v[i].id == id) {
+                dev = &$v[i];
+                return;
+            }
+        }
+        dev = NULL;
+    }
+
+    method find_device_by_obj(conf_object_t *obj) -> (connected_device_t *dev) {
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            if ($v[i].dev == obj) {
+                dev = &$v[i];
+                return;
+            }
+        }
+        dev = NULL;
+    }
+
+    method is_connected(conf_object_t *dev) -> (bool res) {
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            if ($v[i].dev == dev) {
+                res = true;
+                return;
+            }
+        }
+        res = false;
+    }
+
+    method get_fw_dev_iface(conf_object_t *dev)
+        -> (const firewire_device_interface_t *iface) {
+        iface = SIM_get_interface(dev, "firewire_device");
+        if (iface == NULL) {
+            SIM_clear_exception();
+            log error: "tried to connect device which does not implement firewire_device";
+            throw;
+        }
+    }
+
+    method make_all_unvisited {
+        local int i;
+        for (i = 0; i < VLEN($connected_devices.v); i++) {
+            $connected_devices.v[i].visited = false;
+        }
+    }
+
+    method make_all_connected_ports_unknown {
+        local int i;
+        for (i = 0; i < VLEN($connected_devices.v); i++) {
+            local int j;
+            for (j = 0; j < $connected_devices.v[i].port_count; j++) {
+                if ($connected_devices.v[i].ports[j].port_status
+                    > Ps_Unconnected)
+                    $connected_devices.v[i].ports[j].port_status = Ps_Unknown;
+            }
+        }
+    }
+
+    method remove_disabled_connections {
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            local uint16 mask = $v[i].iface->get_port_mask($v[i].dev);
+            local int j;
+            for (j = 0; j < $v[i].port_count; j++) {
+                if ((((1 << j) & mask) == 0)
+                    && ($v[i].ports[j].port_status > Ps_Unconnected)) {
+                    local connected_device_t *other
+                        = $v[i].ports[j].other_device;
+                    local int other_port
+                        = $v[i].ports[j].other_port;
+                    $v[i].ports[j].port_status = Ps_Unconnected;
+                    other->ports[other_port].port_status = Ps_Unconnected;
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    conf_object_t *dev;
+    uint8 port;
+} port_id_t;
+
+typedef struct {
+    port_id_t p[2];
+} connection_t;
+
+attribute connections {
+    parameter documentation = "The connections between the ports on the"
+        + " devices. Each connection is represented as a pair of ports, where"
+        + " each port is represented as a pair of a device and a port number."
+        + " The connections must be kept consistent with the devices connected"
+        + " to the bus.";
+    parameter type = "[[[oi][oi]]*]";
+    data connection_t vect v;
+
+    method init {
+        VINIT($v);
+    }
+
+    method set(attr_value_t val) {
+        VRESIZE($v, SIM_attr_list_size(val));
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            local attr_value_t con = SIM_attr_list_item(val, i);
+            local int j;
+            for (j = 0; j < 2; j++) {
+                local attr_value_t port = SIM_attr_list_item(con, j);
+                $v[i].p[j].dev = SIM_attr_object(SIM_attr_list_item(port, 0));
+                $v[i].p[j].port = SIM_attr_integer(SIM_attr_list_item(port, 1));
+            }
+        }
+    }
+
+    method get -> (attr_value_t val) {
+        val = SIM_alloc_attr_list(VLEN($v));
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            local attr_value_t con = SIM_alloc_attr_list(2);
+            local int j;
+            for (j = 0; j < 2; j++) {
+                local attr_value_t port = SIM_make_attr_list(
+                    2,
+                    SIM_make_attr_object($v[i].p[j].dev),
+                    SIM_make_attr_uint64($v[i].p[j].port));
+                SIM_attr_list_set_item(&con, j, port);
+            }
+            SIM_attr_list_set_item(&val, i, con);
+        }
+    }
+
+    method remove_all_connections {
+        local int i;
+        for (i = 0; i < VLEN($connected_devices.v); i++) {
+            local int port_count = $connected_devices.v[i].port_count;
+            local int j;
+            for (j = 0; j < port_count; j++) {
+                $connected_devices.v[i].ports[j].port_status = Ps_Unconnected;
+                $connected_devices.v[i].ports[j].other_device = NULL;
+            }
+        }
+    }
+
+    method reset_connection_fields {
+        call $remove_all_connections;
+        local int i;
+        for (i = 0; i < VLEN($v); i++) {
+            local connection_t con = $v[i];
+            local connected_device_t *dev[2];
+            local int j;
+            for (j = 0; j < 2; j++) {
+                call $connected_devices.find_device_by_obj(con.p[j].dev)
+                    -> (dev[j]);
+                if (dev[j] == NULL) {
+                    log info: "unconnected device (%s) used in connections", 
+                        SIM_object_name(con.p[j].dev);
+                }
+            }
+            for (j = 0; j < 2; j++) {
+                if (dev[j] == NULL) continue;
+                dev[j]->ports[con.p[j].port].port_status = (dev[1-j] != NULL)
+                    ? Ps_Unknown
+                    : Ps_Unconnected;
+                dev[j]->ports[con.p[j].port].other_device = dev[1-j];
+                dev[j]->ports[con.p[j].port].other_port = con.p[1-j].port;
+            }
+        }
+    }
+}
+
+attribute self_ids {
+    parameter documentation ="The self-id packets describing the current tree."
+        + " This attribute is only valid during the Firewire_Bus_Reset hap."
+        + " It describes the structure of the tree. The"
+        + " connected_devices attribute is what is used to say which device"
+        + " has which node-id.";
+    parameter type = "[i*]";
+    parameter configuration = "pseudo";
+    data uint32 vect v;
+
+    method set (attr_value_t val) {
+        local int i;
+        VRESIZE($v, SIM_attr_list_size(val));
+        for (i = 0; i < VLEN($v); i++) {
+            $v[i] = SIM_attr_integer(SIM_attr_list_item(val, i));
+        }
+    }
+
+    method get -> (attr_value_t val) {
+        local int i;
+        val = SIM_alloc_attr_list(VLEN($v));
+        for (i = 0; i < VLEN($v); i++) {
+            SIM_attr_list_set_item(&val, i, SIM_make_attr_uint64($v[i]));
+        }
+    }
+
+    method calculate_self_ids -> (uint6 root) {
+        call $connections.reset_connection_fields;
+        call $connected_devices.remove_disabled_connections;
+        call $connected_devices.make_all_unvisited;
+        call $connected_devices.make_all_connected_ports_unknown;
+        local uint8 root_or_error = identify_nodes($dev.obj, cast(&$v, void *),
+                                                   cast(&$connected_devices.v,
+                                                        void*));
+        if (root_or_error == 0xff) {
+            throw; /* No devices connected */
+        }
+        root = root_or_error;
+    }
+
+    method flush {
+        VRESIZE($v, 0);
+    }
+}
+
+attribute current_transfer {
+    parameter configuration = "pseudo";
+    parameter documentation = "The current transfer. This"
+        + " attribute is only valid during the Firewire_Transfer hap.";
+    parameter type = "d|n";
+    data dbuffer_t *packet;
+    data bool dropped;
+    parameter hap = hap_transfer;
+
+    method invoke_hap(packet) 
+        -> (dropped) {
+        /* current_transfer contains the packet while the hap is invoked. The
+           hap handler can modify it or set it to nil to indicate that the it
+           should be dropped.
+        */
+        $packet = packet;
+        dropped = false;
+        SIM_c_hap_occurred_always($hap, $dev.obj, 0);
+        $packet = NULL;
+        dropped = $dropped;
+    }
+
+    method get -> (attr_value_t val) {
+        if (!$packet || $dropped) {
+            val = SIM_make_attr_nil();
+            return;
+        }
+        val = SIM_make_attr_data(dbuffer_len($packet),
+                                 dbuffer_read_all($packet));
+    }
+
+    method set(attr_value_t val) {
+        if (!$packet) throw;
+        if (SIM_attr_is_nil(val)) {
+            $dropped = true;
+            return;
+        }
+        dbuffer_clear($packet);
+        memcpy(dbuffer_append($packet, SIM_attr_data_size(val)), 
+               SIM_attr_data(val), SIM_attr_data_size(val));
+    }
+}
+
+implement firewire_bus {
+    /*
+     * Connect the device dev to the bus.
+     */
+    method connect_device(conf_object_t *dev)
+        -> (int result) {
+        result = 0;
+        try {
+            if (dev == NULL) {
+                log error: "tried to connect null device to the bus";
+                throw;
+            }
+            call $connected_devices.add_device(dev);
+            result = 0;
+        } catch {
+            result = -1;
+        }
+    }
+
+    /*
+     * Disconnect the device dev from the bus.
+     */
+    method disconnect_device(conf_object_t *dev) -> (int result) {
+        result = -1; /* appease compiler */
+        try {
+            call $connected_devices.remove_device(dev);
+            result = 0;
+        } catch {
+            result = -1;
+        }
+    }
+
+    method set_device_bus_id(conf_object_t *dev, uint16 bus_id) {
+        log info, 3: "update bus ID for %s to 0x%x", SIM_object_name(dev), 
+            bus_id;
+        local connected_device_t *con_dev;
+        call $connected_devices.find_device_by_obj(dev) -> (con_dev);
+        if (con_dev == NULL) {
+            log error: "set_device_bus_id failed since %s isn't connected", 
+                SIM_object_name(dev);
+            return;
+        }
+        /* Use little endian bitorder to avoid confusing dmlc */
+        con_dev->id[15:6] = bus_id[15:6];
+    }
+
+    /*
+     * I'm unsure of the semantics of this method
+     */
+    method set_id_mask(conf_object_t *dev, uint16 id_mask) {
+        local connected_device_t *con_dev;
+        call $connected_devices.find_device_by_obj(dev) -> (con_dev);
+        if (con_dev == NULL) {
+            log error: "set_id_mask failed since %s isn't connected", 
+                SIM_object_name(dev);
+            return;
+        }
+        con_dev->id_mask = id_mask;
+    }
+
+    method transfer(conf_object_t *source, dbuffer_t *packet,
+                    int crc_calculated)
+        -> (firewire_ack_code_t ack) {
+        local bool dropped;
+            ack = Firewire_Ack_No_Ack;
+        if (packet == NULL) {
+            /* NULL packets are not valid */
+            log error: "someone tried to transfer a null";
+            return;
+        }
+        /*
+         * Make sure that we own the packet's dbuffer since it might
+         * be replaced by the hap.
+         */
+        packet = dbuffer_clone(packet);
+        inline $current_transfer.invoke_hap(packet) -> (dropped);
+        if (dropped) {
+            log info, 2: "dropping packet";
+        } else {
+            if (dbuffer_len(packet) < 8) {
+                log error: "too short packet";
+                return;
+            }
+            inline $perform_transfer(source, packet, crc_calculated) -> (ack);
+        }
+        dbuffer_free(packet);
+    }
+
+    method register_channel(conf_object_t *obj, uint32 channel) -> (int res) {
+        local connected_device_t *dev;
+        if (obj == NULL) {
+            log error: "tried to register null device to a channel";
+            res = -1;
+            return;
+        }
+        if (channel > $number_of_channels) {
+            log error: "channel (%d) out of range", channel;
+            res = -1;
+            return;
+        }
+        call $connected_devices.find_device_by_obj(obj) -> (dev);
+        if (dev == NULL) {
+            log error: "device %s not connected to the bus", 
+                SIM_object_name(obj);
+            res = -1;
+            return;
+        }
+        if ((dev->subscriptions & (1 << channel)) != 0) {
+            log error: "device %s already subscribed to channel %d", 
+                SIM_object_name(obj), channel;
+            res = -1;
+            return;
+        }
+        dev->subscriptions |= 1 << channel;
+        res = 0;
+    }
+
+    method unregister_channel(conf_object_t *obj, uint32 channel) -> (int res) {
+        local connected_device_t *dev;
+        if (obj == NULL) {
+            log error: "tried to unregister null device from a channel";
+            res = -1;
+            return;
+        }
+        if (channel > $number_of_channels) {
+            log error: "channel (%d) out of range", channel;
+            res = -1;
+            return;
+        }
+        call $connected_devices.find_device_by_obj(obj) -> (dev);
+        if (dev == NULL) {
+            log error: "device %s not connected to the bus", 
+                SIM_object_name(obj);
+            res = -1;
+            return;
+        }
+        if ((dev->subscriptions & (1 << channel)) == 0) {
+            res = 0;
+            return;
+        }
+        log info, 3: "unregistering device %s from channel %d", 
+            SIM_object_name(obj), channel;
+        dev->subscriptions &= ~(1 << channel);
+        res = 0;
+    }
+
+    method reset {
+        try {
+            call $reset_bus;
+        } catch {
+            log error: "error during bus reset";
+        }
+    }
+}
+
+/*
+ * Reset is a three stage process. First the bus calculates the default id
+ * assignment and self-ids. Then the reset hap is signalled. Lastly the reset
+ * and self_id_transfer methods are called on all the connected devices. This
+ * sequence makes it possible for hap listeners to rewrite the id assignment
+ * and self-id list to create whatever topology they want.
+ */
+method reset_bus {
+        local int i;
+       /* Assign IDs */
+        local uint6 root;
+        call $self_ids.calculate_self_ids -> (root);
+
+        SIM_c_hap_occurred_always(hap_reset, $dev.obj, 0);
+
+        /* Call reset on all devices on the bus */
+        local uint32_array_t v;
+        v.len = VLEN($self_ids.v);
+        v.data = new uint32[v.len];
+        for (i = 0; i < v.len; i++) {
+            v.data[i] = $self_ids.v[i];
+        }
+        for (i = 0; i < VLEN($connected_devices.v); i++) {
+            $connected_devices.v[i].iface->reset(
+                $connected_devices.v[i].dev,
+                $connected_devices.v[i].id, root, v);
+        }
+        delete v.data;
+        call $self_ids.flush;
+}
+
+typedef bitfields 32 {
+    uint16 destinationID @ [31:16];
+    uint6 channel @ [13:8];
+    uint4 tCode @ [7:4];
+} packet_header_t;
+
+typedef layout "big-endian" {
+    packet_header_t h;
+} packet_t;
+
+method perform_transfer(conf_object_t *source, dbuffer_t *packet,
+                        int crc_calculated)
+    -> (firewire_ack_code_t ack) {
+    if (is_fw_packet_phy(packet) != 0) {
+        /* Broadcast PHY packets to all nodes */
+        call $transfer_to_all(source, packet, crc_calculated);
+        ack = Firewire_Ack_No_Ack;
+        return;
+    }
+    local uint4 tcode = fw_extract_tcode(packet);
+    switch (tcode) {
+    case Firewire_Write_Quadlet:
+    case Firewire_Write_Block:
+    case Firewire_Write_Response:
+    case Firewire_Read_Quadlet:
+    case Firewire_Read_Block:
+    case Firewire_Read_Quadlet_Response:
+    case Firewire_Read_Block_Response:
+    case Firewire_Lock:
+    case Firewire_Lock_Response:
+        call $transfer_async(source, packet, crc_calculated) -> (ack);
+        break;
+    case Firewire_Cycle_Start:
+        call $transfer_to_all(source, packet,
+                              crc_calculated);
+        ack = Firewire_Ack_No_Ack;
+        break;
+    case Firewire_Streaming:
+        call $transfer_streaming(source, packet, crc_calculated);
+        ack = Firewire_Ack_No_Ack;
+        break;
+    default:
+        log error: "unknown packet tCode 0x%x - dropping packet", tcode;
+        ack = Firewire_Ack_No_Ack;
+    }
+}
+
+method transfer_to_all(conf_object_t *source, dbuffer_t *packet,
+                       int crc_calculated) {
+    local int i;
+    for (i = 0; i < VLEN($connected_devices.v); i++) {
+        local firewire_ack_code_t ack;
+        /* Don't transfer to the source */
+        if (source == $connected_devices.v[i].dev) continue;
+
+        /*
+          Ignore the ACKs to avoid special casing broadcast transfers in all
+          devices.
+        */
+        ack = $connected_devices.v[i].iface->transfer(
+            $connected_devices.v[i].dev, packet, crc_calculated);
+    }
+}
+
+method transfer_async(conf_object_t *source, dbuffer_t *packet,
+                      int crc_calculated)
+    -> (firewire_ack_code_t ack) {
+    local uint16 destination = fw_extract_destination_id(packet);
+    local connected_device_t *dev;
+    log info, 3: "transfer asynchronous packet to 0x%x", destination;
+    ack = Firewire_Ack_No_Destination;
+    if ((destination & 0x3f) == 0x3f) {
+        /* Broadcasted */
+        call $transfer_to_all(source, packet, crc_calculated);
+        ack = Firewire_Ack_No_Ack;
+        return;
+    }
+    local int i;
+    ack = Firewire_Ack_No_Destination;
+    local bool got_reply = false;
+    for (i = 0; i < VLEN($connected_devices.v); i++) {
+        /* Skip messages not intended for the device */
+        if ((($connected_devices.v[i].id ^ destination)
+                & $connected_devices.v[i].id_mask) != 0)
+            continue;
+        local firewire_ack_code_t this_ack;
+        this_ack = $connected_devices.v[i].iface->transfer(
+            $connected_devices.v[i].dev, packet, crc_calculated);
+        if ((this_ack != Firewire_Ack_No_Ack) && got_reply)
+            log error: "more than one device ACKed async transfer";
+        if (!got_reply)
+            ack = this_ack;
+        if (this_ack != Firewire_Ack_No_Ack) {
+            got_reply = true;
+        }
+    }
+    if (ack == Firewire_Ack_No_Destination)
+        log info, 2: "no destination for packet with destination 0x%x", destination;
+}
+
+method transfer_streaming(conf_object_t *source, dbuffer_t *packet,
+                          int crc_calculated) {
+    local uint64 shifted_channel = (1 << fw_extract_channel(packet));
+    local int i;
+    for (i = 0; i < VLEN($connected_devices.v); i++) {
+        /* Don't transfer to the source */
+        if (source == $connected_devices.v[i].dev) continue;
+
+        if (($connected_devices.v[i].subscriptions & shifted_channel)
+            != 0) {
+            $connected_devices.v[i].iface->transfer(
+                $connected_devices.v[i].dev, packet, crc_calculated);
+        }
+    }
+}
+
+footer %{
+    typedef VECT(connected_device_t) connected_devices_t;
+    typedef VECT(uint32) self_ids_t;
+
+    static connected_device_t *find_root(conf_object_t *bus,
+                                         connected_devices_t *devs)
+    {
+        /* Find the root. A node with rhb or any node. */
+        connected_device_t *dev = NULL;
+        for (int i = 0; i < VLEN(*devs); i++) {
+            dev = &VGET(*devs, i);
+            if (dev->iface->get_rhb(dev->dev)) {
+                break;
+            }
+        }
+        return dev;
+    }
+
+    /*
+     * Build the tree and return the root
+     */
+    static connected_device_t *build_tree(conf_object_t *bus,
+                                          connected_devices_t *devs)
+    {
+        QUEUE(connected_device_t *) q = QNULL;
+        connected_device_t *root = find_root(bus, devs);
+        if (root == NULL) return NULL;
+
+        /* Breadth first traversal from root to assign node ids to the nodes */
+        root->visited = 1;
+        QADD(q, root);
+        while (!QEMPTY(q)) {
+            connected_device_t *dev = QREMOVE(q);
+            for (int i = 0; i < dev->port_count; i++) {
+                if (dev->ports[i].port_status == Ps_Unknown) {
+                    connected_device_t *other = dev->ports[i].other_device;
+                    ASSERT(other);
+                    dev->ports[i].port_status = Ps_Child;
+                    other->ports[dev->ports[i].other_port].port_status
+                        = Ps_Parent;
+                    other->visited = 1;
+                    QADD(q, other);
+                }
+            }
+        }
+        return root;
+    }
+
+    /*
+     * Add the self_id for node dev to self_ids
+     */
+    static void add_self_id(conf_object_t *bus, self_ids_t *self_ids,
+                            connected_device_t *dev)
+    {
+        uint32 pkt = dev->iface->get_self_id_template(dev->dev);
+        uint32 shifted_id = (dev->id & 0x3f) << 24;
+        pkt = pkt & 0x007fcf00;
+        pkt |= 0x80000000 | shifted_id;
+        for (int i = 0; i < 3; i++) {
+            pkt |= (dev->ports[i].port_status & 0x3) << (6 - (i * 2));
+        }
+        pkt |= (dev->port_count > 3) ? 1 : 0;
+        VADD(*self_ids, pkt);
+        if (dev->port_count <= 3) return;
+        /* Packet 2 */
+        pkt = 0x80900000 | shifted_id;
+        for (int i = 3; i < 11; i++) {
+            pkt |= (dev->ports[i].port_status & 0x3) << (16 - ((i - 3) * 2));
+        }
+        pkt |= (dev->port_count > 11) ? 1 : 0;
+        VADD(*self_ids, pkt);
+        /* Packet 3 */
+        if (dev->port_count <= 11) return;
+        pkt = 0x80a00000 | shifted_id;
+        for (int i = 11; i < 16; i++) {
+            pkt |= (dev->ports[i].port_status & 0x3) << (16 - ((i - 11) * 2));
+        }
+        VADD(*self_ids, pkt);
+    }
+
+    /*
+     * Do a post-order traversal of the nodes reachable from dev. Assign
+     * id and generate self_id packets for each node as it is visited.
+     */
+    static uint8 identify_tree_nodes(conf_object_t *bus,
+                                     self_ids_t *self_ids,
+                                     connected_device_t *dev, int next_id)
+    {
+        for (int i = 0; i < dev->port_count; i++) {
+            if (dev->ports[i].port_status == Ps_Child) {
+                next_id = identify_tree_nodes(bus, self_ids,
+                                              dev->ports[i].other_device,
+                                              next_id);
+            }
+        }
+        dev->id = (dev->id & ~0x3f) | next_id++;
+        add_self_id(bus, self_ids, dev);
+        return next_id;
+    }
+
+    /*
+     * Assign Physical IDs based on a post-order traversal. Left over nodes
+     * are given the left over IDs. Also create self_id packets for the nodes
+     */
+    static uint8 identify_nodes(conf_object_t *bus, void *void_self_ids,
+                                void *void_devs)
+    {
+        self_ids_t *self_ids = void_self_ids;
+        connected_devices_t *devs = void_devs;
+
+        connected_device_t *root = build_tree(bus, devs);
+        if (root == NULL) return 0xff;
+
+        int next_id = 0;
+        /* First give IDs to the  unvisited nodes */
+        for (int i = 0; i < VLEN(*devs); i++) {
+            connected_device_t *dev = &VGET(*devs, i);
+            if (!dev->visited) {
+                dev->id = (dev->id & ~0x3f) | next_id++;
+                add_self_id(bus, self_ids, dev);
+            }
+        }
+
+        /* Then to the nodes in the tree */
+        if (next_id != 0) {
+            SIM_LOG_INFO(2, bus, 0,
+                         "all nodes are not reachable from root due to "
+                         "incomplete topology");
+        }
+        identify_tree_nodes(bus, self_ids, root, next_id);
+        return root->id & 0x3f;
+    }
+%}

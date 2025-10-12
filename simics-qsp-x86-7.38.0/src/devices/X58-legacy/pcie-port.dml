@@ -1,0 +1,121 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device x58_pcie_port_legacy;
+parameter classname = "x58-pcie-port-legacy";
+
+parameter desc = "model of X58 PCIe root port";
+parameter documentation = "PCI Express Root Port unit in the "
+    + "Intel® X58 Express Chipset. - legacy variant, using old PCIe libraries";
+
+parameter limitations = "<ul>"
+    + "<li>The device is mostly dummy and does not support connecting PCIe devices.</li>"
+    + "</ul>";
+
+import "pci/pcie-to-pcie.dml";
+import "x58-pcie-header.dml";
+
+parameter forward_io = true;
+parameter forward_io32 = false;
+parameter forward_mem = true;
+parameter forward_prefetchable = true;
+parameter forward_prefetchable64 = true;
+
+bank pci_config {
+    register base_address_1 @ 0x10 is (no_base_address_32);
+    register base_address_2 @ 0x14 is (no_base_address_32);
+
+    register status {
+        field c { parameter hard_reset_value = 1; }
+    }
+    register capabilities_ptr { parameter hard_reset_value = 0x40; }
+    register interrupt_pin { parameter hard_reset_value = 0x1; }
+    register prefetchable_base {
+        field sf { parameter hard_reset_value = 0x1; }
+    }
+    register prefetchable_limit {
+        field sf { parameter hard_reset_value = 0x1; }
+    }
+
+    // Subsystem Capability
+    register scapid size 1 @ 0x40 is (read_only) "Subsystem Capability ID" {
+        parameter hard_reset_value = 0x0d;
+    }
+    register snxtptr size 1 @ 0x41 is (read_only) "Subsystem ID Next Pointer" {
+        parameter hard_reset_value = 0x60;
+    }
+    register dummy1 size 2 @ 0x42 is (read_zero) "Dummy1";
+
+    register svid size 2 @ 0x44 is (read_write) "Subsystem Vendor ID" {
+        parameter hard_reset_value = 0x8086;
+    }
+    register sid size 1 @ 0x46 is (read_write) "Subsystem Identity" {
+        parameter hard_reset_value = 0x0;
+    }
+    register dummy2 size 1 @ 0x47 is (read_zero) "Dummy2";
+
+    is defining_pci_msi_pvm_capability;
+    parameter msi_offset = 0x60;
+    parameter msi_next_ptr = 0x90;
+
+    is defining_pcie_capability_v2;
+    parameter exp_offset = 0x90;
+    parameter exp_next_ptr = 0xe0;
+    register exp_dev_cap {
+        field mpss { parameter hard_reset_value = 0x1; }
+        field etfs { parameter hard_reset_value = 0x1; }
+        field rber { parameter hard_reset_value = 0x1; }
+    }
+    register exp_link_cap {
+        field mls { parameter hard_reset_value = 0x1; }
+        field mlw { parameter hard_reset_value = 0x4; }
+        field aspms { parameter hard_reset_value = 0x3; }
+        field l0el { parameter hard_reset_value = 0x3; }
+        field l1el { parameter hard_reset_value = 0x2; }
+        field sder { parameter hard_reset_value = 0x1; }
+        field dlllar { parameter hard_reset_value = 0x1; }
+        field lbn { parameter hard_reset_value = 0x1; }
+
+        method hard_reset(){}
+    }
+    register exp_link_status {
+        field ls { parameter hard_reset_value = 0x1; }
+        field nlw { parameter hard_reset_value = 0x4; } 
+
+        method hard_reset(){}
+    }
+    register exp_slot_control {
+        field pcc { parameter hard_reset_value = 0x1; }
+        field pic { parameter hard_reset_value = 0x3; }
+        field aic { parameter hard_reset_value = 0x3; }
+    }
+    register exp_root_cap {
+        field csv { parameter hard_reset_value = 0x1; }
+    }
+    register exp_dev_cap2 {
+        field ctrs { parameter hard_reset_value = 0xe; }
+    }
+
+    is defining_pci_pm_capability;
+    parameter pm_offset = 0xe0;
+    parameter pm_next_ptr = 0x0;
+    register pm_capabilities {
+        field pmes { parameter hard_reset_value = 0x19; }
+    }
+    register pm_status_control {
+        field nsr { parameter hard_reset_value = 0x1; }
+    }
+
+}

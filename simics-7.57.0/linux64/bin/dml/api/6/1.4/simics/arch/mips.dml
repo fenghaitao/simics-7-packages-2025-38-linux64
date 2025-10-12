@@ -1,0 +1,32 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/arch/mips.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/base/memory-transaction.dml";
+import "simics/pywrap.dml";
+
+extern mips_memory_transaction_t *SIM_mips_mem_trans_from_generic(generic_transaction_t *mop);
+extern typedef struct { generic_transaction_t s; uint3 cache_coherency; } mips_memory_transaction_t;
+extern typedef struct { int dummy; } mips_interface_t;
+extern typedef struct { uint64 (*read_register)(conf_object_t *obj, uint32 thread_id, uint32 reg, uint32 sel); void (*write_register)(conf_object_t *obj, uint32 thread_id, uint64 value, uint32 reg, uint32 sel); } mips_coprocessor_interface_t;
+extern typedef struct { uint64 (*send_message)(conf_object_t *obj, uint32 thread_id, uint64 rt_value); void (*load_message)(conf_object_t *obj, uint32 thread_id, uint8 bucket); int (*wait)(conf_object_t *obj, uint32 thread_id, uint8 vector); void (*sync)(conf_object_t *obj, uint32 thread_id); } fmn_station_control_interface_t;
+extern typedef struct { uint64 (*send_message)(conf_object_t *obj, uint32 thread_id, uint64 rt_value); uint64 (*load_message)(conf_object_t *obj, uint32 thread_id, uint64 rt_value); int (*wait)(conf_object_t *obj, uint32 thread_id, uint64 rt_value); void (*sync)(conf_object_t *obj, uint32 thread_id); } fmn_station_control_v2_interface_t;
+extern typedef struct { int (*cache_instruction)(conf_object_t *self, conf_object_t *cpu, uint32 op, logical_address_t vaddr); } mips_cache_instruction_interface_t;
+extern typedef struct { void (*set_dtag_lo)(conf_object_t *obj, uint32 value); uint32 (*get_dtag_lo)(conf_object_t *obj); uint32 (*get_errctl)(conf_object_t *obj); void (*block_tc)(conf_object_t *obj); void (*gated_exception)(conf_object_t *obj); int (*current_tc_num)(conf_object_t *obj); void (*unblock_tc)(conf_object_t *obj, int tc_num); bool (*is_big_endian)(conf_object_t *obj); } mips_ite_interface_t;
+extern typedef struct { void (*cpu_pending_irqs)(conf_object_t *obj, uint32 cause); uint32 (*requested_ipl)(conf_object_t *obj); uint32 (*requested_offset)(conf_object_t *obj); uint32 (*requested_vect_num)(conf_object_t *obj); uint32 (*reg_set)(conf_object_t *obj); void (*handled)(conf_object_t *obj); } mips_eic_interface_t;

@@ -1,0 +1,62 @@
+/*
+  i82571EB-mac-tx.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+attribute context is (tcpip_context_attr);
+
+bank csr {
+    group tx_queue [i < NUM_TRANSMIT_QUEUES] {
+        is tx_desc_queue;
+        param BA = 0x3800 + i * 0x100;
+    }
+
+    register ait  @ 0x00458 "Adaptive IFS Throttle";
+
+
+    register tctl {
+        field en @ [1] "Transmit Enable" {
+            is write;
+            method write(uint64 value) {
+                if (value == 0 && this.val == 1) {
+                    this.val = 0;
+                    log info, 2: "disable MAC transceiver";
+                } else if (this.val == 0 && value == 1) {
+                    this.val = 1;
+                    log info, 2: "enable MAC transceiver";
+                    transmit();
+                }
+            }
+        }
+        field psp @ [3] "Pad Short Packets" {
+            param init_val = 1;
+        }
+        field ct @ [11:4] "Collision Threshold" {
+            param init_val = 0xf; // NOTE: real reset value is 0 but should be set to 15 in order to comply with the IEEE specification
+        }
+        field cold @ [21:12] "Collision Distance" {
+            param init_val = 0x3f; // NOTE: real reset value is 0
+        }
+        field swxoff @ [22] is (unimpl) "Software XOFF Transmission";
+        // reserved[23]
+        field rtlc @ [24]   is (unimpl) "Re-transmit on Late Collision";
+        field unortx @ [25] is (unimpl) "Underrun No Re-Transmit";
+        field txcscmt @ [27:26] is (unimpl) "Tx Descriptor Minimum Threshold";
+        field mulr @ [28] is (unimpl) "Multiple Request Support";
+        // reserved[31:29]
+    }
+
+    register ait is (unimpl);
+}

@@ -1,0 +1,165 @@
+/*
+  i82571EB-mac-rx.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+import "e1000-mac-rx.dml";
+
+param RA_CNT = 16;
+
+param MTA_CNT = 128;    // 128regs * 32bits = 4096 bits
+
+bank csr {
+    /* --------------------------------------------------------------
+       RECEIVE REGISTERS
+       -------------------------------------------------------------- */
+
+    register psrctl  @ 0x02170 "Packet Split Receive Control";
+
+    register radv   @ 0x0282c "Receive Interrupt Absolute Delay Timer";
+    register rsrpd  @ 0x02c00 "Receive Small Packet Detect";
+    register raid   @ 0x02c08 "Receive ACK Interrupt Delay";
+
+    group rx_queue [i < NUM_RECEIVE_QUEUES] {
+        is rx_desc_queue;
+        is ext_rx_desc_queue;
+        param BA = 0x2800 + i * 0x100;
+        param rdmts  = rctl.rdmts;
+        param dtyp   = rctl.dtyp;
+        param bsize  = rctl.bsize;
+        param bsex   = rctl.bsex;
+        param flxbuf = rctl.flxbuf;
+        param psr_sz = psrctl;
+    }
+
+    // This group defines the ral[0..15] and rah[0..15] registers, used to store receive MAC address
+    group ra [i <  (RA_CNT)] {
+        is rx_mac_register;
+        register low  @ 0x05400 + i * 8 "Receive Address Low";
+        register high @ 0x05404 + i * 8 "Receive Address High";
+    }
+
+    register mrqc    @ 0x05818 "Multiple Receive Queues Command";
+
+    event rx_delay is (intr_delay_evt) { param INTR = INTR_RXT0; }
+    event ack_delay is (intr_delay_evt) { param INTR = INTR_ACK; }
+
+    register rctl {
+        is rx_buffer_ctrl;
+        // reserved[0]
+        field en @ [1]     "Receiver Enable";
+        field sbp @ [2]    "Store Bad Packets";
+        field upe @ [3]    "Unicast Promiscuous Enabled";
+        field mpe @ [4]    "Multicast Promiscuous Enabled";
+        field lpe @ [5]    "Long Packet Reception Enabled";
+        field lbm @ [7:6]  is (unimpl) "Loopback Mode";
+        // rdmts and dtyp are defined in rx_buffer_ctrl
+        field mo @ [13:12] "Multicast Offset";
+        // reserved[14]
+        field bam @ [15]   "Broadcast Accept Mode";
+        // bsize defined in rx_buffer_ctrl
+        field vfe @ [18]   "VLAN Filter Enable";
+        field cfien @ [19] "Canonical Form Indicator Enable";
+        field cfi @ [20]   "Canonical Form Indicator Bit Value";
+        // reserved[21]
+        field dpf @ [22]   is (unimpl) "Discard Pause Frames";
+        field pmcf @ [23]  is (unimpl) "Pass MAC Control Frame";
+        // reserved[24]
+        // bsex[25] defined in rx_buffer_ctrl
+        field secrc @ [26] "Strip Ethernet CRC from incoming Packet";
+        // flxbuf[30:27] defined in rx_buffer_ctrl
+        // reserved[31]
+    }
+    register psrctl is (write_mask) {
+        param mask = 0x7F7F7F7F;
+        param init_val = 0x00040402;
+    }
+    register radv  is (unimpl);
+    register rsrpd is (write_mask) { param mask = 0x00000FFF; }
+    register raid  is (write_mask) { param mask = 0x0000FFFF; }
+    register rssir is (write_1_clears);
+    register rxcsum {
+        field pcss @ [7:0]  "Packet Checksum Start";
+        field ipofld @ [8]  "IP Checksum Off-load Enable";
+        field tuofld @ [9]  "TCP/UDP Checksum Off-load Enable";
+
+        /* PCSD is actually not present in i82571EB, but the generic Rx
+           code wants it. By defining it here, we can avoid having yet another
+           configuration parameter. */
+        field pcsd @ [13] "Packet Checksum Disable" {
+            param init_val = 0;
+        }
+        // reserved[31:10]
+    }
+
+    register rfctl {
+        field iscsi_dis @ [0]   "iSCSI Disable";
+        field iscsi_dwc @ [5:1] "iSCSI Dword Count";
+        field nfsw_dis @ [6]    "NFS Write Disable";
+        field nfsr_dis @ [7]    "NFS Read Disable";
+        field nfs_ver @ [9:8]   "NFS Version";
+        field ipv6_dis @ [10]   is (unimpl) "IPv6 Disable";
+        field ipv6xsum_dis @ [11] is (unimpl) "IPv6 Xsum Disable";
+        field ackdis @ [12]     "ACK Accelerate Disable";
+        field ackd_dis @ [13]   "ACK Data Disable";
+        field ipfrsp_dis @ [14] "IP Fragment Split Disable";
+        field exsten @ [15]     "Extended Status Enable";
+        // reserved[31:16]
+    }
+
+    register reta[i < RETA_CNT] {
+        /* cpu_idx is there only to avoid having yet another
+           configuration parameter for the RSS CPU selection. */
+        field cpu_idx  @ [7:5] "CPU index";
+        field qidx @ [4:0] "Queue Index";
+    }
+
+    register mrqc {
+        field mrqe @ [1:0] "Multiple Receive Queues Enable" {
+            is write;
+            method write(uint64 value) {
+                if (rctl.en.val == 1) {
+                    log spec_viol, 1:
+                    "can't modify %s's value when Receiver is enabled", name;
+                    return;
+                }
+                if (this.val != value && value > 1) {
+                    log spec_viol, 1: "value %d for %s is reserved, %s",
+                        value, name, "adjusted to 0b00";
+                    value = 0;
+                }
+                this.val = value;
+            }
+        }
+        field rssie @ [2] is (unimpl);
+        // reserved[15:3]
+        field rssfe @ [21:16] "RSS Field Enable";
+    }
+}
+
+template rx_buffer_ctrl {
+    field rdmts @ [9:8]
+        "Receive Descriptor Minimum Threshold Size";
+    field dtyp @ [11:10]   "Descriptor Type";
+    field bsize @ [17:16]  "Receive Buffer Size";
+    field bsex @ [25]      "Buffer Size Extension";
+    field flxbuf @ [30:27] "Flexible buffer Size";
+}
+
+template flow_ctl_register {
+    // reserved[2:0]
+    field rt @ [15:3] is (unimpl) "Receive Threshold Value";
+    // reserved[30:16]
+    field b31 @ [31] is (unimpl) "XON Enable";
+}

@@ -1,0 +1,133 @@
+/*
+  ahci-util.dml - Collection of common definition/help function for AHCI
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "sata-util.dml";
+
+extern void *malloc(int size);
+extern void free(void *ptr);
+
+// Interrupts bits
+constant ISR_CPDS = 31;
+constant ISR_TFES = 30;
+constant ISR_HBFS = 29;
+constant ISR_HBDS = 28;
+constant ISR_IFS  = 27;
+constant ISR_INFS = 26;
+constant ISR_OFS  = 24;
+constant ISR_IPMS = 23;
+constant ISR_PRCS = 22;
+constant ISR_DMPS = 7;
+constant ISR_PCS  = 6;
+constant ISR_DPS  = 5;
+constant ISR_UFS  = 4;
+constant ISR_SDBS = 3;
+constant ISR_DSS  = 2;
+constant ISR_PSS  = 1;
+constant ISR_DHRS = 0;
+
+/* FIS Lengths */
+constant FISLEN_REGISTER     = 0x14;
+constant FISLEN_SDB          = 0x8;
+constant FISLEN_DMA_ACTIVATE = 0x4;
+constant FISLEN_DMA_SETUP    = 0x1c;
+constant FISLEN_BIST         = 0xc;
+constant FISLEN_PIO_SETUP    = 0x14;
+
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint16 prdtl    @ [31:16]; /* Number of entries in PDR */
+        uint4  pmp      @ [15:12]; /* Port multiplier port */
+        uint1  reserved @ [11:11];
+        uint1  clear    @ [10:10]; /* Clear busy upon R_OK */
+        uint1  bist     @ [9:9]; /* sending a BIST FIS? */
+        uint1  reset    @ [8:8];
+        uint1  pref     @ [7:7]; /* Prefetchable */
+        uint1  write    @ [6:6]; /* Device write/read */
+        uint1  atapi    @ [5:5]; /* ATAPI command */
+        uint5  cfl      @ [4:0]; /* Length of command FIS */
+    } dw0;
+
+    uint32 prdbc; /* How many bytes have transferred */
+
+    bitfields 32 {
+        uint25 ctba     @ [31:7]; /* Physical address of command table */
+        uint7  reserved @ [6:0];
+    } dw2;
+
+    uint32 ctbau; /* Command table base, upper 32 bits */
+    uint32 reserved[4];
+} command_header_t;
+
+/* Physical Region Descriptor Table (PRDT) */
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint31 dba      @ [31:1]; /* Physical address of the data block */
+        uint1  reserved @ [0:0];
+    } dw0;
+
+    uint32 dbau; /* Upper 32-bits of the data block physical address */
+    uint32 dw2;  /* Reserved */
+
+    bitfields 32 {
+        uint1  int_on_comp @ [31:31]; /* Interrupt on Completion */
+        uint9  reserved    @ [30:22];
+        uint22 dbc         @ [21:00]; /* Data byte count */
+    } dw3;
+} phys_region_desc_t;
+
+template cap_dependent_read_only {
+    is read_only;
+
+    parameter cap_bit default undefined;
+    parameter value default undefined;
+
+    method read() -> (value) {
+        value = $cap_bit == 0 ? 0 : $value;
+    }
+}
+
+template cap_dependent_reserved {
+    parameter cap_bit default undefined;
+    parameter value default undefined;
+
+    method read() -> (value) {
+        value = $cap_bit == 1? $this : $value;
+    }
+
+    method write(value) {
+        if ($this != value) {
+            if ($cap_bit == 1)
+                call $operations(value);
+            else
+                log "spec_violation", 2: 
+                    "Write to read-only field %s (content=%d, value=%d)",
+                    $qname, $this, value;
+        }
+    }
+
+    method operations(uint32 written_value) default {
+        $this = written_value;
+    }
+
+    method soft_reset() {
+        // Fix to satisfy Coverity
+        if ($value != 0)
+            $this = $cap_bit == 1? 0 : $value;
+        else
+            $this = 0;
+    }
+}

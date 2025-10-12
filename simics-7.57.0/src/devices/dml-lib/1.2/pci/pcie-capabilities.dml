@@ -1,0 +1,3053 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "simics-api.dml";
+
+if ($dev.simics_api_version != "6") {
+    error "This library is deprecated, please use the new library dml-lib/pcie/*";
+}
+
+// template aliases
+import "pci/pcie-capabilities-v21.dml";
+import "pci/pcie-capabilities-v31.dml";
+
+// TODO(ah): drop this import when templates are no longer needed for
+// backwards compatibility
+import "pci/pcie-deprecated.dml";
+
+// TODO(ah): deprecated this template
+template defining_pcie_capability_v1 {
+    is defining_pcie_capability_root_ports_v1;
+}
+
+// TODO(ah): deprecated this template
+template defining_pcie_capability_v2 {
+    is defining_pcie_capability_root_ports_v2;
+}
+
+// TODO(ah): deprecated this template
+template defining_pcie_capability_v3 {
+    is defining_pcie_capability_root_ports_v3;
+}
+
+// PCI Express Capabilities
+template _defining_pcie_capability_devices_common {
+    parameter exp_offset   default undefined;
+    parameter exp_next_ptr default undefined;
+    parameter exp_version  default 1;
+
+    register exp_capability_header size 2 @ ($exp_offset + 0x0) {
+        parameter documentation = "PCI Express Capability List Register";
+    }
+    register exp_capabilities    size 2 @ ($exp_offset + 0x2) {
+        parameter documentation = "PCI Express Capabilities Register";
+    }
+    register exp_dev_cap         size 4 @ ($exp_offset + 0x4) {
+        parameter documentation = "Device Capabilities Register";
+    }
+    register exp_dev_control     size 2 @ ($exp_offset + 0x8) {
+        parameter documentation = "Device Control Register";
+    }
+    register exp_dev_status      size 2 @ ($exp_offset + 0xa) {
+        parameter documentation = "Device Status Register";
+    }
+
+    register exp_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter value = 0x10;
+        }
+        field next_ptr [15:8] is (read_only) "Next capability offset" {
+            parameter hard_reset_value = $exp_next_ptr;
+        }
+    }
+    register exp_capabilities {
+        field cv  [3:0]  is (read_only) "Capability Version" {
+            parameter hard_reset_value = $exp_version;
+        }
+        field dpt [7:4]  is (read_only) "Device/Port Type";
+        field si  [8:8]  is (read_only) "Slot Implemented";
+        field imn [13:9] is (read_only) "Interrupt Message Number";
+    }
+    register exp_dev_cap {
+        field mpss  [2:0]   is (read_only) "Max Payload_Size Supported";
+        field pfs   [4:3]   is (read_only) "Phantom Functions Supported";
+        field etfs  [5:5]   is (read_only) "Extended Tag Field Supported";
+        field el0al [8:6]   is (read_only) "Endpoint L0 Acceptable Latency";
+        field el1al [11:9]  is (read_only) "Endpoint L1 Acceptable Latency";
+        field rber  [15:15] is (read_only) "Role Based Error Reporting";
+        field csplv [25:18] is (read_only) "Captured Slot Power Limit Value";
+        field cspls [27:26] is (read_only) "Captured Slot Power Limit Scale";
+    }
+    register exp_dev_control {
+        field cere  [0:0]   is (read_write) "Correctable Error Reporting Enable";
+        field nfere [1:1]   is (read_write) "Non-Fatal Error Reporting Enable";
+        field fere  [2:2]   is (read_write) "Fatal Error Reporting Enable";
+        field urre  [3:3]   is (read_write) "Unsupported Request Reporting Enable";
+        field ero   [4:4]   is (read_write) "Enabled Relaxed Ordering";
+        field mps   [7:5]   is (read_write) "Max Payload Size";
+        field etfe  [8:8]   is (read_write) "Extended Tag Field Enable";
+        field pfe   [9:9]   is (read_write) "Phantom Functions Enable";
+        field appme [10:10] is (read_write) "Auxiliary Power PM Enable";
+        field ens   [11:11] is (read_write) "Enabled No Snoop";
+        field mrrs  [14:12] is (read_write) "Max Read Request Size";
+    }
+    register exp_dev_status {
+        field ced   [0:0] is (write_1_clears) "Correctable Error Detected";
+        field nfed  [1:1] is (write_1_clears) "Non-Fatal Error Detected";
+        field fed   [2:2] is (write_1_clears) "Fatal Error Detected";
+        field urd   [3:3] is (write_1_clears) "Unsupported Request Detected";
+        field auxpd [4:4] is (ignore_write) "AUX Power Detected";
+        field tp    [5:5] is (ignore_write) "Transactions Pending";
+    }
+}
+
+template _defining_pcie_capability_devices_2_v2 {
+    register exp_dev_cap2     size 4 @ ($exp_offset + 0x24) {
+        parameter documentation = "Device Capabilities 2 Register";
+    }
+    register exp_dev_control2 size 2 @ ($exp_offset + 0x28) {
+        parameter documentation = "Device control 2 Register";
+    }
+    register exp_dev_status2  size 2 @ ($exp_offset + 0x2a) {
+        parameter documentation = "Device status 2 Register";
+    }
+
+    register exp_dev_cap2 {
+        field ctrs     [3:0]   is (read_only) "Completion Timeout Ranges Supported";
+        field ctds     [4:4]   is (read_only) "Completion Timeout Disable Supported";
+    }
+    register exp_dev_control2 {
+        field ctv     [3:0]   is (read_write) "Completion Timeout Value";
+        field ctd     [4:4]   is (read_write) "Completion Timeout Disable";
+        field arife   [5:5]   is (read_write) "ARI Forwarding Enable";
+        field aore    [6:6]   is (read_write) "AtomicOp Requester Enable";
+        field aoeb    [7:7]   is (read_write) "AtomicOp Egress Blocking";
+        field idore   [8:8]   is (read_write) "IDO Request Enable";
+        field idoce   [9:9]   is (read_write) "IDO Completion Enable";
+        field ltrme   [10:10] is (read_write) "LTR Mechanism Enable";
+        field eetlppb [15:15] is (read_write) "End-End TLP Prefix Blocking";
+    }
+    register exp_dev_status2 is (read_only);
+}
+
+template defining_pcie_capability_devices_v1 {
+    is _defining_pcie_capability_devices_common;
+    register exp_dev_cap {
+        field abp   [12:12] is (read_only) "Attention Button Present";
+        field aip   [13:13] is (read_only) "Attention Indicator Present";
+        field pip   [14:14] is (read_only) "Power Indicator Present";
+    }
+}
+
+template defining_pcie_capability_devices_v2 {
+    is _defining_pcie_capability_devices_common;
+    is _defining_pcie_capability_devices_2_v2;
+    parameter exp_version = 0x2;
+    register exp_dev_cap {
+        field flrc [28:28] is (read_only) "Function Level Reset Capability";
+    }
+    register exp_dev_control {
+        // TODO(ah): field has different meaning depending on bridge or
+        // endpoints with FLR capability. Not sure how to model this.
+        // field bcre  [15:15] is (read_write) "Bridge Configuration Retry Enable";
+        field iflr [15:15] is (read_write) "Initiate Function Level Reset" {
+            // TODO(ah): for IFLR we should initiate FLR on write of 1b. This is
+            // generic functionality that we could implement in the dml-lib pci
+            // template library just like we provide MSI, INTx, DMA support
+        }
+    }
+}
+
+template defining_pcie_capability_devices_v21 {
+    is defining_pcie_capability_devices_v2;
+    register exp_dev_cap2 {
+        field arifs    [5:5]   is (read_only) "ARI Forwarding Supported";
+        field aors     [6:6]   is (read_only) "AtomicOp Routing Supported";
+        field aocs32   [7:7]   is (read_only) "32-bit AtomicOp Completer Supported";
+        field aocs64   [8:8]   is (read_only) "64-bit AtomicOp Completer Supported";
+        field cascs    [9:9]   is (read_only) "128-bit CAS Completer Supported";
+        field nroprprp [10:10] is (read_only) "No RO-enabled PR-PR Passing";
+        field ltrms    [11:11] is (read_only) "LTR Mechanism Supported";
+        field tphcs    [13:12] is (read_only) "TPH Completer Supported";
+        field effs     [20:20] is (read_only) "Extended Fmt Field Supported";
+        field eetlpps  [21:21] is (read_only) "End-End TLP Prefix Supported";
+        field meetlpp  [23:22] is (read_only) "Max End-End TLP Prefixes";
+    }
+}
+
+template defining_pcie_capability_devices_v3 {
+    is defining_pcie_capability_devices_v21;
+    register exp_dev_cap2 {
+        field obffs    [19:18] is (read_only) "OBFF Supported";
+    }
+    register exp_dev_control2 {
+        field obffe [14:13] is (read_write) "OBFF Enable";
+    }
+}
+
+template defining_pcie_capability_devices_v31 {
+    is defining_pcie_capability_devices_v3;
+    register exp_dev_cap2 {
+        field lnscls [15:14] is (read_only) "LN System CLS";
+        field frss   [31:31] is (read_only) "FRS Supported";
+    }
+}
+
+template defining_pcie_capability_devices_v4 {
+    is defining_pcie_capability_devices_v31;
+    register exp_dev_status {
+        field eprd  [6:6] is (write_1_clears) "Emergency Power Reduction Detected";
+    }
+    register exp_dev_cap2 {
+        field tcs    [16:16] is (read_only) "10-Bit Tag Completer Supported";
+        field trs    [17:17] is (read_only) "10-Bit Tag Requester Supported";
+        field eprs   [25:24] is (read_only) "Emergency Power Reduction Supported";
+        field eprir  [26:26] is (read_only) "Emergency Power Reduction Initialization Required";
+    }
+    register exp_dev_control2 {
+        field eprr [11:11] is (read_write) "Emergency Power Reduction Request";
+        field tre  [12:12] is (read_write) "10-Bit Tag Requester Enable";
+    }
+}
+
+template defining_pcie_capability_devices_v5 {
+    is defining_pcie_capability_devices_v4;
+    register exp_dev_cap {
+        field ecsc  [16:16] is (read_only) "ERR COR Subclass Capable";
+    }
+}
+
+template _defining_pcie_capability_links_common {
+    register exp_link_cap     size 4 @ ($exp_offset + 0xc) {
+       parameter documentation = "Link Capabilities Register";
+    }
+    register exp_link_control size 2 @ ($exp_offset + 0x10) {
+        parameter documentation = "Link Control Register";
+    }
+    register exp_link_status  size 2 @ ($exp_offset + 0x12) {
+        parameter documentation = "Link Status Register";
+    }
+
+    register exp_link_cap {
+        field mls   [3:0]   is (read_only) "Max Link Speed";
+        field mlw   [9:4]   is (read_only) "Max Link Width";
+        field aspms [11:10] is (read_only) "Active State Power Management Support";
+        field l0el  [14:12] is (read_only) "L0 Exit Latency";
+        field l1el  [17:15] is (read_only) "L1 Exit Latency";
+        field pn    [31:24] is (read_only) "Port Number";
+    }
+    register exp_link_control {
+        field aspmc [1:0]  is (read_write) "Active State Power Management (ASPM) Control";
+        field rcb   [3:3]  is (read_write) "Read Completion Boundary";
+        field ld    [4:4]  is (read_write) "Link Disable";
+        field rl    [5:5]  is (read_write) "Retrain Link";
+        field ccc   [6:6]  is (read_write) "Common Clock Configuration";
+        field es    [7:7]  is (read_write) "Extended Synch";
+    }
+    register exp_link_status {
+        field ls  [3:0]   is (read_only) "Current Link Speed";
+        field nlw [9:4]   is (read_only) "Negotiated Link Width";
+        field te  [10:10] is (read_only) "Training Error";
+        field lt  [11:11] is (read_only) "Link Training";
+        field scc [12:12] is (read_only) "Slot Clock Configuration";
+    }
+}
+
+template _defining_pcie_capability_links_2_common {
+    register exp_link_cap2     size 4 @ ($exp_offset + 0x2c) {
+        parameter documentation = "Link Capabilities 2 Register";
+    }
+    register exp_link_control2 size 2 @ ($exp_offset + 0x30) {
+        parameter documentation = "Link Control 2 Register";
+    }
+    register exp_link_status2  size 2 @ ($exp_offset + 0x32) {
+        parameter documentation = "Link Status 2 Register";
+    }
+
+    register exp_link_control2 {
+        field tls  [3:0]   is (read_write) "Target Link Speed";
+        field ec   [4:4]   is (read_write) "Enter Compliance";
+        field hasd [5:5]   is (read_write) "Hardware Autonomous Speed Disable";
+        field sd   [6:6]   is (ignore_write) "Selectable De-emphasis";
+        field tm   [9:7]   is (read_write) "Transmit Margin";
+        field emc  [10:10] is (read_write) "Enter Modified Compliance";
+        field csos [11:11] is (read_write) "Compliance SOS";
+    }
+    register exp_link_status2 {
+        field cdl [0:0] is (read_only) "Current De-emphasis Level";
+    }
+}
+
+template _defining_pcie_capability_links_v2 {
+    is _defining_pcie_capability_links_common;
+    register exp_link_cap {
+        field cpm    [18:18] is (read_only) "Clock Power Management";
+        field sder   [19:19] is (read_only) "Surprise Down Error Reporting Capable";
+        field dlllar [20:20] is (read_only) "Data Link Layer Link Active Reporting Capable";
+        field lbn    [21:21] is (read_only) "Link Bandwidth Notification Capability";
+    }
+    register exp_link_control {
+        field ecpm  [8:8]   is (read_write) "Enable Clock Power Management";
+        field hawd  [9:9]   is (read_write) "Hardware Autonomous Width Disable";
+        field lbmie [10:10] is (read_write) "Link Bandwidth Management Interrupt Enable";
+        field labie [11:11] is (read_write) "Link Autonomous Bandwidth Interrupt Enable";
+    }
+    register exp_link_status {
+        field dllla [13:13] is (read_only) "Data Link Layer Link Active";
+        field lbms  [14:14] is (write_1_clears) "Link Bandwidth Management Status";
+        field labs  [15:15] is (write_1_clears) "Link Autonomous Bandwidth Status";
+    }
+}
+
+template defining_pcie_capability_links_2_v2 {
+    is _defining_pcie_capability_links_2_common;
+
+    register exp_link_control2 {
+        field cd [12:12] is (read_write) "Compliance de-emphasis";
+    }
+}
+
+template defining_pcie_capability_links_2_v3 {
+    // NOTE: because of exp_link_control2 we cannot inherit from v2
+    is _defining_pcie_capability_links_2_common;
+
+    register exp_link_cap2 {
+        field slsv [7:1] is (read_only) "Supported Link Speeds Vector";
+        field cs   [8:8] is (read_only) "Crosslink Supported";
+    }
+    register exp_link_control2 {
+        field cd [15:12] is (read_write) "Compliance Preset/De-emphasis";
+    }
+    register exp_link_status2 {
+        field ec   [1:1] is (ignore_write) "Equalization 8.0 GT/s Complete";
+        field ep1s [2:2] is (ignore_write) "Equalization 8.0 GT/s Phase 1 Successful";
+        field ep2s [3:3] is (ignore_write) "Equalization 8.0 GT/s Phase 2 Successful";
+        field ep3s [4:4] is (ignore_write) "Equalization 8.0 GT/s Phase 3 Successful";
+        field ler  [5:5] is (write_1_clears) "Link Equalization Request 8.0 GT/s";
+    }
+}
+
+template defining_pcie_capability_links_2_v31 {
+    is defining_pcie_capability_links_2_v3;
+    register exp_link_cap2 {
+        field lskposgssv [15:9] is (read_only) "Lower SKP OS Generation Supported Speeds Vector";
+        field lskposrssv [22:16] is (read_only) "Lower SKP OS Reception Supported Speeds Vector";
+        field drss [31:31] is (read_only) "DRS Supported";
+    }
+    register exp_link_status2 {
+        field dcp [14:12] is (read_only) "Downstream Component Presence";
+        field drsmr [15:15] is (write_1_clears) "DRS Message Received";
+    }
+}
+
+template defining_pcie_capability_links_2_v4 {
+    is defining_pcie_capability_links_2_v31;
+    register exp_link_cap2 {
+        field rpds [23:23] is (read_only) "Retimer Presence Detect Supported";
+        field trpds [24:24] is (read_only) "Two Retimers Presence Detect Supported";
+    }
+    register exp_link_status2 {
+        field rpd [6:6] is (read_only) "Retimer Presence Detected";
+        field trpd [7:7] is (read_only) "Two Retimers Presence Detected";
+        field cr [9:8] is (read_only) "Crosslink Resolution";
+    }
+}
+
+template defining_pcie_capability_links_2_v5 {
+    is defining_pcie_capability_links_2_v4;
+}
+
+template defining_pcie_capability_links_v1 {
+    is defining_pcie_capability_devices_v1;
+    is _defining_pcie_capability_links_common;
+}
+
+template defining_pcie_capability_links_v2 {
+    is defining_pcie_capability_devices_v2;
+    is _defining_pcie_capability_links_v2;
+    is defining_pcie_capability_links_2_v2;
+}
+
+template defining_pcie_capability_links_v3 {
+    is defining_pcie_capability_devices_v3;
+    is _defining_pcie_capability_links_v2;
+    register exp_link_cap {
+        field aspmoc [22:22] is (read_only) "ASPM Optionality Compliance";
+    }
+    is defining_pcie_capability_links_2_v3;
+}
+
+template defining_pcie_capability_links_v31 {
+    is defining_pcie_capability_links_v3;
+    is defining_pcie_capability_devices_v31;
+    register exp_link_control {
+        field drssc [15:14] is (read_write) "DRS Signaling Control";
+    }
+}
+
+template defining_pcie_capability_links_v4 {
+    is defining_pcie_capability_links_v31;
+    is defining_pcie_capability_devices_v4;
+}
+
+template defining_pcie_capability_links_v5 {
+    is defining_pcie_capability_links_v4;
+    is defining_pcie_capability_devices_v5;
+}
+
+template _defining_pcie_capability_slots_common {
+    register exp_slot_cap     size 4 @ ($exp_offset + 0x14) {
+        parameter documentation = "Slot Capabilities Register";
+    }
+    register exp_slot_control size 2 @ ($exp_offset + 0x18) {
+        parameter documentation = "Slot Control Register";
+    }
+    register exp_slot_status  size 2 @ ($exp_offset + 0x1a) {
+        parameter documentation = "Slot Status Register";
+    }
+
+    register exp_slot_cap {
+        field abp   [0:0]   is (read_only) "Attention Button Present";
+        field pcp   [1:1]   is (read_only) "Power Controller Present";
+        field mrlsp [2:2]   is (read_only) "MRL Sensor Present";
+        field aip   [3:3]   is (read_only) "Attention Indicator Present";
+        field pip   [4:4]   is (read_only) "Power Indicator Present";
+        field hps   [5:5]   is (read_only) "Hot-Plug Surprise";
+        field hpc   [6:6]   is (read_only) "Hot Plug Capable";
+        field splv  [14:7]  is (read_only) "Slot Power Limit Value";
+        field spls  [16:15] is (read_only) "Slot Power Limit Scale";
+        field psn   [31:19] is (read_only) "Physical Slot Number";
+    }
+    register exp_slot_control {
+        field abpe   [0:0]   is (read_write) "Attention Button Pressed Enable";
+        field pfde   [1:1]   is (read_write) "Power Fault Detected Enable";
+        field mrlsce [2:2]   is (read_write) "MRL Sensor Changed Enable";
+        field pdce   [3:3]   is (read_write) "Present Detect Changed Enable";
+        field ccie   [4:4]   is (read_write) "Command Completed Interrupt Enable";
+        field hpie   [5:5]   is (read_write) "Hot-Plug Interrupt Enable";
+        field aic    [7:6]   is (read_write) "Attention Indicator Control";
+        field pic    [9:8]   is (read_write) "Power Indicator Control";
+        field pcc    [10:10] is (read_write) "Power Controller Control";
+    }
+    register exp_slot_status {
+        field abp   [0:0]  is (write_1_clears) "Attention Button Pressed";
+        field pfd   [1:1]  is (write_1_clears) "Power Fault Detected";
+        field mrlsc [2:2]  is (write_1_clears) "MRL Sensor Changed";
+        field pdc   [3:3]  is (write_1_clears) "Presence Detect Changed";
+        field cc    [4:4]  is (write_1_clears) "Command Completed";
+        field mrlss [5:5]  is (ignore_write) "MRL Sensor State";
+        field pds   [6:6]  is (ignore_write) "Presence Detect State";
+    }
+}
+
+template _defining_pcie_capability_slots_v2 {
+    is _defining_pcie_capability_slots_common;
+    register exp_slot_cap {
+        field eip  [17:17] is (read_only) "Electromechanical Interlock Present";
+        field nccs [18:18] is (read_only) "No Command Completed Support";
+    }
+    register exp_slot_control {
+        field eic    [11:11] is (read_write) "Electromechanical Interlock Control";
+        field dllsce [12:12] is (read_write) "Data Link Layer State Changed Enable";
+    }
+    register exp_slot_status {
+        field eis   [7:7] is (ignore_write) "Electromechanical Interlock Status";
+        field dllsc [8:8] is (write_1_clears) "Data Link Layer State Changed";
+    }
+}
+
+template _defining_pcie_capability_slots_v3 {
+    is _defining_pcie_capability_slots_v2;
+}
+
+template defining_pcie_capability_slots_2_v2 {
+    register exp_slot_cap2     size 4 @ ($exp_offset + 0x34) {
+        parameter documentation = "Slot Capabilities 2 Register";
+    }
+    register exp_slot_control2 size 2 @ ($exp_offset + 0x38) {
+        parameter documentation = "Slot Control 2 Register";
+    }
+    register exp_slot_status2  size 2 @ ($exp_offset + 0x3a) {
+        parameter documentation = "Slot Status 2 Register";
+    }
+
+    register exp_slot_cap2 is (read_only);
+    register exp_slot_control2 is (read_only);
+    register exp_slot_status2 is (read_only);
+}
+
+template defining_pcie_capability_slots_2_v3 {
+    is defining_pcie_capability_slots_2_v2;
+}
+
+template defining_pcie_capability_slots_2_v4 {
+    is defining_pcie_capability_slots_2_v3;
+}
+
+template defining_pcie_capability_slots_2_v5 {
+    is defining_pcie_capability_slots_2_v4;
+    register exp_slot_cap2 {
+        field ibpdds [0:0] is (read_only) "In-Band PD Disable Supported";
+    }
+}
+
+template defining_pcie_capability_slots_v1 {
+    is defining_pcie_capability_links_v1;
+    is _defining_pcie_capability_slots_common;
+}
+
+template defining_pcie_capability_slots_v2 {
+    is defining_pcie_capability_links_v2;
+    is _defining_pcie_capability_slots_v2;
+    is defining_pcie_capability_slots_2_v2;
+}
+
+template defining_pcie_capability_slots_v3 {
+    is defining_pcie_capability_links_v3;
+    is _defining_pcie_capability_slots_v3;
+    is defining_pcie_capability_slots_2_v3;
+}
+
+template defining_pcie_capability_slots_v31 {
+    is defining_pcie_capability_slots_v3;
+    register exp_slot_control {
+        field aspld [13:13] is (read_write) "Auto Slot Power Limit Disable";
+    }
+    is defining_pcie_capability_links_v31;
+}
+
+template defining_pcie_capability_slots_v4 {
+    is defining_pcie_capability_slots_v31;
+    is defining_pcie_capability_links_v4;
+}
+
+template defining_pcie_capability_slots_v5 {
+    is defining_pcie_capability_slots_v4;
+    register exp_slot_control {
+        field ibpdd [14:14] is (read_write) "In-Band PD Disable";
+    }
+    is defining_pcie_capability_links_v5;
+}
+
+template _defining_pcie_capability_root_ports_common {
+    register exp_root_control size 2 @ ($exp_offset + 0x1c) {
+        parameter documentation = "Root Control Register";
+    }
+    register exp_root_status  size 4 @ ($exp_offset + 0x20) {
+        parameter documentation = "Root Status";
+    }
+
+    register exp_root_control {
+        field secee  [0:0] is (read_write) "System Error on Correctable Error Enable";
+        field senfee [1:1] is (read_write) "System Error on Non-Fatal Error Enable";
+        field sefee  [2:2] is (read_write) "System Error on Fatal Error Enable";
+        field pmeie  [3:3] is (read_write) "PME Interrupt Enable";
+    }
+    register exp_root_status {
+        field pmerid [15:0]  is (ignore_write) "PME Requester ID";
+        field pmes   [16:16] is (write_1_clears) "PME Status";
+        field pmep   [17:17] is (ignore_write) "PME Pending";
+    }
+}
+
+template _defining_pcie_capability_root_ports_v2 {
+    is _defining_pcie_capability_root_ports_common;
+
+    register exp_root_cap size 2 @ ($exp_offset + 0x1e) "Root Capabilities";
+
+    register exp_root_control {
+        field crssve [4:4] is (read_write) "CRS Software Visibility Enable";
+    }
+    register exp_root_cap {
+        field csv [0:0]  is (read_only) "CRS Software Visibility";
+    }
+}
+
+template _defining_pcie_capability_root_ports_v3 {
+    is _defining_pcie_capability_root_ports_v2;
+}
+template _defining_pcie_capability_root_ports_v4 {
+    is _defining_pcie_capability_root_ports_v3;
+}
+template _defining_pcie_capability_root_ports_v5 {
+    is _defining_pcie_capability_root_ports_v4;
+}
+
+template defining_pcie_capability_root_ports_v1 {
+    is defining_pcie_capability_slots_v1;
+    is _defining_pcie_capability_root_ports_common;
+}
+
+template defining_pcie_capability_root_ports_v2 {
+    is defining_pcie_capability_slots_v2;
+    is _defining_pcie_capability_root_ports_v2;
+}
+
+template defining_pcie_capability_root_ports_v3 {
+    is defining_pcie_capability_slots_v3;
+    is _defining_pcie_capability_root_ports_v3;
+}
+
+template defining_pcie_capability_root_ports_v4 {
+    is defining_pcie_capability_slots_v4;
+    is _defining_pcie_capability_root_ports_v4;
+}
+
+template defining_pcie_capability_root_ports_v5 {
+    is defining_pcie_capability_slots_v5;
+    is _defining_pcie_capability_root_ports_v5;
+}
+
+//////////////////////// Extended Capabilities ////////////////////////////////
+
+// Advanced Error Reporting (AER) Capability
+template _defining_pcie_aer_capability_common {
+    parameter aer_offset   default undefined;
+    parameter aer_next_ptr default undefined;
+
+    register aer_capability_header  size 4 @ ($aer_offset + 0x0) {
+        parameter documentation = "Capability Header";
+    }
+    register aer_unc_error_status   size 4 @ ($aer_offset + 0x4) {
+        parameter documentation = "Uncorrectable Error Status";
+    }
+    register aer_unc_error_mask     size 4 @ ($aer_offset + 0x8) {
+        parameter documentation = "Uncorrectable Error Mask";
+    }
+    register aer_unc_error_severity size 4 @ ($aer_offset + 0xc) {
+        parameter documentation = "Uncorrectable Error Severity";
+    }
+    register aer_corr_error_status  size 4 @ ($aer_offset + 0x10) {
+        parameter documentation = "Correctable Error Status";
+    }
+    register aer_corr_error_mask    size 4 @ ($aer_offset + 0x14) {
+        parameter documentation = "Correctable Error Mask";
+    }
+    register aer_cap_control        size 4 @ ($aer_offset + 0x18) {
+        parameter documentation = "Advanced Error Capabilities and Control";
+    }
+    register aer_header_log_1       size 4 @ ($aer_offset + 0x1c) {
+        parameter documentation = "Header Log (1st DW)";
+    }
+    register aer_header_log_2       size 4 @ ($aer_offset + 0x20) {
+        parameter documentation = "Header Log (2nd DW)";
+    }
+    register aer_header_log_3       size 4 @ ($aer_offset + 0x24) {
+        parameter documentation = "Header Log (3rd DW)";
+    }
+    register aer_header_log_4       size 4 @ ($aer_offset + 0x28) {
+        parameter documentation = "Header Log (4th DW)";
+    }
+    register aer_root_error_cmd     size 4 @ ($aer_offset + 0x2c) {
+        parameter documentation = "Root Error Command";
+    }
+    register aer_root_error_status  size 4 @ ($aer_offset + 0x30) {
+        parameter documentation = "Root Error Status";
+    }
+    register aer_error_source_id    size 4 @ ($aer_offset + 0x34) {
+        parameter documentation = "Error Source Identification";
+    }
+
+    register aer_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter value = 0x1;
+        }
+        field version  [19:16] is (constant) "Capability Version";
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $aer_next_ptr;
+        }
+    }
+    register aer_unc_error_status is (sticky) {
+        field dlpes [4:4]   is (write_1_clears) "Data Link Protocol Error Status";
+        field ptlps [12:12] is (write_1_clears) "Poisoned TLP Status";
+        field fcpes [13:13] is (write_1_clears) "Flow Control Protocol Error Status";
+        field cts   [14:14] is (write_1_clears) "Completion Time-out Status";
+        field cas   [15:15] is (write_1_clears) "Completer Abort Status";
+        field ucs   [16:16] is (write_1_clears) "Unexpected Completion Status";
+        field ros   [17:17] is (write_1_clears) "Receiver Overflow Status";
+        field mtlps [18:18] is (write_1_clears) "Malformed TLP Status";
+        field ees   [19:19] is (write_1_clears) "ECRC Error Status";
+        field ures  [20:20] is (write_1_clears) "Unsupported Request Error Status";
+    }
+    register aer_unc_error_mask is (sticky) {
+        field dlpem [4:4]   is (read_write) "Data Link Protocol Error Mask";
+        field ptlpm [12:12] is (read_write) "Poisoned TLP Mask";
+        field fcpem [13:13] is (read_write) "Flow Control Protocol Error Mask";
+        field ctm   [14:14] is (read_write) "Completion Time-out Mask";
+        field cam   [15:15] is (read_write) "Completer Abort Mask";
+        field ucm   [16:16] is (read_write) "Unexpected Completion Mask";
+        field rom   [17:17] is (read_write) "Receiver Overflow Mask";
+        field mtlpm [18:18] is (read_write) "Malformed TLP Mask";
+        field eem   [19:19] is (read_write) "ECRC Error Mask";
+        field urem  [20:20] is (read_write) "Unsupported Request Error Mask";
+    }
+    register aer_unc_error_severity is (sticky) {
+        field dlpes [4:4]   is (read_write) "Data Link Protocol Error Severity" {
+            parameter hard_reset_value = 0x1;
+        }
+        field ptlps [12:12] is (read_write) "Poisoned TLP Severity";
+        field fcpes [13:13] is (read_write) "Flow Control Protocol Error Severity" {
+            parameter hard_reset_value = 0x1;
+        }
+        field cts   [14:14] is (read_write) "Completion Time-out Severity";
+        field cas   [15:15] is (read_write) "Completer Abort Severity";
+        field ucs   [16:16] is (read_write) "Unexpected Completion Severity";
+        field ros   [17:17] is (read_write) "Receiver Overflow Severity" {
+            parameter hard_reset_value = 0x1;
+        }
+        field mtlps [18:18] is (read_write) "Malformed TLP Severity" {
+            parameter hard_reset_value = 0x1;
+        }
+        field ees   [19:19] is (read_write) "ECRC Error Severity";
+        field ures  [20:20] is (read_write) "Unsupported Request Error Severity";
+    }
+    register aer_corr_error_status is (sticky)  {
+        field res    [0:0]   is (write_1_clears) "Receiver Error Status";
+        field btlps  [6:6]   is (write_1_clears) "Bad TLP Status";
+        field bdllps [7:7]   is (write_1_clears) "Bad DLLP Status";
+        field rnrs   [8:8]   is (write_1_clears) "REPLAY_NUM Rollover Status";
+        field rtts   [12:12] is (write_1_clears) "Replay Timer Timeout Status";
+    }
+    register aer_corr_error_mask is (sticky) {
+        field rem    [0:0]   is (read_write) "Receiver Error Mask";
+        field btlpm  [6:6]   is (read_write) "Bad TLP Mask";
+        field bdllpm [7:7]   is (read_write) "Bad DLLP Mask";
+        field rnrm   [8:8]   is (read_write) "REPLAY_NUM Rollover Mask";
+        field rttm   [12:12] is (read_write) "Replay Timer Timeout Mask";
+    }
+    register aer_cap_control is (sticky) {
+        field fep    [4:0] is (ignore_write) "First Error Pointer";
+        field ecrcgc [5:5] is (ignore_write) "ECRC Generation Capable";
+        field ecrcge [6:6] is (read_write) "ECRC Generation Enable";
+        field ecrccc [7:7] is (ignore_write) "ECRC Check Capable";
+        field ecrcce [8:8] is (read_write) "ECRC Check Enable";
+    }
+    register aer_header_log_1 is (read_only, sticky);
+    register aer_header_log_2 is (read_only, sticky);
+    register aer_header_log_3 is (read_only, sticky);
+    register aer_header_log_4 is (read_only, sticky);
+    register aer_root_error_cmd {
+        field cere  [0:0] is (read_write) "Correctable Error Reporting Enable";
+        field nfere [1:1] is (read_write) "Non-Fatal Error Reporting Enable";
+        field fere  [2:2] is (read_write) "Fatal Error Reporting Enable";
+    }
+    register aer_root_error_status {
+        field ecr   [0:0]   is (write_1_clears, sticky) "ERR_COR Received";
+        field mecr  [1:1]   is (write_1_clears, sticky) "Multiple ERR_COR Received";
+        field efnr  [2:2]   is (write_1_clears, sticky) "ERR_FATAL/NONFATAL Received";
+        field mefnr [3:3]   is (write_1_clears, sticky) "Multiple ERR_FATAL/NONFATAL Received";
+        field fuf   [4:4]   is (write_1_clears, sticky) "First Uncorrectable Fatal";
+        field nfemr [5:5]   is (write_1_clears, sticky) "Non-Fatal Error Messages Received";
+        field femr  [6:6]   is (write_1_clears, sticky) "Fatal Error Messages Received";
+        field aeimn [31:27] is (ignore_write) "Advanced Error Interrupt Message Number";
+    }
+    register aer_error_source_id is (sticky) {
+        field ecsi [15:0]  is (read_only) "ERR_COR Source Identification";
+        field efsi [31:16] is (read_only) "ERR_FATAL/NONFATAL Source Identification";
+    }
+}
+
+template defining_pcie_aer_capability_v1 {
+    is _defining_pcie_aer_capability_common;
+
+    register aer_unc_error_status {
+        field tes   [0:0]   is (write_1_clears) "Training Error Status";
+    }
+    register aer_unc_error_mask is (sticky) {
+        field tem   [0:0]   is (read_write) "Training Error Mask";
+    }
+    register aer_unc_error_severity is (sticky) {
+        field tes   [0:0]   is (read_write) "Training Error Severity";
+    }
+    register aer_capability_header {
+        field version {
+            parameter value = 0x1;
+        }
+    }
+}
+
+template defining_pcie_aer_capability_v2 {
+    is _defining_pcie_aer_capability_common;
+
+    register aer_capability_header  {
+        field version {
+            parameter value = 0x2;
+        }
+    }
+    register aer_unc_error_status is (sticky) {
+        field sdes  [5:5]   is (write_1_clears) "Surprise Down Error Status";
+        field acsvs [21:21] is (write_1_clears) "ACS Violation Status";
+    }
+    register aer_unc_error_mask {
+        field sdes  [5:5]   is (read_write) "Surprise Down Error Mask";
+        field acsvm [21:21] is (read_write) "ACS Violation Mask";
+    }
+    register aer_unc_error_severity {
+        field sdes  [5:5]   is (read_write) "Surprise Down Error Severity" {
+            parameter hard_reset_value = 0x1;
+        }
+        field acsvs [21:21] is (read_write) "ACS Violation Severity";
+    }
+    register aer_corr_error_status {
+        field anfes [13:13] is (write_1_clears) "Advisory Non-Fatal Error Status";
+    }
+    register aer_corr_error_mask {
+        field anfem [13:13] is (read_write) "Advisory Non-Fatal Error Mask" {
+            parameter hard_reset_value = 1;
+        }
+    }
+    register aer_cap_control is (sticky) {
+        field mhrc [9:9]   is (ignore_write)  "Multiple Header Recording Capable";
+        field mhre [10:10] is (read_write) "Multiple Header Recording Enable";
+        field tplp [11:11] is (ignore_write)  "TLP Prefix Log Present";
+    }
+}
+
+template defining_pcie_aer_capability_v21 {
+    is defining_pcie_aer_capability_v2;
+
+    register aer_unc_error_status is (sticky) {
+        field uies  [22:22] is (write_1_clears) "Uncorrectable Internal Error Status";
+        field mbts  [23:23] is (write_1_clears) "MC Blocked TLP Status";
+        field aoebs [24:24] is (write_1_clears) "AtomicOp Egress Blocked Status";
+        field tpbes [25:25] is (write_1_clears) "TLP Prefix Blocked Error Status";
+    }
+    register aer_unc_error_mask {
+        field uiem  [22:22] is (read_write) "Uncorrectable Internal Error Mask";
+        field mbtm  [23:23] is (write_1_clears) "MC Blocked TLP Mask";
+        field aoebm [24:24] is (write_1_clears) "AtomicOp Egress Blocked Mask";
+        field tpbem [25:25] is (write_1_clears) "TLP Prefix Blocked Error Mask";
+    }
+    register aer_unc_error_severity {
+        field uies  [22:22] is (read_write) "Uncorrectable Internal Error Severity";
+        field mbts  [23:23] is (write_1_clears) "MC Blocked TLP Severity";
+        field aoebs [24:24] is (write_1_clears) "AtomicOp Egress Blocked Severity";
+        field tpbes [25:25] is (write_1_clears) "TLP Prefix Blocked Error Severity";
+    }
+    register aer_corr_error_status {
+        field cies  [14:14] is (write_1_clears) "Corrected Internal Error Status";
+        field hlos  [15:15] is (write_1_clears) "Header Log Overflow Status";
+    }
+    register aer_corr_error_mask {
+        field ciem  [14:14] is (read_write) "Corrected Internal Error Mask";
+        field hlom  [15:15] is (read_write) "Header Log Overflow Mask";
+    }
+}
+
+template defining_pcie_aer_capability_v3 {
+    is defining_pcie_aer_capability_v21;
+}
+
+template defining_pcie_aer_capability_v4 {
+    is defining_pcie_aer_capability_v3;
+}
+
+template defining_pcie_aer_capability_v5 {
+    is defining_pcie_aer_capability_v4;
+}
+
+// Virtual Channel (VC) Capability
+template _defining_pcie_vc_capability_common {
+    parameter vc_offset     default undefined;
+    parameter vc_next_ptr   default undefined;
+    parameter vc_id         default 2;  // must be set to 9 if mfvc is used
+    parameter vc_cnt        default 0;
+    // NOTE: it is allowed to leave the remaining parameters undefined
+    // NOTE: if offset is 0, no table is allocated
+    parameter vc_vat_offset default undefined;
+    parameter vc_pat_offset default undefined;
+    // NOTE: the arbitration select values given by parameter here are supposed
+    // to be the max supported value that can be written to the arbitration
+    // select field of the control register. The capability register must still
+    // be correctly implemented.
+    parameter vc_as         default undefined;
+    parameter vc_pas        default undefined;
+
+    register vc_capability_header   size 4 @ ($vc_offset + 0x0) {
+        parameter documentation = "Virtual Channel Enhanced Capability Header";
+    }
+    register vc_port_vc_capability1 size 4 @ ($vc_offset + 0x4) {
+        parameter documentation = "Port VC Capability Register 1";
+    }
+    register vc_port_vc_capability2 size 4 @ ($vc_offset + 0x8) {
+        parameter documentation = "Port VC Capability Register 2";
+    }
+    register vc_port_vc_control     size 2 @ ($vc_offset + 0xc) {
+        parameter documentation = "Port VC Control Register";
+    }
+    register vc_port_vc_status      size 2 @ ($vc_offset + 0xe) {
+        parameter documentation = "Port VC Status Register";
+    }
+    register vc_resource_capability[$vc_cnt + 1] size 4 @ ($vc_offset + $i * 0xc + 0x10) {
+        parameter documentation = "VC Resource Capability Register";
+    }
+    register vc_resource_control[$vc_cnt + 1]    size 4 @ ($vc_offset + $i * 0xc + 0x14) {
+        parameter documentation = "VC Resource Control Register";
+    }
+    register vc_resource_status[$vc_cnt + 1]     size 2 @ ($vc_offset + $i * 0xc + 0x1a) {
+        parameter documentation = "VC Resource Status Register";
+    }
+    if (defined $vc_vat_offset && $vc_vat_offset != 0) {
+        if (defined $vc_as && ($vc_as == 0 || $vc_as > 3)) {
+            error "Max Arbitration Select must be a value in the range: 1-3";
+        }
+        register vc_arbitration_table[1 << ($vc_as + 1)] size 4 @
+            ($vc_offset + $vc_vat_offset * 0x10 + $i * 0x4) {
+            parameter documentation = "Virtual Channel Arbitration Table";
+        }
+    }
+    if (defined $vc_pat_offset && $vc_pat_offset != 0) {
+        if (defined $vc_pas && ($vc_pas == 0 || $vc_pas > 5)) {
+            error "Max Port Arbitration Select must be a value in the range: 1-5";
+        }
+        register vc_port_arbitration_table[1 << ($vc_pas > 0x3 ? ($vc_pas - 1) : $vc_pas)]
+            size 4 @ ($vc_offset + $vc_pat_offset * 0x10 + $i * 0x4) {
+            parameter documentation = "Port Arbitration Table";
+        }
+    }
+
+    register vc_capability_header {
+        field id       [15:0]  is (read_only) "Capability ID" {
+            parameter hard_reset_value = $vc_id;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $vc_next_ptr;
+        }
+    }
+    register vc_port_vc_capability1 {
+        field evcc   [2:0]   is (read_only) "Extended VC Count";
+        field lpevcc [6:4]   is (read_only) "Low Priority Extended VC Count";
+        field rc     [9:8]   is (read_only) "Reference Clocks";
+        field pates  [11:10] is (read_only) "Port Arbitration Table-Entry Size";
+    }
+    register vc_port_vc_capability2 {
+        field vcac  [7:0]   is (read_only) "VC Arbitration Capability";
+        field vcato [31:24] is (read_only) "VC Arbitration Table Offset" {
+            parameter value = $vc_vat_offset;
+        }
+    }
+    register vc_port_vc_control {
+        field lvcat [0:0] is (read_write) "Load VC Arbitration Table";
+        field vcas  [3:1] is (read_write) "VC Arbitration Select";
+    }
+    register vc_port_vc_status {
+        field vcats [0:0] is (read_only) "VC Arbitration Table Status";
+    }
+    register vc_resource_capability[$vc_cnt + 1] {
+        field pac  [7:0]   is (read_only) "Port Arbitration Capability";
+        field rst  [15:15] is (read_only) "Reject Snoop Transactions";
+        field mts  [22:16] is (read_only) "Maximum Time Slots";
+        field pato [31:24] is (read_only) "Port Arbitration Table Offset" {
+            parameter value = $vc_pat_offset;
+        }
+    }
+    register vc_resource_control[$vc_cnt + 1] {
+        field tcvcm [7:0]   is (read_write) "TC/VC Map";
+        field lpat  [16:16] is (read_write) "Load Port Arbitration Table";
+        field pas   [19:17] is (read_write) "Port Arbitration Select";
+        field vcid  [26:24] is (read_write) "VC ID";
+        field vce   [31:31] is (read_write) "VC Enable";
+    }
+    register vc_resource_status[$vc_cnt + 1] {
+        field pats [0:0] is (read_only) "Port Arbitration Table Status";
+        field vcnp [1:1] is (read_only) "VC Negotiation Pending";
+    }
+    if (defined $vc_vat_offset && $vc_vat_offset != 0) {
+        register vc_arbitration_table[1 << ($vc_as + 1)] is (read_write);
+    }
+    if (defined $vc_pat_offset && $vc_pat_offset != 0) {
+        register vc_port_arbitration_table[1 << ($vc_pas > 0x3 ? ($vc_pas - 1) : $vc_pas)] {
+            is read_write;
+        }
+    }
+}
+
+template defining_pcie_vc_capability_v1 {
+    is _defining_pcie_vc_capability_common;
+
+    register vc_resource_capability[$vc_cnt + 1] {
+        field aps [14:14] is (read_only) "Advanced Packet Switching";
+    }
+}
+
+template defining_pcie_vc_capability_v2 {
+    is _defining_pcie_vc_capability_common;
+}
+
+template defining_pcie_vc_capability_v3 {
+    is defining_pcie_vc_capability_v2;
+}
+
+template defining_pcie_vc_capability_v4 {
+    is defining_pcie_vc_capability_v3;
+}
+
+template defining_pcie_vc_capability_v5 {
+    is defining_pcie_vc_capability_v4;
+}
+
+// Device Serial Number (DSN) Capability
+template defining_pcie_dsn_capability_v1 {
+    parameter dsn_offset   default undefined;
+    parameter dsn_next_ptr default undefined;
+
+    register dsn_capability_header  size 4 @ ($dsn_offset + 0x0) {
+        parameter documentation = "Device Serial Number Extended Capability Header";
+    }
+    register dsn_serial_number_low  size 4 @ ($dsn_offset + 0x4) {
+        parameter documentation = "Serial Number (low)";
+    }
+    register dsn_serial_number_high size 4 @ ($dsn_offset + 0x8) {
+        parameter documentation = "Serial Number (high)";
+    }
+
+    register dsn_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter value = 0x3;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $dsn_next_ptr;
+        }
+    }
+    register dsn_serial_number_low  is (read_only_write_same_ignore);
+    register dsn_serial_number_high is (read_only_write_same_ignore);
+}
+
+template defining_pcie_dsn_capability_v2 {
+    is defining_pcie_dsn_capability_v1;
+}
+
+template defining_pcie_dsn_capability_v3 {
+    is defining_pcie_dsn_capability_v2;
+}
+
+template defining_pcie_dsn_capability_v4 {
+    is defining_pcie_dsn_capability_v3;
+}
+
+template defining_pcie_dsn_capability_v5 {
+    is defining_pcie_dsn_capability_v4;
+}
+
+// Root Complex Link Declaration (RCLD) Capability
+template _defining_pcie_rcld_capability_common {
+    parameter rcld_offset   default undefined;
+    parameter rcld_next_ptr default undefined;
+    parameter rcld_link_num default 1;
+
+    register rcld_capability_header size 4 @ ($rcld_offset + 0x0) {
+        parameter documentation = "Root Complex Link Declaration Extended Capability Header";
+    }
+    register rcld_element_self_desc size 4 @ ($rcld_offset + 0x4) {
+        parameter documentation = "Element Self Description";
+    }
+    register rcld_link_desc[$rcld_link_num] size 4 @ ($rcld_offset + $i * 0x10 + 0xc) {
+        parameter documentation = "Link Description";
+    }
+    register rcld_link_addr[$rcld_link_num] size 8 @ ($rcld_offset + $i * 0x10 + 0x14) {
+        parameter documentation = "Link Address";
+    }
+
+    register rcld_capability_header {
+        field id       [15:0]  is (constant) "PCI Express Extended Capability ID" {
+            parameter value = 0x5;
+        }
+        field version  [19:16] is (constant) "Capability version" {
+            parameter value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next capability offset" {
+            parameter hard_reset_value = $rcld_next_ptr;
+        }
+    }
+    register rcld_element_self_desc {
+        field et  [3:0]   is (read_only) "Element Type";
+        field nle [15:8]  is (read_only) "Number of Link Entries" {
+            parameter value = $rcld_link_num;
+        }
+        field cid [23:16] is (read_only) "Component ID";
+        field pn  [31:24] is (read_only) "Port Number";
+    }
+    register rcld_link_desc[$rcld_link_num] {
+        field lv     [0:0]   is (read_only) "Link Valid";
+        field lt     [1:1]   is (read_only) "Link Type";
+        field arcrbh [2:2]   is (read_only) "Associate RCRB Header";
+        field tcid   [23:16] is (read_only) "Target Component ID";
+        field tpn    [31:24] is (read_only) "Target Port Number";
+    }
+    register rcld_link_addr[$rcld_link_num] is (read_only);
+}
+
+template defining_pcie_rcld_capability_v2 {
+    is _defining_pcie_rcld_capability_common;
+}
+
+template defining_pcie_rcld_capability_v3 {
+    is defining_pcie_rcld_capability_v2;
+}
+
+template defining_pcie_rcld_capability_v4 {
+    is defining_pcie_rcld_capability_v3;
+}
+
+template defining_pcie_rcld_capability_v5 {
+    is defining_pcie_rcld_capability_v4;
+}
+
+// Root Complex Internal Link Control (RCILC) Capability
+template _defining_pcie_rcilc_capability_common {
+    parameter rcilc_offset   default undefined;
+    parameter rcilc_next_ptr default undefined;
+
+    register rcilc_capability_header size 4 @ ($rcilc_offset + 0x0) {
+        parameter documentation = "Root Complex Internal Link Control Extended Capability Header";
+    }
+    register rcilc_capabilities      size 4 @ ($rcilc_offset + 0x4) {
+        parameter documentation = "Root Complex Link Capabilities Register";
+    }
+    register rcilc_control           size 2 @ ($rcilc_offset + 0x8) {
+        parameter documentation = "Root Complex Link Control Register";
+    }
+    register rcilc_status            size 2 @ ($rcilc_offset + 0xa) {
+        parameter documentation = "Root Complex Link Status Register";
+    }
+
+    register rcilc_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter value = 0x6;
+        }
+        field version  [19:16] is (constant) "Capability version" {
+            parameter value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next capability offset" {
+            parameter hard_reset_value = $rcilc_next_ptr;
+        }
+    }
+    register rcilc_capabilities {
+        field mlw   [9:4]   is (read_only) "Maximum Link Width";
+        field aspms [11:10] is (read_only) "Active State Power Management Support";
+        field l0el  [14:12] is (read_only) "L0s Exit Latency";
+        field l1el  [17:15] is (read_only) "L1 Exit Latency";
+    }
+    register rcilc_control {
+        field aspmc [1:0] is (read_write) "Active State Power Management Control";
+        field es    [7:7] is (read_write) "Extended Sync";
+    }
+    register rcilc_status {
+        field cls [ 3: 0] is (ignore_write) "Current Link Speed";
+        field nlw [ 9: 4] is (ignore_write) "Negotiated Link Width";
+    }
+}
+
+template defining_pcie_rcilc_capability_v2 {
+    is _defining_pcie_rcilc_capability_common;
+
+    register rcilc_capabilities {
+        field sls [3:0] is (read_only) "Supported Link Speeds";
+    }
+}
+
+template defining_pcie_rcilc_capability_v3 {
+    is _defining_pcie_rcilc_capability_common;
+
+    register rcilc_capabilities {
+        field mls  [3:0]   is (read_only) "Max Link Speed";
+        field slsv [24:18] is (read_only) "Supported Link Speeds Vector";
+    }
+}
+
+template defining_pcie_rcilc_capability_v4 {
+    is defining_pcie_rcilc_capability_v3;
+}
+
+template defining_pcie_rcilc_capability_v5 {
+    is defining_pcie_rcilc_capability_v4;
+}
+
+// Device Power Budgeting (DPB) Capability
+template defining_pcie_dpb_capability_v1 {
+    parameter dpb_offset   default undefined;
+    parameter dpb_next_ptr default undefined;
+
+    register dpb_capability_header size 4 @ ($dpb_offset + 0x0) {
+        parameter documentation = "Power Budgeting Enhanced Capability Header";
+    }
+    register dpb_data_select       size 1 @ ($dpb_offset + 0x4) {
+        parameter documentation = "Data Select Register";
+    }
+    register dpb_data              size 4 @ ($dpb_offset + 0x8) {
+        parameter documentation = "Data Register";
+    }
+    register dpb_capability        size 1 @ ($dpb_offset + 0xc) {
+        parameter documentation = "Power Budget Capability Register";
+    }
+
+    register dpb_capability_header {
+        field id       [15: 0] is (constant) "Capability ID" {
+            parameter value = 0x4;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $dpb_next_ptr;
+        }
+    }
+    register dpb_data_select is (read_write);
+    register dpb_data {
+        field bp   [7:0]   is (read_only) "Base Power";
+        field ds   [9:8]   is (read_only) "Data Scale";
+        field pmss [12:10] is (read_only) "PM Sub State";
+        field pms  [14:13] is (read_only) "PM State";
+        field t    [17:15] is (read_only) "Type";
+        field pr   [20:18] is (read_only) "Power Rail";
+    }
+    register dpb_capability {
+        field sa [0:0] is (read_only) "System Allocated";
+    }
+}
+
+template defining_pcie_dpb_capability_v2 {
+    is defining_pcie_dpb_capability_v1;
+}
+
+template defining_pcie_dpb_capability_v3 {
+    is defining_pcie_dpb_capability_v2;
+}
+
+template defining_pcie_dpb_capability_v4 {
+    is defining_pcie_dpb_capability_v3;
+}
+
+template defining_pcie_dpb_capability_v5 {
+    is defining_pcie_dpb_capability_v4;
+}
+
+
+// Access Control Services (ACS) Capability
+template defining_pcie_acs_capability_v2 {
+    parameter acs_offset   default undefined;
+    parameter acs_next_ptr default undefined;
+
+    register acs_capability_header size 4 @ ($acs_offset + 0x0) {
+        parameter documentation = "ACS Extended Capability Header";
+    }
+    register acs_capability        size 2 @ ($acs_offset + 0x4) {
+        parameter documentation = "ACS Capability Register";
+    }
+    register acs_control           size 2 @ ($acs_offset + 0x6) {
+        parameter documentation = "ACS Control Register";
+    }
+    register acs_egress_control    size 4 @ ($acs_offset + 0x8) {
+        parameter documentation = "Egress Control Vector";
+    }
+
+    register acs_capability_header {
+        field id       [15: 0] is (constant) "Capability ID" {
+            parameter hard_reset_value = 0xd;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $acs_next_ptr;
+        }
+    }
+    register acs_capability {
+        field v [0:0]  is (read_only) "ACS Source Validation (V)";
+        field b [1:1]  is (read_only) "ACS Translation Blocking (B)";
+        field r [2:2]  is (read_only) "ACS P2P Request Redirect (R)";
+        field c [3:3]  is (read_only) "ACS P2P Completion Redirect (C)";
+        field u [4:4]  is (read_only) "ACS Upstream Forwarding (U)";
+        field e [5:5]  is (read_only) "ACS P2P Egress Control (E)";
+        field t [6:6]  is (read_only) "ACS Direct Translated P2P (T)";
+        field s [15:8] is (read_only) "Egress Control Vector Size (S)";
+    }
+    register acs_control {
+        field v [0:0] is (read_only) "ACS Source Validation Enable (V)";
+        field b [1:1] is (read_only) "ACS Translation Blocking Enable (B)";
+        field r [2:2] is (read_only) "ACS P2P Request Redirect Enable (R)";
+        field c [3:3] is (read_only) "ACS P2P Completion Redirect Enable (C)";
+        field u [4:4] is (read_only) "ACS Upstream Forwarding Enable (U)";
+        field e [5:5] is (read_only) "ACS P2P Egress Control Enable (E)";
+        field t [6:6] is (read_only) "ACS Direct Translated P2P Enable (T)";
+    }
+    register acs_egress_control is (read_write);
+}
+
+template defining_pcie_acs_capability_v3 {
+    is defining_pcie_acs_capability_v2;
+}
+
+template defining_pcie_acs_capability_v4 {
+    is defining_pcie_acs_capability_v3;
+}
+
+template defining_pcie_acs_capability_v5 {
+    is defining_pcie_acs_capability_v4;
+}
+
+
+// Root Complex Event Collector Endpoint Association (RCECEA) Capability
+template _defining_pcie_rcecea_capability_common {
+    parameter rcecea_offset   default undefined;
+    parameter rcecea_next_ptr default undefined;
+
+    register rcecea_capability_header size 4 @ ($rcecea_offset + 0x0) {
+        parameter documentation = "RCECEA Capability Header";
+    }
+    register rcecea_bitmap            size 4 @ ($rcecea_offset + 0x4) {
+        parameter documentation = "Association Bitmap for Root Complex Integrated Devices";
+    }
+
+    register rcecea_capability_header {
+        field id       [15: 0] is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x7;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $rcecea_next_ptr;
+        }
+    }
+    register rcecea_bitmap is (read_only);
+}
+
+template defining_pcie_rcecea_capability_v2 {
+    is _defining_pcie_rcecea_capability_common;
+}
+
+template defining_pcie_rcecea_capability_v3 {
+    is defining_pcie_rcecea_capability_v2;
+}
+
+template defining_pcie_rcecea_capability_v4 {
+    is defining_pcie_rcecea_capability_v3;
+}
+
+template defining_pcie_rcecea_capability_v5 {
+    is defining_pcie_rcecea_capability_v4;
+}
+
+// Multi-Function Virtual Channel (MFVC) Capability
+template _defining_pcie_mfvc_capability_common {
+    parameter mfvc_offset     default undefined;
+    parameter mfvc_next_ptr   default undefined;
+    parameter mfvc_cnt        default 0;
+    // NOTE: it is allowed to leave the remaining parameters undefined
+    // NOTE: if offset is 0, no table is allocated
+    parameter mfvc_vat_offset default undefined;
+    parameter mfvc_fat_offset default undefined;
+    // NOTE: the arbitration select values given by parameter here are supposed
+    // to be the max supported value that can be written to the arbitration
+    // select field of the control register. The capability register must still
+    // be correctly implemented.
+    parameter mfvc_as         default undefined;
+    parameter mfvc_fas        default undefined;
+
+    register mfvc_capability_header   size 4 @ ($mfvc_offset + 0x0) {
+        parameter documentation = "MFVC Enhanced Capability Header";
+    }
+    register mfvc_port_vc_capability1 size 4 @ ($mfvc_offset + 0x4) {
+        parameter documentation = "Port VC Capability Register 1";
+    }
+    register mfvc_port_vc_capability2 size 4 @ ($mfvc_offset + 0x8) {
+        parameter documentation = "Port VC Capability Register 2";
+    }
+    register mfvc_port_vc_control     size 2 @ ($mfvc_offset + 0xc) {
+        parameter documentation = "Port VC Control Register";
+    }
+    register mfvc_port_vc_status      size 2 @ ($mfvc_offset + 0xe) {
+        parameter documentation = "Port VC Status Register";
+    }
+    register mfvc_resource_capability[$mfvc_cnt + 1] size 4 @ ($mfvc_offset + $i * 0xc + 0x10) {
+        parameter documentation = "VC Resource Capability Register";
+    }
+    register mfvc_resource_control[$mfvc_cnt + 1]    size 4 @ ($mfvc_offset + $i * 0xc + 0x14) {
+        parameter documentation = "VC Resource Control Register";
+    }
+    register mfvc_resource_status[$mfvc_cnt + 1]     size 2 @ ($mfvc_offset + $i * 0xc + 0x1a) {
+        parameter documentation = "VC Resource Status Register";
+    }
+    if (defined $mfvc_vat_offset && $mfvc_vat_offset != 0) {
+        if (defined $mfvc_as && ($mfvc_as == 0 || $mfvc_as > 3)) {
+            error "Max Arbitration Select must be a value in the range: 1-3";
+        }
+        register mfvc_arbitration_table[1 << ($mfvc_as + 1)] size 4 @
+            ($mfvc_offset + $mfvc_vat_offset * 0x10 + $i * 0x4) {
+            parameter documentation = "Virtual Channel Arbitration Table";
+        }
+    }
+    if (defined $mfvc_fat_offset && $mfvc_fat_offset != 0) {
+        if (defined $mfvc_fas && ($mfvc_fas == 0 || $mfvc_fas > 5)) {
+            error "Max Port Arbitration Select must be a value in the range: 1-5";
+        }
+        register mfvc_port_arbitration_table[1 << ($mfvc_fas > 0x3 ? ($mfvc_fas - 1) : $mfvc_fas)]
+            size 4 @ ($mfvc_offset + $mfvc_fat_offset * 0x10 + $i * 0x4) {
+            parameter documentation = "Function Arbitration Table";
+        }
+    }
+
+    register mfvc_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter value = 0x8;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $mfvc_next_ptr;
+        }
+    }
+    register mfvc_port_vc_capability1 {
+        field evcc   [2:0]   is (read_only) "Extended VC count";
+        field lpevcc [6:4]   is (read_only) "Low Priority Extended VC Count";
+        field rc     [9:8]   is (read_only) "Reference Clocks";
+        field fates  [11:10] is (read_only) "Function Arbitration Table-Entry Size";
+    }
+    register mfvc_port_vc_capability2 {
+        field vcac  [7:0]   is (read_only) "VC Arbitration Capability";
+        field vcato [31:24] is (read_only) "VC Arbitration Table Offset" {
+            parameter value = $mfvc_vat_offset;
+        }
+    }
+    register mfvc_port_vc_control {
+        field lvcat [0:0] is (read_write) "Load VC Arbitration Table";
+        field vcas  [3:1] is (read_write) "VC Arbitration Select";
+    }
+    register mfvc_port_vc_status {
+        field vcats [0:0] is (read_only) "VC Arbitration Table Status";
+    }
+    register mfvc_resource_capability[$mfvc_cnt + 1] {
+        field fac  [7:0]   is (read_only) "Function Arbitration Capability";
+        field mts  [22:16] is (read_only) "Maximum Time Slots";
+        field fato [31:24] is (read_only) "Function Arbitration Table Offset" {
+            parameter value = $mfvc_fat_offset;
+        }
+    }
+    register mfvc_resource_control[$mfvc_cnt + 1] {
+        field tcvcm [7:0]   is (read_write) "TC/VC Map";
+        field lfat  [16:16] is (read_write) "Load Function Arbitration Table";
+        field fas   [19:17] is (read_write) "Function Arbitration Select";
+        field vcid  [26:24] is (read_write) "VC ID";
+        field vce   [31:31] is (read_write) "VC Enable";
+    }
+    register mfvc_resource_status[$mfvc_cnt + 1] {
+        field fats [0:0] is (read_only) "Function Arbitration Table Status";
+        field vcnp [1:1] is (read_only) "VC Negotiation Pending";
+    }
+    if (defined $mfvc_vat_offset && $mfvc_vat_offset != 0) {
+        register mfvc_arbitration_table[1 << ($mfvc_as + 1)] is (read_write);
+    }
+    if (defined $mfvc_fat_offset && $mfvc_fat_offset != 0) {
+        register mfvc_port_arbitration_table[1 << ($mfvc_fas > 0x3 ? ($mfvc_fas - 1) : $mfvc_fas)] {
+            is read_write;
+        }
+    }
+}
+
+template defining_pcie_mfvc_capability_v2 {
+    is _defining_pcie_mfvc_capability_common;
+}
+
+template defining_pcie_mfvc_capability_v3 {
+    is defining_pcie_mfvc_capability_v2;
+}
+
+template defining_pcie_mfvc_capability_v4 {
+    is defining_pcie_mfvc_capability_v3;
+}
+
+template defining_pcie_mfvc_capability_v5 {
+    is defining_pcie_mfvc_capability_v4;
+}
+
+// Vendor-Specific Extended Capability (VSEC)
+template _defining_pcie_vsec_capability_common {
+    parameter vsec_offset   default undefined;
+    parameter vsec_next_ptr default undefined;
+
+    register vsec_capability_header size 4 @ ($vsec_offset + 0x0) {
+        parameter documentation = "Vendor-Specific Extended Capability Header";
+    }
+    register vsec_header            size 4 @ ($vsec_offset + 0x4) {
+        parameter documentation = "Vendor-Specific Header";
+    }
+
+    register vsec_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0xb;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $vsec_next_ptr;
+        }
+    }
+    register vsec_header {
+        field vsecid [15:0]  is (read_only) "VSEC ID";
+        field vsecr  [19:16] is (read_only) "VSEC Rev";
+        field vsecl  [31:20] is (read_only) "VSEC Length";
+    }
+}
+
+template defining_pcie_vsec_capability_v2 {
+    is _defining_pcie_vsec_capability_common;
+}
+
+template defining_pcie_vsec_capability_v3 {
+    is defining_pcie_vsec_capability_v2;
+}
+
+template defining_pcie_vsec_capability_v4 {
+    is defining_pcie_vsec_capability_v3;
+}
+
+template defining_pcie_vsec_capability_v5 {
+    is defining_pcie_vsec_capability_v4;
+}
+
+// RCRB Header (RCRB) Capability
+template _defining_pcie_rcrb_capability_common {
+    parameter rcrb_offset   default undefined;
+    parameter rcrb_next_ptr default undefined;
+
+    register rcrb_capability_header size 4 @ ($rcrb_offset + 0x0) {
+        parameter documentation = "Vendor-Specific Extended Capability Header";
+    }
+    register rcrb_vendor_id         size 2 @ ($rcrb_offset + 0x4) {
+        parameter documentation = "Vendor ID";
+    }
+    register rcrb_device_id         size 2 @ ($rcrb_offset + 0x6) {
+        parameter documentation = "Device ID";
+    }
+    register rcrb_capabilities      size 4 @ ($rcrb_offset + 0x8) {
+        parameter documentation = "RCRB Capabilities";
+    }
+    register rcrb_control           size 4 @ ($rcrb_offset + 0xc) {
+        parameter documentation = "RCRB Control";
+    }
+
+    register rcrb_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0xa;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $rcrb_next_ptr;
+        }
+    }
+    register rcrb_vendor_id is (read_only);
+    register rcrb_device_id is (read_only);
+    register rcrb_capabilities {
+        field crssv [0:0] is (read_only) "CRS Software Visibility";
+    }
+    register rcrb_control {
+        field crssve [0:0] is (read_only) "CRS Software Visibility Enable";
+    }
+}
+
+template defining_pcie_rcrb_capability_v2 {
+    is _defining_pcie_rcrb_capability_common;
+}
+
+template defining_pcie_rcrb_capability_v3 {
+    is defining_pcie_rcrb_capability_v2;
+}
+
+template defining_pcie_rcrb_capability_v4 {
+    is defining_pcie_rcrb_capability_v3;
+}
+
+template defining_pcie_rcrb_capability_v5 {
+    is defining_pcie_rcrb_capability_v4;
+}
+
+// Multicast (MC) Capability
+template defining_pcie_mc_capability_v21 {
+    parameter mc_offset   default undefined;
+    parameter mc_next_ptr default undefined;
+
+    register mc_capability_header size 4 @ ($mc_offset + 0x0) {
+        parameter documentation = "Vendor-Specific Extended Capability Header";
+    }
+    register mc_capability        size 2 @ ($mc_offset + 0x4) {
+        parameter documentation = "Multicast Capability Register";
+    }
+    register mc_control           size 2 @ ($mc_offset + 0x6) {
+        parameter documentation = "Multicast Control Register";
+    }
+    register mc_bar               size 8 @ ($mc_offset + 0x8) {
+        parameter documentation = "Multicast Base Address Register";
+    }
+    register mc_receive           size 8 @ ($mc_offset + 0x10) {
+        parameter documentation = "Multicast Receive Register";
+    }
+    register mc_block_all         size 8 @ ($mc_offset + 0x18) {
+        parameter documentation = "Multicast Block All Register";
+    }
+    register mc_block_untrans     size 8 @ ($mc_offset + 0x20) {
+        parameter documentation = "Multicast Block Untranslated Register";
+    }
+    register mc_overlay           size 8 @ ($mc_offset + 0x28) {
+        parameter documentation = "Multicast Overlay BAR Register";
+    }
+
+    register mc_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x12;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $mc_next_ptr;
+        }
+    }
+    register mc_capability {
+        field mmg  [5:0]   is (ignore_write) "Multicast Max Group";
+        field mrws [13:8]  is (ignore_write) "Multicast Required Window Size";
+        field mers [15:15] is (ignore_write) "MC_ECRC_Regeneration_Supported";
+    }
+    register mc_control {
+        field nmg [5:0]   is (read_write) "Number of Multicast Groups";
+        field me  [15:15] is (read_write) "Multicast Enable";
+    }
+    register mc_bar {
+        field mip [5:0]   is (read_write) "Multicast Index Position";
+        field mba [63:12] is (read_write) "Multicast Base Address";
+    }
+    register mc_receive is (read_write);
+    register mc_block_all is (read_write);
+    register mc_block_untrans is (read_write);
+    register mc_overlay {
+        field mos   [5:0]   is (read_write) "Multicast Overlay Size";
+        field mobar [63: 6] is (read_write) "Multicast Overlay BAR";
+    }
+}
+
+template defining_pcie_mc_capability_v3 {
+    is defining_pcie_mc_capability_v21;
+}
+
+template defining_pcie_mc_capability_v4 {
+    is defining_pcie_mc_capability_v3;
+}
+
+template defining_pcie_mc_capability_v5 {
+    is defining_pcie_mc_capability_v4;
+}
+
+// Resizable BAR (RBAR) Capability
+template defining_pcie_rbar_capability_v21 {
+    parameter rbar_offset   default undefined;
+    parameter rbar_next_ptr default undefined;
+    parameter rbar_bar_num  default 1;
+    // NOTE: it is expected that model provides hard_reset_value of rbar_control.id
+
+    register rbar_capability_header size 4 @ ($rbar_offset) {
+        parameter documentation = "Resizable BAR Extended Capability Header";
+    }
+    register rbar_capability[$rbar_bar_num] size 4 @ ($rbar_offset + $i * 0x8 + 0x4) {
+        parameter documentation = "Resizable BAR Capability Register";
+    }
+    register rbar_control[$rbar_bar_num] size 2 @ ($rbar_offset + $i * 0x8 + 0x8) {
+        parameter documentation = "Resizable BAR Control Register";
+    }
+
+    register rbar_capability_header {
+        field id       [15:0]  is (constant)  "Capability ID" {
+            parameter hard_reset_value = 0x15;
+        }
+        field version  [19:16] is (constant)  "Capability Version" {
+            parameter hard_reset_value = 1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $rbar_next_ptr;
+        }
+    }
+    register rbar_control[$rbar_bar_num] {
+        field id  [2:0]  is (ignore_write) "BAR Index" {
+            // NOTE: it is expected that model provides hard_reset_value
+            method hard_reset() {
+                default();
+                local bool found=false;
+                foreach name in ($bank.base_address_registers) {
+                    foreach reg in ($mapped_registers) {
+                        if (reg.name == name && reg._resizable) {
+                            if (reg.offset == 0x10 + 4 * $this) {
+                                found = true;
+                            }
+                        }
+                    }
+                }
+                if (!found) {
+                    log error, 1, PCI_config: "hard_reset_value of %s.%s not"
+                        + " initialized correctly or BARs not configured"
+                        + " properly.", $reg.name, $name;
+                            
+                }
+            }
+        }
+        field num [7:5]  is (ignore_write) "Number of Resizable BARs" {
+            parameter hard_reset_value = $rbar_bar_num;
+        }
+        field sz  [12:8] is (read_write)   "BAR Size";
+    }
+}
+
+template resizable_bar {
+    parameter _resizable = true;
+    method pci_bar_size_bits() -> (int bits) {
+        bits = $size_bits;
+        local uint32 i;
+        for (i = 0; i < $bank.rbar_control[0].num; ++i) {
+            if ($offset == 0x10 + 4 * $bank.rbar_control[i].id) {
+                bits = 20 + $bank.rbar_control[i].sz;
+                log info, 4, PCI_config: "Resizable BAR detected, configured"
+                    + " number of bits: %d", bits;
+                break;
+            }
+        }
+    }
+}
+
+template defining_pcie_rbar_capability_v3 {
+    is defining_pcie_rbar_capability_v21;
+}
+
+template defining_pcie_rbar_capability_v4 {
+    is defining_pcie_rbar_capability_v3;
+}
+
+template defining_pcie_rbar_capability_v5 {
+    is defining_pcie_rbar_capability_v4;
+}
+
+// Alternate Routing ID (ARI) Capability
+template defining_pcie_ari_capability_v21 {
+    parameter ari_offset   default undefined;
+    parameter ari_next_ptr default undefined;
+
+    register ari_capability_header size 4 @ ($ari_offset + 0x0) {
+        parameter documentation = "ARI Extended Capability Header Register";
+    }
+    register ari_capability        size 2 @ ($ari_offset + 0x4) {
+        parameter documentation = "ARI Capability Register";
+    }
+    register ari_control           size 2 @ ($ari_offset + 0x6) {
+        parameter documentation = "ARI Control Register";
+    }
+
+    register ari_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0xe;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $ari_next_ptr;
+        }
+    }
+    register ari_capability {
+        field m   [0:0]  is (ignore_write) "MFVC Function Groups Capability (M)";
+        field a   [1:1]  is (ignore_write) "ACS Function Groups Capability (A)";
+        field nfn [15:8] is (ignore_write) "Next Function Number";
+    }
+    register ari_control {
+        field m  [0:0] is (read_write) "MFVC Function Groups Enable (M)";
+        field a  [1:1] is (read_write) "ACS Function Groups Enable (A)";
+        field fg [6:4] is (read_write) "Function Group";
+    }
+}
+
+template defining_pcie_ari_capability_v3 {
+    is defining_pcie_ari_capability_v21;
+}
+
+template defining_pcie_ari_capability_v4 {
+    is defining_pcie_ari_capability_v3;
+}
+
+template defining_pcie_ari_capability_v5 {
+    is defining_pcie_ari_capability_v4;
+}
+
+// Dynamic Power Allocation (DPA) Capability
+template defining_pcie_dpa_capability_v21 {
+    parameter dpa_offset       default undefined;
+    parameter dpa_next_ptr     default undefined;
+    parameter dpa_substate_max default 0;
+
+    register dpa_capability_header size 4 @ ($dpa_offset + 0x0) {
+        parameter documentation = "DPA Extended Capability Header";
+    }
+    register dpa_capability        size 4 @ ($dpa_offset + 0x4) {
+        parameter documentation = "DPA Capability Register";
+    }
+    register dpa_latency_indicator size 4 @ ($dpa_offset + 0x8) {
+        parameter documentation = "DPA Latency Indicator Register";
+    }
+    register dpa_status            size 2 @ ($dpa_offset + 0xc) {
+        parameter documentation = "DPA Status Register";
+    }
+    register dpa_control           size 2 @ ($dpa_offset + 0xe) {
+        parameter documentation = "DPA Control Register";
+    }
+    register dpa_power_allocation[$dpa_substate_max + 1] size 1 @ ($dpa_offset + 0x10 + $i) {
+        parameter documentation = "DPA Power Allocation Array";
+    }
+
+    register dpa_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x16;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $dpa_next_ptr;
+        }
+    }
+    register dpa_capability {
+        field sm [4:0] is (read_only) "Substate Max" {
+            parameter hard_reset_value = $dpa_substate_max;
+        }
+        field tlu  [9:8]   is (read_only) "Transition Latency Unit";
+        field pas  [13:12] is (read_only) "Power Allocation Scale";
+        field tlv0 [23:16] is (read_only) "Transition Latency Value 0";
+        field tlv1 [31:24] is (read_only) "Transition Latency Value 1";
+    }
+    register dpa_latency_indicator is (read_only);
+    register dpa_status {
+        field ss  [4:0] is (ignore_write) "Substate Status";
+        field sce [8:8] is (write_1_clears) "Substate Control Enabled" {
+            parameter hard_reset_value = 0x1;
+        }
+    }
+    register dpa_control {
+        field sc [4:0] is (read_write) "Substate Control";
+    }
+    register dpa_power_allocation[$dpa_substate_max + 1] is (read_only);
+}
+
+template defining_pcie_dpa_capability_v3 {
+    is defining_pcie_dpa_capability_v21;
+}
+
+template defining_pcie_dpa_capability_v4 {
+    is defining_pcie_dpa_capability_v3;
+}
+
+template defining_pcie_dpa_capability_v5 {
+    is defining_pcie_dpa_capability_v4;
+}
+
+// Latency Tolerance Reporting (LTR) Capability
+template defining_pcie_ltr_capability_v21 {
+    parameter ltr_offset   default undefined;
+    parameter ltr_next_ptr default undefined;
+
+    register ltr_capability_header     size 4 @ ($ltr_offset + 0x0) {
+        parameter documentation = "LTR Extended Capability Header";
+    }
+    register ltr_max_snoop_latency     size 2 @ ($ltr_offset + 0x4) {
+        parameter documentation = "Max Snoop Latency Register";
+    }
+    register ltr_max_non_snoop_latency size 2 @ ($ltr_offset + 0x6) {
+        parameter documentation = "Max Non-Snoop Latency Register";
+    }
+
+    register ltr_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x18;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $ltr_next_ptr;
+        }
+    }
+    register ltr_max_snoop_latency {
+        field mslv [9:0]   is (read_write) "Max Snoop Latency Value";
+        field msls [12:10] is (read_write) "Max Snoop Latency Scale";
+    }
+    register ltr_max_non_snoop_latency {
+        field mslv [9:0]   is (read_write) "Max Snoop Latency Value";
+        field msls [12:10] is (read_write) "Max Snoop Latency Scale";
+    }
+}
+
+template defining_pcie_ltr_capability_v3 {
+    is defining_pcie_ltr_capability_v21;
+}
+
+template defining_pcie_ltr_capability_v4 {
+    is defining_pcie_ltr_capability_v3;
+}
+
+template defining_pcie_ltr_capability_v5 {
+    is defining_pcie_ltr_capability_v4;
+}
+
+// Transaction Processing Hints (TPH) Requester Extended Capability
+template defining_pcie_tph_capability_v21 {
+    parameter tph_offset        default undefined;
+    parameter tph_next_ptr      default undefined;
+    parameter tph_st_table_size default 0;
+
+    register tph_capability_header size 4 @ ($tph_offset + 0x0) {
+        parameter documentation = "TPH Requester Enhanced Capability Header Register";
+    }
+    register tph_capability        size 4 @ ($tph_offset + 0x4) {
+        parameter documentation = "TPH Requester Capability Register";
+    }
+    register tph_control           size 4 @ ($tph_offset + 0x8) {
+        parameter documentation = "TPH Requester Control Register";
+    }
+    register tph_st_table[$tph_st_table_size + 1] size 4 @ ($tph_offset + 0xc + $i * 0x2) {
+        parameter documentation = "TPH ST Table";
+    }
+
+    register tph_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x17;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $tph_next_ptr;
+        }
+    }
+    register tph_capability {
+        field nstms  [0:0]   is (read_only) "No ST Mode Supported" {
+            parameter hard_reset_value = 1;
+        }
+        field ivms   [1:1]   is (read_only) "Interrupt Vector Mode Supported";
+        field dsms   [2:2]   is (read_only) "Device Specific Mode Supported";
+        field etphrs [8:8]   is (read_only) "Extended TPH Requester Supported";
+        field sttl   [10:9]  is (read_only) "ST Table Location";
+        field stts   [26:16] is (read_only) "ST Table Size" {
+            parameter value = $tph_st_table_size;
+        }
+    }
+    register tph_control {
+        field stms  [2:0] is (read_write) "ST Mode Select";
+        field tphre [9:8] is (read_write) "TPH Requester Enable";
+    }
+    register tph_st_table[$tph_st_table_size + 1] {
+        field stl [7:0]  is (read_write) "ST Lower";
+        field stu [15:8] is (read_write) "ST Upper";
+    }
+}
+
+template defining_pcie_tph_capability_v3 {
+    is defining_pcie_tph_capability_v21;
+}
+
+template defining_pcie_tph_capability_v4 {
+    is defining_pcie_tph_capability_v3;
+}
+
+template defining_pcie_tph_capability_v5 {
+    is defining_pcie_tph_capability_v4;
+}
+
+// Secondary PCI Express (SPE) Capability
+template defining_pcie_spe_capability_v3 {
+    parameter spe_offset     default undefined;
+    parameter spe_next_ptr   default undefined;
+    parameter max_link_width default undefined;
+
+    register spe_capability_header size 4 @ ($spe_offset + 0x0) {
+        parameter documentation = "Secondary PCI Express Extended Capability Header";
+    }
+    register spe_link_control_3    size 4 @ ($spe_offset + 0x4) {
+        parameter documentation = "Link Control 3 Register";
+    }
+    register spe_lane_error_status size 4 @ ($spe_offset + 0x8) {
+        parameter documentation = "Lane Error Status Register";
+    }
+    register spe_equalization_control[$max_link_width] size 2 @ ($spe_offset + 0xc + $i * 0x2) {
+        parameter documentation = "Equalization Control Register";
+    }
+
+    register spe_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x19;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $spe_next_ptr;
+        }
+    }
+    register spe_link_control_3 {
+        field pe    [0:0] is (read_write) "Perform Equalization";
+        field lerie [1:1] is (read_write) "Link Equalization Request Interrupt Enable";
+    }
+    register spe_lane_error_status is (write_1_clears);
+    register spe_equalization_control[$max_link_width] {
+        field dptp  [3:0]   is (read_only) "Downstream Port Transmitter Preset" {
+            parameter hard_reset_value = 0xf;
+        }
+        field dprph [6:4]   is (read_only) "Downstream Port Receiver Preset Hint" {
+            parameter hard_reset_value = 0x7;
+        }
+        field uptp  [11:8]  is (read_only) "Upstream Port Transmitter Preset" {
+            parameter hard_reset_value = 0xf;
+        }
+        field uprph [14:12] is (read_only) "Upstream Port Receiver Preset Hint" {
+            parameter hard_reset_value = 0x7;
+        }
+    }
+}
+
+template defining_pcie_spe_capability_v4 {
+    is defining_pcie_spe_capability_v3;
+}
+
+template defining_pcie_spe_capability_v5 {
+    is defining_pcie_spe_capability_v4;
+}
+
+// M-PCIe Extended Capability
+template defining_pcie_mpcie_capability_v31  {
+    parameter mpcie_offset default undefined;
+    parameter mpcie_next_ptr default undefined;
+
+    register mpcie_capability_header size 4 @ ($mpcie_offset + 0x0) {
+        parameter documentation = "M-PCIe Extended Capability Header";
+    }
+    register mpcie_capabilities      size 4 @ ($mpcie_offset + 0x4) {
+        parameter documentation = "M-PCIe Capabilities Register";
+    }
+    register mpcie_control           size 4 @ ($mpcie_offset + 0x8) {
+        parameter documentation = "M-PCIe Control Register";
+    }
+    register mpcie_status            size 4 @ ($mpcie_offset + 0xc) {
+        parameter documentation = "M-PCIe Status Register";
+    }
+    register mpcie_lane_error_status size 4 @ ($mpcie_offset + 0x10) {
+        parameter documentation = "M-PCIe LANE Error Status Register";
+    }
+    register mpcie_phy_control_addr  size 4 @ ($mpcie_offset + 0x14) {
+        parameter documentation = "M-PCIe Phy Control Address Register";
+    }
+    register mpcie_phy_control_data  size 4 @ ($mpcie_offset + 0x18) {
+        parameter documentation = "M-PCIe Phy Control Data Register";
+    }
+
+    register mpcie_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x20;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $mpcie_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_mpcie_capability_v4 {
+    is defining_pcie_mpcie_capability_v31;
+}
+
+template defining_pcie_mpcie_capability_v5 {
+    is defining_pcie_mpcie_capability_v4;
+}
+
+// PASID Extended Capability Structure
+template defining_pcie_pasid_capability_v31 {
+    parameter pasid_offset default undefined;
+    parameter pasid_next_ptr default undefined;
+
+    register pasid_capability_header size 4 @ ($pasid_offset + 0x0) {
+        parameter documentation = "PASID Extended Capability Header";
+    }
+    register pasid_capability        size 2 @ ($pasid_offset + 0x4) {
+        parameter documentation = "PASID Capability Register";
+    }
+    register pasid_control           size 2 @ ($pasid_offset + 0x6) {
+        parameter documentation = "PASID Control Register";
+    }
+
+    register pasid_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x1b;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $pasid_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_pasid_capability_v4 {
+    is defining_pcie_pasid_capability_v31;
+}
+
+template defining_pcie_pasid_capability_v5 {
+    is defining_pcie_pasid_capability_v4;
+}
+
+// LNR Extended Capability
+template defining_pcie_lnr_capability_v31 {
+    parameter lnr_offset default undefined;
+    parameter lnr_next_ptr default undefined;
+
+    register lnr_capability_header size 4 @ ($lnr_offset + 0x0) {
+        parameter documentation = "LNR Extended Capability Header";
+    }
+    register lnr_capability        size 2 @ ($lnr_offset + 0x4) {
+        parameter documentation = "LNR Capability Register";
+    }
+    register lnr_control           size 2 @ ($lnr_offset + 0x6) {
+        parameter documentation = "LNR Control Register";
+    }
+
+    register lnr_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x1c;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $lnr_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_lnr_capability_v4 {
+    is defining_pcie_lnr_capability_v31;
+}
+
+template defining_pcie_lnr_capability_v5 {
+    is defining_pcie_lnr_capability_v4;
+}
+
+// DPC Extended Capability
+template defining_pcie_dpc_capability_v31 {
+    parameter dpc_offset default undefined;
+    parameter dpc_next_ptr default undefined;
+    parameter dpc_root_ports default false;
+
+    register dpc_capability_header size 4 @ ($dpc_offset + 0x0) {
+        parameter documentation = "DPC Extended Capability Header";
+    }
+    register dpc_capability        size 2 @ ($dpc_offset + 0x4) {
+        parameter documentation = "DPC Capability Register";
+    }
+    register dpc_control           size 2 @ ($dpc_offset + 0x6) {
+        parameter documentation = "DPC Control Register";
+    }
+    register dpc_status            size 2 @ ($dpc_offset + 0x8) {
+        parameter documentation = "DPC Status Register";
+    }
+    register dpc_error_source_id   size 2 @ ($dpc_offset + 0xa) {
+        parameter documentation = "DPC Error Source ID Register";
+    }
+
+    if ($dpc_root_ports) {
+        // TODO(ah): root ports added upon request
+    }
+
+    register dpc_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x1d;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $dpc_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_dpc_capability_v4 {
+    is defining_pcie_dpc_capability_v31;
+}
+
+template defining_pcie_dpc_capability_v5 {
+    is defining_pcie_dpc_capability_v4;
+}
+
+// Precision Time Management (PTM) Capability
+template defining_pcie_ptm_capability_v31 {
+    parameter ptm_offset default undefined;
+    parameter ptm_next_ptr default undefined;
+
+    register ptm_capability_header size 4 @ ($ptm_offset + 0x0) {
+        parameter documentation = "PTM Extended Capability Header";
+    }
+    register ptm_capability        size 4 @ ($ptm_offset + 0x4) {
+        parameter documentation = "PTM Capability Register";
+    }
+    register ptm_control           size 4 @ ($ptm_offset + 0x8) {
+        parameter documentation = "PTM Control Register";
+    }
+
+    register ptm_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x1f;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $ptm_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_ptm_capability_v4 {
+    is defining_pcie_ptm_capability_v31;
+}
+
+template defining_pcie_ptm_capability_v5 {
+    is defining_pcie_ptm_capability_v4;
+}
+
+// L1 PM Substates Extended Capability
+template defining_pcie_l1pms_capability_v31 {
+    parameter l1pms_offset default undefined;
+    parameter l1pms_next_ptr default undefined;
+
+    register l1pms_capability_header size 4 @ ($l1pms_offset + 0x0) {
+        parameter documentation = "L1 PM Substates Extended Capability Header";
+    }
+    register l1pms_capabilities      size 4 @ ($l1pms_offset + 0x4) {
+        parameter documentation = "L1 PM Substates Capabilities Register";
+    }
+    register l1pms_control1          size 4 @ ($l1pms_offset + 0x8) {
+        parameter documentation = "L1 PM Substates Control 1 Register";
+    }
+    register l1pms_control2          size 4 @ ($l1pms_offset + 0xc) {
+        parameter documentation = "L1 PM Substates Control 2 Register";
+    }
+
+    register l1pms_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x1e;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $l1pms_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_l1pms_capability_v4 {
+    is defining_pcie_l1pms_capability_v31;
+}
+
+template defining_pcie_l1pms_capability_v5 {
+    is defining_pcie_l1pms_capability_v4;
+}
+
+// FRS Queueing Extended Capability
+
+template defining_pcie_frsq_capability_v31 {
+    parameter frsq_offset default undefined;
+    parameter frsq_next_ptr default undefined;
+
+    register frsq_capability_header size 4 @ ($frsq_offset + 0x0) {
+        parameter documentation = "FRS Queueing Extended Capability Header";
+    }
+    register frsq_capability        size 4 @ ($frsq_offset + 0x4) {
+        parameter documentation = "FRS Queueing Capability Register";
+    }
+    register frsq_status            size 2 @ ($frsq_offset + 0x8) {
+        parameter documentation = "FRS Queueing Status Register";
+    }
+    register frsq_control           size 2 @ ($frsq_offset + 0xa) {
+        parameter documentation = "FRS Queueing Control Register";
+    }
+    register frsq_message_queue     size 4 @ ($frsq_offset + 0xc) {
+        parameter documentation = "FRS Message Queue Register";
+    }
+
+    register frsq_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x21;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $frsq_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_frsq_capability_v4 {
+    is defining_pcie_frsq_capability_v31;
+}
+
+template defining_pcie_frsq_capability_v5 {
+    is defining_pcie_frsq_capability_v4;
+}
+
+// Readiness Time Reporting Extended Capability
+template defining_pcie_rtr_capability_v31 {
+    parameter rtr_offset default undefined;
+    parameter rtr_next_ptr default undefined;
+
+    register rtr_capability_header size 4 @ ($rtr_offset + 0x0) {
+        parameter documentation = "RTR Extended Capability Header";
+    }
+    register rtr_1                 size 4 @ ($rtr_offset + 0x4) {
+        parameter documentation = "Readiness Time Reporting 1";
+    }
+    register rtr_2                 size 4 @ ($rtr_offset + 0x8) {
+        parameter documentation = "Readiness Time Reporting 2";
+    }
+
+    register rtr_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x22;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $rtr_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_rtr_capability_v4 {
+    is defining_pcie_rtr_capability_v31;
+}
+
+template defining_pcie_rtr_capability_v5 {
+    is defining_pcie_rtr_capability_v4;
+}
+
+// Data Link Feature Extended Capability
+template defining_pcie_dlf_capability_v4 {
+    parameter dlf_offset default undefined;
+    parameter dlf_next_ptr default undefined;
+
+    register dlf_capability_header size 4 @ ($dlf_offset + 0x0) {
+        parameter documentation = "DLF Extended Capability Header";
+    }
+    register dlf_capabilities      size 4 @ ($dlf_offset + 0x4) {
+        parameter documentation = "DLF Capabilities Register";
+    }
+    register dlf_status            size 4 @ ($dlf_offset + 0x8) {
+        parameter documentation = "DLF Status Register";
+    }
+
+    register dlf_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x25;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $dlf_next_ptr;
+        }
+    }
+
+    register dlf_capabilities {
+        field ldlfs [22:0] is (read_only) "Local Data Link Feature Supported";
+        field dlfee [31:31] is (read_only) "Data Link Feature Exchange Enable";
+    }
+    register dlf_status {
+        field rdlfs  [22:0] is (read_only) "Remote Data Link Feature Supported";
+        field rdlfsv [31:31] is (read_only) "Remote Data Link Feature Supported Valid";
+    }
+}
+
+template defining_pcie_dlf_capability_v5 {
+    is defining_pcie_dlf_capability_v4;
+}
+
+// Physical Layer 16.0 GT/s Extended Capability
+template defining_pcie_pl16g_capability_v4 {
+    parameter pl16g_offset default undefined;
+    parameter pl16g_next_ptr default undefined;
+    parameter max_link_width default undefined;
+    parameter pl16g_max_lanes default undefined;
+
+    if (defined $pl16g_max_lanes && defined $max_link_width) {
+        if ($pl16g_max_lanes < $max_link_width) {
+            error "Max number of lanes must be at least equal to max link with";
+        }
+        // add more checks here?
+    }
+
+    register pl16g_capability_header size 4 @ ($pl16g_offset + 0x0) {
+        parameter documentation = "16.0 GT/s Extended Capability Header";
+    }
+    register pl16g_capabilities      size 4 @ ($pl16g_offset + 0x4) {
+        parameter documentation = "16.0 GT/s Capabilities Register";
+    }
+    register pl16g_control           size 4 @ ($pl16g_offset + 0x8) {
+        parameter documentation = "16.0 GT/s Control Register";
+    }
+    register pl16g_status            size 4 @ ($pl16g_offset + 0xc) {
+        parameter documentation = "16.0 GT/s Status Register";
+    }
+    register pl16g_ldpms            size 4 @ ($pl16g_offset + 0x10) {
+        parameter documentation = "16.0 GT/s Local Data Parity Mismatch Status Register";
+    }
+    register pl16g_frdpms            size 4 @ ($pl16g_offset + 0x14) {
+        parameter documentation = "16.0 GT/s First Retimer Data Parity Mismatch Status Register";
+    }
+    register pl16g_srdpms            size 4 @ ($pl16g_offset + 0x18) {
+        parameter documentation = "16.0 GT/s Second Retimer Data Parity Mismatch Status Register";
+    }
+    register pl16g_reserved          size 4 @ ($pl16g_offset + 0x1c) {
+        parameter documentation = "16.0 GT/s Reserved";
+    }
+    register pl16g_lec[($pl16g_max_lanes - 1) / 8 + 1] size 4 @ ($pl16g_offset + $i * 4 + 0x20) {
+        parameter documentation = "16.0 GT/s Lane Equalization Control Register";
+    }
+
+    register pl16g_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x26;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $pl16g_next_ptr;
+        }
+    }
+
+    register pl16g_capabilities is (read_only) {
+        // reserved
+    }
+    register pl16g_control is (read_write) {
+        // reserved
+    }
+    register pl16g_status {
+        field ec   [0:0] is (read_only) "Equalization 16.0 GT/s Complete";
+        field ep1s [1:1] is (read_only) "Equalization 16.0 GT/s Phase 1 Successful";
+        field ep2s [2:2] is (read_only) "Equalization 16.0 GT/s Phase 2 Successful";
+        field ep3s [3:3] is (read_only) "Equalization 16.0 GT/s Phase 3 Successful";
+        field ler  [4:4] is (write_1_clears) "Link Equalization Request 16.0 GT/s";
+    }
+    register pl16g_ldpms {
+        field status [$max_link_width - 1:0] is (write_1_clears) "Local Data Parity Mismatch Status";
+    }
+    register pl16g_frdpms {
+        field status [$max_link_width - 1:0] is (write_1_clears) "First Retimer Data Parity Mismatch Status";
+    }
+    register pl16g_srdpms {
+        field status [$max_link_width - 1:0] is (write_1_clears) "Second Retimer Data Parity Mismatch Status";
+    }
+    register pl16g_lec[($pl16g_max_lanes - 1) / 8 + 1] {
+        // TODO(ah): fields to be added upon request
+    }
+}
+
+template defining_pcie_pl16g_capability_v5 {
+    is defining_pcie_pl16g_capability_v4;
+}
+
+// Physical Layer 32.0 GT/s Extended Capability
+template defining_pcie_pl32g_capability_v5 {
+    parameter pl32g_offset default undefined;
+    parameter pl32g_next_ptr default undefined;
+    parameter max_link_width default undefined;
+    parameter pl32g_max_lanes default undefined;
+
+    if (defined $pl32g_max_lanes && defined $max_link_width) {
+        if ($pl32g_max_lanes < $max_link_width) {
+            error "Max number of lanes must be at least equal to max link with";
+        }
+        // add more checks here?
+    }
+
+    register pl32g_capability_header size 4 @ ($pl32g_offset + 0x0) {
+        parameter documentation = "32.0 GT/s Extended Capability Header";
+    }
+    register pl32g_capabilities      size 4 @ ($pl32g_offset + 0x4) {
+        parameter documentation = "32.0 GT/s Capabilities Register";
+    }
+    register pl32g_control           size 4 @ ($pl32g_offset + 0x8) {
+        parameter documentation = "32.0 GT/s Control Register";
+    }
+    register pl32g_status            size 4 @ ($pl32g_offset + 0xc) {
+        parameter documentation = "32.0 GT/s Status Register";
+    }
+    register pl32g_rmtsd1            size 4 @ ($pl32g_offset + 0x10) {
+        parameter documentation = "Received Modified TS Data 1 Register";
+    }
+    register pl32g_rmtsd2            size 4 @ ($pl32g_offset + 0x14) {
+        parameter documentation = "Received Modified TS Data 2 Register";
+    }
+    register pl32g_tmtsd1            size 4 @ ($pl32g_offset + 0x18) {
+        parameter documentation = "Transmitted Modified TS Data 1 Register";
+    }
+    register pl32g_tmtsd2          size 4 @ ($pl32g_offset + 0x1c) {
+        parameter documentation = "Transmitted Modified TS Data 2 Register";
+    }
+    register pl32g_lec[($pl32g_max_lanes - 1) / 8 + 1] size 4 @ ($pl32g_offset + $i * 4 + 0x20) {
+        parameter documentation = "32.0 GT/s Lane Equalization Control Register";
+    }
+
+    register pl32g_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x2a;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $pl32g_next_ptr;
+        }
+    }
+
+    register pl32g_capabilities {
+        field ebthrs  [0:0] is (read_only) "Equalization bypass to highest rate Supported";
+        field nens    [1:1] is (read_only) "No Equalization Needed Supported";
+        field mtsum0s [8:8] is (read_only) "Modified TS Usage Mode 0 Supported - PCI Express";
+        field mtsum1s [9:9] is (read_only) "Modified TS Usage Mode 1 Supported - Training Set Message";
+        field mtsum2s [10:10] is (read_only) "Modified TS Usage Mode 2 Supported - Alternate Protocol";
+        field mtsrum  [15:11] is (read_only) "Modified TS Reserved Usage Modes";
+    }
+    register pl32g_control is (read_write) {
+        field ebthrd [0:0] is (read_write) "Equalization bypass to highest rate Disable";
+        field nend   [1:1] is (read_write) "No Equalization Needed Disable";
+        field mtsums [10:8] is (read_write) "Modified TS Usage Mode Selected";
+    }
+    register pl32g_status {
+        field ec    [0:0] is (read_only) "Equalization 32.0 GT/s Complete";
+        field ep1s  [1:1] is (read_only) "Equalization 32.0 GT/s Phase 1 Successful";
+        field ep2s  [2:2] is (read_only) "Equalization 32.0 GT/s Phase 2 Successful";
+        field ep3s  [3:3] is (read_only) "Equalization 32.0 GT/s Phase 3 Successful";
+        field ler   [4:4] is (write_1_clears) "Link Equalization Request 32.0 GT/s";
+        field mtsr  [5:5] is (read_only) "Modified TS Received";
+        field relbc [7:6] is (read_only) "Received Enhanced Link Behavior Control";
+        field tpo   [8:8] is (read_only) "Transmitter Precoding On";
+        field tpr   [9:9] is (read_only) "Transmitter Precode Request";
+        field nenr [10:10] is (read_only) "No Equalization Needed Received";
+    }
+    register pl32g_rmtsd1 {
+        field rmtsum [2:0] is (read_only) "Received Modified TS Usage Mode";
+        field rmtsi1 [15:3] is (read_only) "Received Modified TS Information 1";
+        field rmtsvid [31:16] is (read_only) "Received Modified TS Vendor ID";
+    }
+    register pl32g_rmtsd2 {
+        field rmtsi2 [23:0] is (read_only) "Received Modified TS Information 2";
+        field apns [25:24] is (read_only) "Alternate Protocol Negotiation Status";
+    }
+    register pl32g_tmtsd1 {
+        field tmtsum [2:0] is (read_only) "Transmitted Modified TS Usage Mode";
+        field tmtsi1 [15:3] is (read_only) "Transmitted Modified TS Information 1";
+        field tmtsvid [31:16] is (read_only) "Transmitted Modified TS Vendor ID";
+    }
+    register pl32g_tmtsd2 {
+        field tmtsi2 [23:0] is (read_only) "Transmitted Modified TS Information 2";
+        field apns [25:24] is (read_only) "Alternate Protocol Negotiation Status";
+    }
+    register pl32g_lec[($pl32g_max_lanes - 1) / 8 + 1] {
+        // TODO(ah): fields to be added upon request
+    }
+}
+
+// Lane Margining at the Receiver Extended Capability
+template defining_pcie_lmar_capability_v4 {
+    parameter lmar_offset default undefined;
+    parameter lmar_next_ptr default undefined;
+    parameter max_link_width default undefined;
+    parameter lmar_max_lanes default undefined;
+
+    if (defined $lmar_max_lanes && defined $max_link_width) {
+        if ($lmar_max_lanes < $max_link_width) {
+            error "Max number of lanes must be at least equal to max link with";
+        }
+        // add more checks here?
+    }
+
+    register lmar_capability_header size 4 @ ($lmar_offset + 0x0) {
+        parameter documentation = "Margining Extended Capability Header";
+    }
+    register lmar_port_capabilities size 2 @ ($lmar_offset + 0x4) {
+        parameter documentation = "Margining Port Capabilities Register";
+    }
+    register lmar_port_status       size 2 @ ($lmar_offset + 0x6) {
+        parameter documentation = "Margining Port Status Register";
+    }
+    register lmar_lane_control[$lmar_max_lanes] size 2 @ ($lmar_offset + $i * 4 + 0x8) {
+        parameter documentation = "Margining Lane Control";
+    }
+    register lmar_lane_status[$lmar_max_lanes] size 2 @ ($lmar_offset + $i * 4 + 0xa) {
+        parameter documentation = "Margining Lane Status";
+    }
+
+    register lmar_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x27;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $lmar_next_ptr;
+        }
+    }
+
+    register lmar_port_capabilities {
+        field muds [0:0] is (read_only) "Margining uses Driver Software";
+    }
+    register lmar_port_status {
+        field mr  [0:0] is (read_only) "Margining Ready";
+        field msr [1:1] is (read_only) "Margining Software Ready";
+    }
+    register lmar_lane_control[$lmar_max_lanes] {
+        field rn [2:0] is (read_write) "Receiver Number";
+        field mt [5:3] is (read_write) "Margin Type";
+        field um [6:6] is (read_write) "Usage Model";
+        field mp [15:8] is (read_write) "Margin Payload";
+    }
+    register lmar_lane_status[$lmar_max_lanes] {
+        field rns [2:0] is (read_only) "Receiver Number Status";
+        field mts [5:3] is (read_only) "Margin Type Status";
+        field ums [6:6] is (read_only) "Usage Model Status";
+        field mps [15:8] is (read_only) "Margin Payload Status";
+    }
+}
+
+template defining_pcie_lmar_capability_v5 {
+    is defining_pcie_lmar_capability_v4;
+}
+
+// Enhanced Allocation (EA) Capability
+template defining_pcie_ea_capability_v4 {
+    parameter ea_offset default undefined;
+    parameter ea_next_ptr default undefined;
+    parameter ea_num_entries default 0;
+
+    register ea_capability_header size 4 @ ($ea_offset + 0x0) {
+        parameter documentation = "EA Extended Capability Header";
+    }
+    if ($ea_num_entries > 0 ) {
+        register ea_entries[$ea_num_entries] size 4 @ ($ea_offset + $i * 4 + 0x4) {
+            parameter documentation = "EA Entry";
+        }
+    }
+    
+    register ea_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x14;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $ea_next_ptr;
+        }
+        field ne [21:16] is (read_only) "Num Entries" {
+            parameter hard_reset_value = $ea_num_entries;
+        }
+    }
+
+    if ($ea_num_entries > 0 ) {
+        register ea_entries[$ea_num_entries] {
+            field es  [2:0] is (read_only) "Entry Size";
+            field bei [7:4] is (read_only) "BAR Equivalent Indicator";
+            field pp  [15:8] is (read_only) "Primary Properties";
+            field sp  [23:16] is (read_only) "Secondary Properties";
+            field w   [30:30] is (read_only) "Writable";
+            field e   [31:31] is (read_write) "Enable";
+        }
+    }
+}
+
+template defining_pcie_ea_capability_v5 {
+    is defining_pcie_ea_capability_v4;
+}
+
+// Flattening Portal Bridge (FPB) Capability
+template defining_pcie_fpb_capability_v4 {
+    parameter fpb_offset default undefined;
+    parameter fpb_next_ptr default undefined;
+
+    register fpb_capability_header size 4 @ ($fpb_offset + 0x0) {
+        parameter documentation = "FPB Capability Header";
+    }
+    register fpb_capability        size 4 @ ($fpb_offset + 0x4) {
+        parameter documentation = "FPB Capabilities Register";
+    }
+    register fpb_rid_vector_control_1  size 4 @ ($fpb_offset + 0x8) {
+        parameter documentation = "FPB RID Vector Control 1 Register";
+    }
+    register fpb_rid_vector_control_2  size 4 @ ($fpb_offset + 0xc) {
+        parameter documentation = "FPB RID Vector Control 2 Register";
+    }
+    register fpb_mem_low_vector_control  size 4 @ ($fpb_offset + 0x10) {
+        parameter documentation = "FPB MEM Low Vector Control Register";
+    }
+    register fpb_mem_high_vector_control_1  size 4 @ ($fpb_offset + 0x14) {
+        parameter documentation = "FPB MEM High Vector Control 1 Register";
+    }
+    register fpb_mem_high_vector_control_2  size 4 @ ($fpb_offset + 0x18) {
+        parameter documentation = "FPB MEM High Vector Control 2 Register";
+    }
+    register fpb_vector_access_control  size 4 @ ($fpb_offset + 0x1c) {
+        parameter documentation = "FPB Vector Access Control Register";
+    }
+    register fpb_vector_access_data  size 4 @ ($fpb_offset + 0x20) {
+        parameter documentation = "FPB Vector Access Data Register";
+    }
+
+    register fpb_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x15;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $fpb_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_fpb_capability_v5 {
+    is defining_pcie_fpb_capability_v4;
+}
+
+// Designated Vendor-Specific Extended Capability (DVSEC)
+template defining_pcie_dvsec_capability_v4 {
+    parameter dvsec_offset   default undefined;
+    parameter dvsec_next_ptr default undefined;
+
+    register dvsec_capability_header size 4 @ ($dvsec_offset + 0x0) {
+        parameter documentation = "Vendor-Specific Extended Capability Header";
+    }
+    register dvsec_header            size 4 @ ($dvsec_offset + 0x4) {
+        parameter documentation = "Vendor-Specific Header";
+    }
+
+    register dvsec_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x23;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $dvsec_next_ptr;
+        }
+    }
+    register dvsec_header {
+        field dvsecid [15:0]  is (read_only) "DVSEC ID";
+        field dvsecr  [19:16] is (read_only) "DVSEC Rev";
+        field dvsecl  [31:20] is (read_only) "DVSEC Length";
+    }
+}
+
+template defining_pcie_dvsec_capability_v5 {
+    is defining_pcie_dvsec_capability_v4;
+}
+
+// Hierarchy ID Extended Capability
+template defining_pcie_hid_capability_v4 {
+    parameter hid_offset default undefined;
+    parameter hid_next_ptr default undefined;
+
+    register hid_capability_header size 4 @ ($hid_offset + 0x0) {
+        parameter documentation = "HID Extended Capability Header";
+    }
+    register hid_status            size 4 @ ($hid_offset + 0x4) {
+        parameter documentation = "Header ID Status Register";
+    }
+    register hid_data              size 4 @ ($hid_offset + 0x8) {
+        parameter documentation = "Hierarchy ID Data Register";
+    }
+    register hid_system_guid_1     size 4 @ ($hid_offset + 0xc) {
+        parameter documentation = "Hierarchy ID System GUID 1 Register";
+    }
+    register hid_system_guid_2     size 4 @ ($hid_offset + 0x10) {
+        parameter documentation = "Hierarchy ID System GUID 2 Register";
+    }
+    register hid_system_guid_3     size 4 @ ($hid_offset + 0x14) {
+        parameter documentation = "Hierarchy ID System GUID 3 Register";
+    }
+    register hid_system_guid_4     size 4 @ ($hid_offset + 0x18) {
+        parameter documentation = "Hierarchy ID System GUID 4 Register";
+    }
+    register hid_system_guid_5     size 4 @ ($hid_offset + 0x1c) {
+        parameter documentation = "Hierarchy ID System GUID 5 Register";
+    }
+
+    register hid_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x28;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $hid_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_hid_capability_v5 {
+    is defining_pcie_hid_capability_v4;
+}
+
+// VPD Capability
+template defining_pcie_vpd_capability_v4 {
+    parameter vpd_offset default undefined;
+    parameter vpd_next_ptr default undefined;
+
+    register vpd_capability_header size 4 @ ($vpd_offset + 0x0) {
+        parameter documentation = "VPD Capability Header";
+    }
+    register vpd_data             size 4 @ ($vpd_offset + 0x4) {
+        parameter documentation = "VPD Data";
+    }
+
+    register vpd_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x3;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $vpd_next_ptr;
+        }
+        field address  [30:16] is (read_write) "VPD Address";
+        field f        [31:31] is (read_write) "F (flag)";
+    }
+    register vpd_data is (read_write);
+}
+
+template defining_pcie_vpd_capability_v5 {
+    is defining_pcie_vpd_capability_v4;
+}
+
+// Native PCIe Enclosure Management (NPEM) Extended Capability
+template defining_pcie_npem_capability_v4 {
+    parameter npem_offset default undefined;
+    parameter npem_next_ptr default undefined;
+
+    register npem_capability_header size 4 @ ($npem_offset + 0x0) {
+        parameter documentation = "NPEM Extended Capability Header";
+    }
+    register npem_capability        size 4 @ ($npem_offset + 0x4) {
+        parameter documentation = "NPEM Capability Register";
+    }
+    register npem_control           size 4 @ ($npem_offset + 0x8) {
+        parameter documentation = "NPEM Control Register";
+    }
+    register npem_status            size 4 @ ($npem_offset + 0xc) {
+        parameter documentation = "NPEM Status Register";
+    }
+
+    register npem_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x29;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $npem_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+template defining_pcie_npem_capability_v5 {
+    is defining_pcie_npem_capability_v4;
+}
+
+// Alternate Protocol Extended Capability
+template defining_pcie_ap_capability_v5 {
+    parameter ap_offset default undefined;
+    parameter ap_next_ptr default undefined;
+
+    register ap_capability_header size 4 @ ($ap_offset + 0x0) {
+        parameter documentation = "AP Extended Capability Header";
+    }
+    register ap_capabilities      size 4 @ ($ap_offset + 0x4) {
+        parameter documentation = "AP Capabilities Register";
+    }
+    register ap_control           size 4 @ ($ap_offset + 0x8) {
+        parameter documentation = "AP Control Register";
+    }
+    register ap_data1             size 4 @ ($ap_offset + 0xc) {
+        parameter documentation = "AP Data 1 Register";
+    }
+    register ap_data2             size 4 @ ($ap_offset + 0x10) {
+        parameter documentation = "AP Data 2 Register";
+    }
+
+    register ap_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x2b;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $ap_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+// Conventional PCI Advanced Features Capability (AF)
+template defining_pcie_af_capability_v5 {
+    parameter af_offset default undefined;
+    parameter af_next_ptr default undefined;
+
+    register af_capability_header size 3 @ ($af_offset + 0x0) {
+        parameter documentation = "Capability Header";
+    }
+    register af_capabilities        size 1 @ ($af_offset + 0x3) {
+        parameter documentation = "AF Capabilities Register";
+    }
+    register af_control             size 1 @ ($af_offset + 0x4) {
+        parameter documentation = "AF Control Register";
+    }
+    register af_status              size 1 @ ($af_offset + 0x5) {
+        parameter documentation = "AF Control Register";
+    }
+
+    register af_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x13;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $af_next_ptr;
+        }
+        field length   [23:16] is (read_only) "Length" {
+            parameter hard_reset_value = 6;
+        }
+    }
+    register af_capabilities {
+        field tp_cap  [0:0] is (read_only) "TP_CAP";
+        field flr_cap [1:1] is (read_only) "FLR_CAP";
+    }
+    register af_control {
+        field iflr [0:0] is (read_write) "Function Level Reset (INITIATE_FLR)";
+    }
+    register af_status {
+        field tp [0:0] is (read_only) "Transactions Pending (TP)";
+    }
+}
+
+// SFI Extended Capability
+template defining_pcie_sfi_capability_v5 {
+    parameter sfi_offset default undefined;
+    parameter sfi_next_ptr default undefined;
+
+    register sfi_capability_header size 4 @ ($sfi_offset + 0x0) {
+        parameter documentation = "SFI Extended Capability Header";
+    }
+    register sfi_capability        size 2 @ ($sfi_offset + 0x4) {
+        parameter documentation = "SFI Capability Register";
+    }
+    register sfi_control           size 2 @ ($sfi_offset + 0x6) {
+        parameter documentation = "SFI Control Register";
+    }
+    register sfi_status            size 2 @ ($sfi_offset + 0x8) {
+        parameter documentation = "SFI Status Register";
+    }
+    register sfi_cam_address       size 4 @ ($sfi_offset + 0xc) {
+        parameter documentation = "SFI CAM Address";
+    }
+    register sfi_cam_data          size 2 @ ($sfi_offset + 0x10) {
+        parameter documentation = "SFI CAM Data";
+    }
+
+    register sfi_capability_header {
+        field id       [15:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x2c;
+        }
+        field version  [19:16] is (constant) "Capability Version" {
+            parameter hard_reset_value = 0x1;
+        }
+        field next_ptr [31:20] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $sfi_next_ptr;
+        }
+    }
+
+    // TODO(ah): fields to be added upon request
+}
+
+// Subsystem ID and Subsystem Vendor ID Capability
+template defining_pcie_ssid_capability_v5 {
+    parameter ssid_offset default undefined;
+    parameter ssid_next_ptr default undefined;
+
+    register ssid_capability_header size 4 @ ($ssid_offset + 0x0) {
+        parameter documentation = "Capability Header";
+    }
+    register ssid_ssvid             size 2 @ ($ssid_offset + 0x4) {
+        parameter documentation = "SSVID";
+    }
+    register ssid_ssid              size 2 @ ($ssid_offset + 0x6) {
+        parameter documentation = "SSID";
+    }
+
+    register ssid_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x0d;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Offset" {
+            parameter hard_reset_value = $ssid_next_ptr;
+        }
+    }
+    register ssid_ssvid is (read_only);
+    register ssid_ssid is (read_only);
+}

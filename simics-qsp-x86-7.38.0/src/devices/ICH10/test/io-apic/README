@@ -1,0 +1,16 @@
+ICH10 IO-APIC Test Description
+=================================
+
+Included Cases
+--------------
+The ICH10 IO-APIC test totally includes 4 cases:
+(1) s-apic-reset.py: tests default states of IO-APIC
+(2) s-apic-intr.py: tests the interrupts of IO-APIC
+(3) s-apic-mask.py: tests interrupt masking function of IO-APIC
+(4) s-apic-eoi.py: tests end-of-interrupt commands to IO-APIC
+
+
+
+Not Tested Features
+-------------------
+(1) Nested mode interrupts are not tested in IO-APIC

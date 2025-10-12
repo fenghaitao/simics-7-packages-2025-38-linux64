@@ -1,0 +1,50 @@
+# -*- Makefile -*-
+
+# © 2015 Intel Corporation
+#
+# This software and the related documents are Intel copyrighted materials, and
+# your use of them is governed by the express license under which they were
+# provided to you ("License"). Unless the License provides otherwise, you may
+# not use, modify, copy, publish, distribute, disclose or transmit this software
+# or the related documents without Intel's prior written permission.
+#
+# This software and the related documents are provided as is, with no express or
+# implied warranties, other than those that are expressly stated in the License.
+
+ifeq ($(SYSTEMC_CORE_CFLAGS),)
+    # Use Simics SystemC kernel
+    ifeq ($(SIMICS_PROJECT),)
+        # SIMICS_PROJECT and HOST_TYPE is needed for systemc-find.mk
+        ifeq ($(wildcard $(CURDIR)/bin/lookup-file),)
+            $(error The makefile needs run from the project root)
+        endif
+        SIMICS_PROJECT = $(CURDIR)
+    endif
+
+    ifeq ($(HOST_TYPE),)
+        ifeq ($(wildcard $(SIMICS_PROJECT)/linux64),)
+            HOST_TYPE = win64
+        else
+            HOST_TYPE = linux64
+        endif
+    endif
+
+    include $(shell $(SIMICS_PROJECT)/bin/lookup-file -f config/project/systemc-find.mk)
+
+    unique := /standalone.mk
+    P1 := modules/systemc-library/$(unique)
+    P2 := src/extensions/systemc-library/$(unique)
+    P3 := src/extensions/systemc-library/$(unique)
+    MSG := Unable to locate: systemc-library
+    $(eval $(call SC_FIND,SCL_INC,P1,P2,P3,MSG,unique))
+    include $(SCL_INC)/standalone.mk
+endif
+
+CXXFLAGS += $(SYSTEMC_CORE_CFLAGS)
+LDFLAGS += $(SYSTEMC_CORE_LDFLAGS)
+LDFLAGS += -lpthread
+
+all: sample-tlm2-dma-device
+
+sample-tlm2-dma-device: dma-device.cc sc-main.cc
+	$(CXX) $(CXXFLAGS) $^ -DDEBUG $(LDFLAGS) -o $@

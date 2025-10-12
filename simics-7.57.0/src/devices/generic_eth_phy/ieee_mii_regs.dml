@@ -1,0 +1,538 @@
+/*
+  IEEE 802.3 PHY functionality
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+  This file requires the following:
+  - a device-level method link_is_up(), returning bool, must be defined
+  - post_init must call $mii_regs.post_init()
+  In return, it defines:
+  - attributes etc. for a set of MII management registers
+  - the method loopback_mode()
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "simics/devs/mii.dml";
+
+param default_phy_id default 0;
+
+is sreset;
+is hreset;
+
+attribute registers[i < 32] {
+    param documentation = "The 32 MII management registers";
+    param configuration = "pseudo";
+    param type = "i";
+
+    method set_value(uint16 val) throws {
+        local bool success;
+        success = mii_regs.write_reg(i, val, true);
+        /* Don't complain when trying to set undefined registers to 0,
+           makes it possible to read out the attribute, set some values
+           and write it back without complaint. */
+        if (!success && val != 0) {
+            log error: "%s.set failed", qname;
+            throw;
+        }
+    }
+
+    method set(attr_value_t attr) throws {
+        local uint64 value = SIM_attr_integer(attr);
+        if (value >= 0x10000)
+            throw;
+        set_value(value);
+    }
+
+    method get_value() -> (uint16) {
+        local uint16 val;
+        local bool success;
+        local uint16 value;
+        (success, val) = mii_regs.read_reg(i, true);
+        /* Don't complain on undefined registers when reading the attribute */
+        if (!success)
+            val = 0;
+        return val;
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(get_value());
+    }
+}
+
+attribute register_defaults[i < 32] {
+    param documentation = "Reset values of the MII registers."
+        + " A <b>nil</b> value denotes that the standard reset"
+        + " value for that register is used.";
+    param type = "n|i";
+    param configuration = "optional";
+    session bool used;
+    session uint16 value;
+    method get() -> (attr_value_t) {
+        return used ? SIM_make_attr_uint64(value) : SIM_make_attr_nil();
+    }
+    method set(attr_value_t val) throws {
+        if ((i == 2 || i == 3)
+            && !SIM_object_is_configured(dev.obj)
+            && phy_id.set_called) {
+            if (!SIM_attr_is_nil(val)) {
+                log error:
+                    "Ambiguous setting of PHY id: Attribute set both via the register_defaults and phy_id attributes";
+            }
+            // value overridden by phy_id attribute
+            return;
+        }
+        used = !SIM_attr_is_nil(val);
+        if (used) {
+            value = SIM_attr_integer(val);
+        }
+    }
+}
+
+attribute phy_id {
+    param documentation = "32-bit PHY identifier";
+    param type = "i";
+    param configuration = "pseudo";
+
+    session bool set_called;
+    method get() -> (attr_value_t) {
+        local uint32 value;
+        value[31:16] = registers[2].get_value();
+        value[15:0] = registers[3].get_value();
+        return SIM_make_attr_uint64(value);
+    }
+    method set(attr_value_t attr) throws {
+        local uint64 val = SIM_attr_integer(attr);
+        if (val >= 0x100000000)
+            throw;
+        local uint16 regvals[2];
+        regvals[0] = val[31:16];
+        regvals[1] = val[15:0];
+        local int i;
+        for (i = 0; i < 2; i++) {
+            if (register_defaults[i + 2].used
+                && !SIM_object_is_configured(dev.obj)) {
+                log error:
+                    "Ambiguous setting of PHY id: Attribute set both via the register_defaults and phy_id attributes";
+            }
+            registers[i + 2].set_value(regvals[i]);
+            register_defaults[i + 2].value = regvals[i];
+            register_defaults[i + 2].used = true;
+        }
+        set_called = true;
+    }
+}
+
+implement mii_management {
+    method read_register(int phy, int reg) -> (uint16) {
+        local uint16 value;
+        local bool success;
+        (success, value) = mii_regs.read_reg(reg, false);
+        if (!success) {
+            log spec_viol:
+                "%s.read_register: Invalid read from register %d",
+                qname, reg;
+            value = 0;
+        }
+        return value;
+    }
+
+    method write_register(int phy, int reg, uint16 value) {
+        local bool success;
+        success = mii_regs.write_reg(reg, value, false);
+        if (!success) {
+            log spec_viol:
+                "%s.write_register: Invalid write to register %d",
+                qname, reg;
+        }
+    }
+}
+
+// legacy
+implement mii {
+    method read_register(int reg) -> (uint16) {
+        local uint16 value;
+        value = mii_management.read_register(0, reg);
+        return value;
+    }
+    method write_register(int reg, uint16 value) {
+        mii_management.write_register(0, reg, value);
+    }
+}
+
+
+bank mii_regs {
+    param documentation
+        = "The MII management register set as described in IEEE 802.3.";
+    param mappable = false;
+    param register_size = 2;
+    param partial = false;
+    param overlapping = false;
+
+    register control @ 0 * 2 is mii_reg "Control (register 0)";
+    register status @ 1 * 2 is mii_reg "Status (register 1)";
+    register phy_id[i < 2] @ (i + 2) * 2 is mii_reg
+        "PHY identifier (registers 2 and 3)" {
+        param init_val = dev.default_phy_id[31-i*16 : 16-i*16];
+    }
+    register an_advertisement @ 4 * 2 is (mii_reg, an_adver_reg)
+        "Auto-Negotiation advertisement (register 4)";
+    register an_link_partner_base_page_ability @ 5 * 2
+        is (mii_reg, an_adver_reg)
+        "Auto-Negotiation link partner base page ability (register 5)";
+    register an_expansion @ 6 * 2 is mii_reg
+        "Auto-Negotiation expansion (register 6)";
+    register an_next_page_transmit @ 7 * 2 is (mii_reg, unimpl)
+        "Auto-Negotiation next page transmit (register 7)";
+    register an_link_partner_received_next_page @ 8 * 2 is
+        (mii_reg, unimpl)
+        "Auto-Negotiation link partner received_next page (register 8)";
+    register ms_control @ 9 * 2 is mii_reg
+        "MASTER-SLAVE control (register 9)";
+    register ms_status @ 10 * 2 is mii_reg
+        "MASTER-SLAVE status (register 10)";
+    register pse_control @ 11 * 2 is (mii_reg, unimpl)
+        "PSE control (register 11)";
+    register pse_status @ 12 * 2 is (mii_reg, unimpl)
+        "PSE status (register 12)";
+    register mmd_access_control @ 13 * 2 is (mii_reg, unimpl)
+        "MMD access control (register 13)";
+    register mmd_access_addr_data @ 14 * 2 is (mii_reg, unimpl)
+        "MMD access address data (register 14)";
+    register ext_status @ 15 * 2 is mii_reg
+        "Extended status (register 15)";
+
+    param override_vendor_specific default false;
+    #if (!override_vendor_specific) {
+        register vendor_specific[i < 16] @ (16 + i) * 2 is (mii_reg, unimpl)
+            "Vendor specific";
+    }
+}
+
+
+/* Template for registers whose hard reset value depends on configurable
+   attributes. Requires that the register's post_init() method is called from
+   the device-level post_init() method. */
+template dynamic_reset_value is (set, post_init) {
+    session bool set_called;
+    method set(uint64 value) {
+        default(value);
+        set_called = true;
+    }
+    method post_init() {
+        if (!set_called) {
+            hard_reset();
+        }
+    }
+}
+
+template mii_reg is (hard_reset, soft_reset) {
+    is dynamic_reset_value;
+    method soft_reset() {
+        hard_reset();
+    }
+    method hard_reset() {
+        if (!register_defaults[offset / 2].used) {
+            default();
+        } else {
+            set(register_defaults[offset / 2].value);
+        }
+    }
+}
+
+template an_adver_reg {
+    field next_page @ [15]           is unimpl "Next Page";
+    field remote_fault @ [13]        is unimpl "Remote Fault";
+    field ext_next_page @ [12]       is unimpl "Extended Next Page";
+    field ta_asymmetric_pause @ [11]
+        "Technology Ability, Asymmetric PAUSE operation for full duplex links";
+    field ta_pause @ [10]
+        "Technology Ability, PAUSE operation for full duplex links";
+    field ta_100base_t4 @ [9]
+        "Technology Ability, 100BASE-T4";
+    field ta_100base_t_fd @ [8]
+        "Technology Ability, 100BASE-TX Full Duplex";
+    field ta_100base_t @ [7]
+        "Technology Ability, 100BASE-TX";
+    field ta_10base_t_fd @ [6]
+        "Technology Ability, 10BASE-T Full Duplex";
+    field ta_10base_t @ [5]
+        "Technology Ability, 10BASE-T";
+    field selector @ [4:0]           "Selector";
+}
+
+bank mii_regs {
+    method read_reg(int reg_no, bool inquiry)
+        -> (bool, uint16) /* success, reg */ {
+        local bool success = true;
+        local uint16 result;
+        try {
+            if (inquiry) {
+                result = get(reg_no * 2, 2);
+            } else {
+                result = read(reg_no * 2, 0xFFFF, NULL);
+            }
+        } catch {
+            success = false;
+        }
+        return (success, result);
+    }
+
+    method write_reg(int reg_no, uint16 value, bool inquiry) -> (bool) {
+        try {
+            if (inquiry) {
+                set(reg_no * 2, 2, value);
+            } else {
+                write(reg_no * 2, value, 0xFFFF, NULL);
+            }
+        } catch {
+            return false;
+        }
+        return true;
+    }
+
+    register control {
+        method write_register(uint64 value, uint64 enabled_bytes,
+                                     void *aux) {
+            default(value, enabled_bytes, aux);
+            if (reset.val != 0) {
+                reset.val = 0;
+                dev.soft_reset();
+                // reset is modeled as taking zero time, so the value is
+                // cleared immediately.
+
+                if (status.an_ability.val != 0 && an_enable.val != 0) {
+                    auto_negotiation();
+                } else {
+                    status.an_complete.val = 0;
+                }
+            }
+        }
+        field reset @ [15] "PHY reset";
+        field loopback @ [14] "enable loopback mode";
+        field ss_lsb @ [13] is (design_limitation) "speed selection (LSB)";
+        field an_enable @ [12] "enable auto-negotiation process" {
+            is write;
+            method write(uint64 value) {
+                if (value == this.val)
+                    return;
+                if (value != 0 && status.an_ability.val == 0) {
+                    log spec_viol:
+                        "attempt to enable auto-negotiation which is not available";
+                } else {
+                    this.val = value;
+                    if (value != 0) {
+                        auto_negotiation();
+                    } else {
+                        status.an_complete.val = 0;
+                    }
+                }
+            }
+        }
+        field power_down @ [11] is (design_limitation) "power down";
+        field isolate @ [10] is (design_limitation)
+            "electrically isolate PHY from MII";
+        field restart_an @ [9] "restart auto-negotiation" {
+            is write;
+            method write(uint64 value) {
+                if (value == 0)
+                    return;
+                if (status.an_ability.val != 0 && an_enable.val != 0) {
+                    local bool link_status;
+
+                    /* Restart auto-negotiation process */
+                    auto_negotiation();
+
+                    link_status = link_is_up();
+                    if (link_status) {
+                        /* Trigger a link status change when link up */
+                        mac.link_status_changed(address.val, IEEE_link_down);
+                        mac.link_status_changed(address.val, IEEE_link_up);
+                    }
+                } else {
+                    log spec_viol:
+                        "Attempt to enable auto-negotiation which is not available";
+                }
+            }
+        }
+        field duplex_mode @ [8]
+            "1 for Full Duplex, 0 for Half Duplex" {
+            method supports_full_duplex() -> (bool) {
+                return status.hd_100base_x.val != 0 || status.hd_10base.val != 0
+                    || status.hd_100base_t2.val != 0
+                    || (status.ext_status.val != 0 && (ext_status.hd_1000base_x.val != 0
+                                               || ext_status.hd_1000base_t.val != 0));
+            }
+            is write;
+            method write(uint64 val) {
+                if (val != 0 && this.val == 0) {
+                    if (!supports_full_duplex()){
+                        log spec_viol:
+                            "cannot write 1 to %s: full duplex not supported",
+                            qname;
+                        return;
+                    }
+                } else if (val == 0 && this.val != 0) {
+                    if (!supports_full_duplex()) {
+                        log spec_viol:
+                            "cannot write 0 to %s: half duplex not supported",
+                            qname;
+                        return;
+                    }
+                }
+                this.val = val;
+            }
+        }
+        field collision_test @ [7] is unimpl "enable COL signal test";
+        field ss_msb @ [6] is design_limitation "speed selection (MSB)";
+        field unidir_en @ [5] is design_limitation "unidirectional enable";
+        field reserved @ [4:0] is reserved;
+
+        method auto_negotiation() {
+            status.an_complete.val = 1;
+
+            /* Pretend LP has all capabilities */
+            an_link_partner_base_page_ability.ta_asymmetric_pause.val
+                = 1;
+            an_link_partner_base_page_ability.ta_pause.val = 1;
+            an_link_partner_base_page_ability.ta_100base_t4.val = 1;
+            an_link_partner_base_page_ability.ta_100base_t_fd.val = 1;
+            an_link_partner_base_page_ability.ta_100base_t.val = 1;
+            an_link_partner_base_page_ability.ta_10base_t_fd.val = 1;
+            an_link_partner_base_page_ability.ta_10base_t.val = 1;
+            an_link_partner_base_page_ability.selector.val = 1;
+
+            /* Pretend LP is auto-neg capable */
+            an_expansion.link_partner_an_able.val = 1;
+        }
+    }
+
+    register status {
+        param documentation = "Default value of MII Status"
+            + " (MII register address 1)";
+        field t4_100base @ [15] is read_only "100BASE-T4" {
+            param init_val = 1;
+        }
+        field fd_100base_x  @ [14] is read_only "100BASE-X Full Duplex" {
+            param init_val = 1;
+        }
+        field hd_100base_x @ [13] is read_only "100BASE-X Half Duplex" {
+            param init_val = 1;
+        }
+        field fd_10base @ [12] is read_only "10 Mb/s Full Duplex" {
+            param init_val = 1;
+        }
+        field hd_10base @ [11] is read_only "10 Mb/s Half Duplex" {
+            param init_val = 1;
+        }
+        field fd_100base_t2 @ [10] is read_only "100BASE-T2 Full Duplex" {
+            param init_val = 1;
+        }
+        field hd_100base_t2 @ [9] is read_only "100BASE-T2 Half Duplex" {
+            param init_val = 1;
+        }
+        field ext_status @ [8] is read_only "Extended Status available" {
+            param init_val = 1;
+        }
+        field reserved @ [7] is read_only "Reserved";
+        field mf_preamble_suppression @ [6] is read_only
+            "MF Preamble Suppression";
+        field an_complete @ [5] is read_only "Auto-Negotiation Complete";
+        field remote_fault @ [4] is (read_only, design_limitation) "Remote Fault";
+        field an_ability @ [3] is read_only "Auto-Negotiation Ability" {
+            param init_val = 1;
+        }
+        field link_status @ [2] is read_only "Link Status" {
+            param configuration = "pseudo";
+            is get;
+            method get() -> (uint64) {
+                return link_is_up() ? 1 : 0;
+            }
+            is read;
+        }
+        field jabber_detect @ [1] is read_only "Jabber Detect";
+        field extended_capability @ [0] is read_only "Extended Capability";
+    }
+
+    register an_advertisement {
+        field ta_100base_t4   { param init_val = 1; }
+        field ta_100base_t_fd { param init_val = 1; }
+        field ta_100base_t    { param init_val = 1; }
+        field ta_10base_t_fd  { param init_val = 1; }
+        field ta_10base_t     { param init_val = 1; }
+        field selector        { param init_val = 1; }
+    }
+
+    register ext_status {
+        param documentation = "Default value of MII Extended Status"
+            + " (MII register address 15)";
+        field fd_1000base_x @ [15] is read_only "1000BASE-X Full Duplex" {
+            param init_val = 1;
+        }
+        field hd_1000base_x @ [14] is read_only "1000BASE-X Half Duplex" {
+            param init_val = 1;
+        }
+        field fd_1000base_t @ [13] is read_only "1000BASE-T Full Duplex" {
+            param init_val = 1;
+        }
+        field hd_1000base_t @ [12] is read_only "1000BASE-T Half Duplex" {
+            param init_val = 1;
+        }
+        field reserved @ [11:0] is reserved;
+    }
+
+    register an_link_partner_base_page_ability {
+        //field next_page           is unimplemented;
+        field acknowledge @ [14]     is read_only;
+        //field remote_fault        is unimplemented;
+        //field ext_next_page]       is unimplemented;
+        field ta_asymmetric_pause is read_only;
+        field ta_pause            is read_only;
+        field ta_100base_t4       is read_only;
+        field ta_100base_t_fd     is read_only;
+        field ta_100base_t        is read_only;
+        field ta_10base_t_fd      is read_only;
+        field ta_10base_t         is read_only;
+        field selector            is read_only;
+    }
+
+    register an_expansion {
+        field receive_next_page_location_able @ [6]     is read_only;
+        field received_next_page_storage_location @ [5] is read_only;
+        field parallel_detection_fault @ [4]            is read_only;
+        field link_partner_next_page_able @ [3]         is read_only;
+        field next_page_able @ [2]                      is read_only;
+        field page_received @ [1]                       is read_only;
+        field link_partner_an_able @ [0]                is read_only;
+    }
+
+    register ms_control {
+        field receiver_test_mode @ [13] is design_limitation;
+        field ms_manual_configuration_enable @ [12] is design_limitation;
+        field ms_manual_configuration_value @ [11]  is design_limitation;
+        field t2_repeater_dte @ [10]                is design_limitation;
+    }
+    register ms_status {
+        field ms_manual_configuration_fault @ [15]        is read_only;
+        field ms_configuration_resolution_complete @ [14] is read_only;
+        field local_receiver_status @ [13]                is read_only;
+        field remote_receiver_status @ [12]               is read_only;
+        field idle_error_count @ [7:0]                    is read_only;
+    }
+}
+
+method loopback_mode() -> (bool) {
+    return mii_regs.control.loopback.val;
+}

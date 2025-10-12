@@ -1,0 +1,461 @@
+/*
+  ich-chipset-conf.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter chipset_function default undefined;
+parameter HPET_REGS = 0;
+
+connect hpet {
+    parameter documentation = "The High Precision Event Timer mapped through "
+        + "the hptc register";
+    parameter configuration = "optional";
+    interface io_memory;
+}
+
+//This block is mapped into memory space, using the Root Complex Base Address
+//(RCBA)register of the PCI-to-LPC bridge.
+bank cs_conf {
+    parameter documentation = "Chipset configuration registers";
+    parameter limitations = "This is a dummy implementation";
+    parameter function = $chipset_function;
+    parameter overlapping = true;
+    parameter partial = true;
+
+    register vch     size 4 @ 0x0000 "Virtual Channel Capability Header";
+    register vcap1   size 4 @ 0x0004 "Virtual Channel Capability #1";
+    register vcap2   size 4 @ 0x0008 "Virtual Channel Capability #2";
+    register pvc     size 2 @ 0x000c "Port VC Control";
+    register pvs     size 2 @ 0x000e "Port VC Status";
+    register v0cap   size 4 @ 0x0010 "VC 0 Resource Capability";
+    register v0ctl   size 4 @ 0x0014 "VC 0 Resource Control";
+    register v0sts   size 2 @ 0x001a "VC 0 Resource Status";
+    register v1cap   size 4 @ 0x001c "VC 1 Resource Capability";
+    register v1ctl   size 4 @ 0x0020 "VC 1 Resource Control";
+    register v1sts   size 2 @ 0x0026 "VC 1 Resource Status";
+    register pat[64] size 1 @ 0x30 + $i "Port Arbitration Table";
+    register cir1    size 4 @ 0x0088 "Chipset Initialization Register 1";
+    register rec     size 4 @ 0x00ac "Root Error Command";
+    register rctcl   size 4 @ 0x0100 "Root Complex Topology Capability List";
+    register esd     size 4 @ 0x0104 "Element Self Description";
+    register uld     size 4 @ 0x0110 "Upstream Link Descriptor";
+    register ulba    size 8 @ 0x0118 "Upstream Link Base Address";
+    register rp1d    size 4 @ 0x0120 "Root Port 1 Descriptor";
+    register rp1ba   size 8 @ 0x0128 "Root Port 1 Base Address";
+    register rp2d    size 4 @ 0x0130 "Root Port 2 Descriptor";
+    register rp2ba   size 8 @ 0x0138 "Root Port 2 Base Address";
+    register rp3d    size 4 @ 0x0140 "Root Port 3 Descriptor";
+    register rp3ba   size 8 @ 0x0148 "Root Port 3 Base Address";
+    register rp4d    size 4 @ 0x0150 "Root Port 4 Descriptor";
+    register rp4ba   size 8 @ 0x0158 "Root Port 4 Base Address";
+    register hdd     size 4 @ 0x0160 "High Definition Audio Descriptor";
+    register hdba    size 8 @ 0x0168 "High Definition Audio Base Address";
+    register rp5d    size 4 @ 0x0170 "Root Port 5 Descriptor";
+    register rp5ba   size 8 @ 0x0178 "Root Port 5 Base Address";
+    register rp6d    size 4 @ 0x0180 "Root Port 6 Descriptor";
+    register rp6ba   size 8 @ 0x0188 "Root Port 6 Base Address";
+    register ilcl    size 4 @ 0x01a0 "Internal Link Capability List";
+    register lcap    size 4 @ 0x01a4 "Link Capability";
+    register lctl    size 2 @ 0x01a8 "Link Control";
+    register lsts    size 2 @ 0x01aa "Link Status";
+    register olctl   size 2 @ 0x01ac "Other Link Control";
+    register olctl_p size 2 @ 0x01ae "Dummy padding register";
+    register cir2    size 4 @ 0x01f4 "Chipset Initialization Register 2";
+    register cir3    size 4 @ 0x01fc "Chipset Initialization Register 3";
+    register l3ac    size 4 @ 0x0200 "Level 3 Backbone Arbiter Config";
+    register l1ac    size 4 @ 0x020c "Level 1 Backbone Arbiter Config";
+    register unrl    size 4 @ 0x0214 "Upstream Non-posted Request Limits";
+    register umr     size 4 @ 0x0218 "Upstream Minimum Reserved";
+    register bcr     size 4 @ 0x0220 "Backbone Configuration";
+    register rpc     size 4 @ 0x0224 "Root Port Configuration";
+    register bac     size 4 @ 0x0228 "Bandwidth Allocation Configuration";
+    register dmic    size 4 @ 0x0234 "DMI Control";
+    register rpfn    size 4 @ 0x0238 "Root Port FN for PCIe Root Port";
+    register fpss    size 4 @ 0x023c
+        "Function Level Reset Pending Status Summary";
+    register cir13   size 4 @ 0x0f20 "Chipset Initialization Register 13";
+    register cir5    size 4 @ 0x1d40 "Chipset Initialization Register 5";
+    register trsr    size 4 @ 0x1e00 "Trap Status Register";
+    register trcr    size 8 @ 0x1e10 "Trapped Cycle Register";
+    register twdr    size 8 @ 0x1e18 "Trapped Write Data Register";
+    register iotr0   size 8 @ 0x1e80 "I/O Trap Register 0";
+    register iotr1   size 8 @ 0x1e88 "I/O Trap Register 1";
+    register iotr2   size 8 @ 0x1e90 "I/O Trap Register 2";
+    register iotr3   size 8 @ 0x1e98 "I/O Trap Register 3";
+    register dmc     size 4 @ 0x2010 "DMI Miscellaneous Control";
+    register cir6    size 4 @ 0x2024 "Chipset Initialization Register 6";
+    register cir7    size 4 @ 0x2034 "Chipset Initialization Register 7";
+    register tctl    size 1 @ 0x3000 "TCO Control";
+    register d31p    size 4 @ 0x3100 "Device 31 Interrupt Pin";
+    register d30p    size 4 @ 0x3104 "Device 30 Interrupt Pin";
+    register d29p    size 4 @ 0x3108 "Device 29 Interrupt Pin";
+    register d28p    size 4 @ 0x310c "Device 28 Interrupt Pin";
+    register d27p    size 4 @ 0x3110 "Device 27 Interrupt Pin";
+    register d26p    size 4 @ 0x3114 "Device 26 Interrupt Pin";
+    register d25p    size 4 @ 0x3118 "Device 25 Interrupt Pin";
+    register d31r    size 2 @ 0x3140 "Device 31 Interrupt Route";
+    register d30r    size 2 @ 0x3142 "Device 30 Interrupt Route";
+    register d29r    size 2 @ 0x3144 "Device 29 Interrupt Route";
+    register d28r    size 2 @ 0x3146 "Device 28 Interrupt Route";
+    register d27r    size 2 @ 0x3148 "Device 27 Interrupt Route";
+    register d27r_p  size 2 @ 0x314a "Dummy padding register";
+    register d26r    size 2 @ 0x314c "Device 26 Interrupt Route";
+    register d26r_p  size 2 @ 0x314e "Dummy padding register";
+    register d25r    size 2 @ 0x3150 "Device 25 Interrupt Route";
+    register d25r_p  size 2 @ 0x3152 "Dummy padding register";
+    register oic     size 1 @ 0x31ff "Other Interrupt Control";
+    register oic_p   size 3 @ 0x3200 "Dummy padding register";
+    register rc      size 4 @ 0x3400 "RTC Configuration";
+    register hptc    size 4 @ 0x3404 "High Precision Timer Configuration";
+    register gcs     size 4 @ 0x3410 "General Control and Status";
+    register buc     size 1 @ 0x3414 "Backed Up Control";
+    register buc_p   size 3 @ 0x3415 "Dummy padding register";
+    register fd      size 4 @ 0x3418 "Function Disable";
+    register cg      size 4 @ 0x341c "Clock Gating";
+    register pdsw    size 1 @ 0x3420 "Function Disable SUS Well";
+    register cir8    size 4 @ 0x3430 "Chipset Initialization Register 8";
+    register cir9    size 4 @ 0x350c "Chipset Initialization Register 9";
+    register ppo     size 2 @ 0x3524 "USB Port Power Off";
+    register cir10   size 4 @ 0x352c "Chipset Initialization Register 10";
+    register map     size 4 @ 0x35f0 "USB Remap Control";
+    register x38b0   size 4 @ 0x38b0 "Undocumented register";
+    register x38b4   size 4 @ 0x38b4 "Undocumented register";
+    register x38c4   size 1 @ 0x38c4 "Undocumented register";
+    register x38c5   size 1 @ 0x38c5 "Undocumented register";
+    register x38c8   size 2 @ 0x38c8 "Undocumented register";
+
+    register vch     is (unimplemented);
+    register vcap1   is (unimplemented);
+    register vcap2   is (unimplemented);
+    register pvc     is (unimplemented);
+    register pvs     is (unimplemented);
+    register v0cap   is (unimplemented);
+    register v0ctl {
+        parameter hard_reset_value = 0x800000FF;
+        field en  [31]    is (ignore_write);
+        field id  [26:24] is (ignore_write);
+        field pas [19:17] is (ignore);
+        field lat [16]    is (ignore_write);
+        field tvm [7:1]   is (unimplemented);
+    }
+    register v0sts   is (unimplemented);
+    register v1cap {
+        parameter hard_reset_value = 0x03008011;
+        field at  [31:24]   is (ignore_write); 
+        field mts [22:16]   is (unimplemented); 
+        field rts [15]      is (ignore_write); 
+        field aps [14]      is (ignore_write); 
+        field pac [7:0]     is (ignore_write);
+    }
+    register v1ctl   is (unimplemented);
+    register v1sts   is (unimplemented);
+    register pat[64] is (unimplemented);
+    register cir1    is (cs_init_reg) { parameter init_value = 0x109000; }
+    register rec     is (unimplemented);
+    register rctcl   is (unimplemented);
+    register esd     is (unimplemented);
+    register uld     is (unimplemented);
+    register ulba    is (unimplemented);
+    register rp1d    is (unimplemented);
+    register rp1ba   is (unimplemented);
+    register rp2d    is (unimplemented);
+    register rp2ba   is (unimplemented);
+    register rp3d    is (unimplemented);
+    register rp3ba   is (unimplemented);
+    register rp4d    is (unimplemented);
+    register rp4ba   is (unimplemented);
+    register hdd     is (unimplemented);
+    register hdba    is (unimplemented);
+    register rp5d    is (unimplemented);
+    register rp5ba   is (unimplemented);
+    register rp6d    is (unimplemented);
+    register rp6ba   is (unimplemented);
+    register ilcl    is (unimplemented);
+    register lcap {
+        parameter hard_reset_value = 0x12841;
+        field el0  [14:12] is (unimplemented);
+        field apms [11:10] is (unimplemented);
+        field mlw  [ 9:4 ] is (read_only);
+        field mls  [ 3:0 ] is (read_only);
+    }
+    register lctl    is (unimplemented);
+    register lsts    is (unimplemented);
+    register olctl   is (undocumented);
+    register olctl_p is (ignore);
+    register cir2    is (cs_init_reg) { parameter init_value = 0x86000040; }
+    register cir3    is (cs_init_reg) { parameter init_value = 0x60b; }
+    register l3ac    is (undocumented);
+    register l1ac    is (undocumented);
+    register unrl    is (undocumented);
+    register umr     is (undocumented);
+    register bcr     is (cs_init_reg) { parameter init_value = 0x45; }
+    register rpc     is (unimplemented);
+    register bac     is (undocumented);
+    register dmic    is (unimplemented);
+    register rpfn    is (unimplemented);
+    register fpss    is (unimplemented);
+    register cir13 {
+        parameter hard_reset_value = 0xb2b477cc;
+        field r1 [31:20] is (reserved);
+        field f1 [19:16] is (cs_init_reg) { parameter init_value = 5; }
+        field r2 [15:0]  is (reserved);
+    }
+    register cir5    is (cs_init_reg);
+    register trsr    is (silent_unimplemented);
+    register trcr    is (unimplemented);
+    register twdr    is (unimplemented);
+    register iotr0   is (unimplemented);
+    register iotr1   is (unimplemented);
+    register iotr2   is (unimplemented);
+    register iotr3   is (unimplemented);
+    register dmc     is (unimplemented);
+    register cir7    is (unimplemented) {
+        parameter hard_reset_value = 0xb2b477cc;
+        field r1 [31:20] is (reserved);
+        field f1 [19:16] is (cs_init_reg) { parameter init_value = 5; }
+        field r2 [15:0]  is (reserved);
+    }
+    register cir6 {
+        parameter hard_reset_value = 0x0b4030c0;
+        field r1 [31:8] is (reserved);
+        field f1 [7] is (cs_init_reg) { parameter init_value = 0; }
+        field r2 [6:0] is (reserved);
+    }
+    register tctl    is (unimplemented);
+    register d31p is (int_pin_register) {
+        parameter hard_reset_value = 0x03243200;
+        field ttip [27:24] is (int_pin_field);
+        field sip2 [23:20] is (int_pin_field);
+        field smip [15:12] is (int_pin_field);
+        field sip  [11:8]  is (int_pin_field);
+    }
+    register d30p is (silent_constant);
+    register d29p is (int_pin_register) {
+        parameter hard_reset_value = 0x10004321;
+        field eip [31:28] is (int_pin_field);
+        field u3p [15:12] is (int_pin_field);
+        field u2p [11:8]  is (int_pin_field);
+        field u1p [7:4]   is (int_pin_field);
+        field u0p [3:0]   is (int_pin_field);
+    }
+    register d28p is (int_pin_register) {
+        parameter hard_reset_value = 0x00214321;
+        field p6ip [23:20] is (int_pin_field);
+        field p5ip [19:16] is (int_pin_field);
+        field p4ip [15:12] is (int_pin_field);
+        field p3ip [11:8]  is (int_pin_field);
+        field p2ip  [7:4]  is (int_pin_field);
+        field p1ip  [3:0]  is (int_pin_field);
+    }
+    register d27p is (int_pin_register) {
+        parameter hard_reset_value = 0x1;
+        field zip [3:0] is (int_pin_field);
+    }
+    register d26p is (int_pin_register) {
+        parameter hard_reset_value = 0x30000321;
+        field e2ip [31:28] is (int_pin_field);
+        field u2p  [11:8]  is (int_pin_field);
+        field u1p   [7:4]  is (int_pin_field);
+        field u0p   [3:0]  is (int_pin_field);
+    }
+    register d25p is (int_pin_register) {
+        parameter hard_reset_value = 0x1;
+        field lip [3:0] is (int_pin_field);
+    }
+    register d31r    is (int_route_register); 
+    register d30r    is (silent_constant);
+    register d29r    is (int_route_register); 
+    register d28r    is (int_route_register); 
+    register d27r    is (int_route_register); 
+    register d27r_p  is (ignore); 
+    register d26r    is (int_route_register); 
+    register d26r_p  is (ignore); 
+    register d25r    is (int_route_register);
+    register d25r_p  is (ignore); 
+    register oic {
+        field asel [7:4] is (unimplemented);
+        field cen  [1] is (silent_unimplemented);
+        field aen  [0] is (unimplemented);
+    }
+    register oic_p is (ignore);
+    register rc {
+        // reset_value should be 0x0 but ue is always on so
+        // set it to 0x4
+        parameter hard_reset_value = 0x4;
+        field ul [4] is (unimplemented);
+        field ll [3] is (unimplemented);
+        field ue [2] is (unimplemented);
+    }
+    register hptc {
+        field ae [7:7] is (read_write);
+        field as [1:0] is (read_write);
+        method after_write(mop) {
+            if ($hpet.obj == NULL) {
+                log "info", 1: 
+                    "hpet attribute not set, write to '%s' does nothing", 
+                    $qname;
+                return;
+            }
+            if ($ae) {
+                local map_info_t info;
+                memset(&info, 0, sizeoftype(map_info_t));
+                info.length = 0x3ff;
+                info.function = $HPET_REGS;
+                info.base = 0xfed00000 + $as * 0x1000;
+                $pci_bus.pci_bus.remove_map($hpet.obj, Sim_Addr_Space_Memory, $HPET_REGS);
+                $pci_bus.pci_bus.add_map($hpet.obj, Sim_Addr_Space_Memory, NULL, info);
+            } else {
+                $pci_bus.pci_bus.remove_map($hpet.obj, Sim_Addr_Space_Memory, $HPET_REGS);
+            }
+        }
+    }
+    register gcs {
+        parameter hard_reset_value = 0xc00; // Boot from LPC
+        parameter regnum = $offset;
+    }
+    register buc {
+        field lan_dis [5] is (unimplemented);
+        field sdo     [4] is (unimplemented);
+        field cbe     [2] is (unimplemented);
+        field ts      [0] is (unimplemented);
+    }
+    register buc_p   is (ignore);
+    register fd {
+        field sata2 [25] is (fd_field) {parameter d = 31; parameter f = 5;}
+        field throt [24] is (unimplemented);  //Thermal Throttle
+        field pcie6 [21] is (fd_field) {parameter d = 28; parameter f = 5;}
+        field pcie5 [20] is (fd_field) {parameter d = 28; parameter f = 4;}
+        field pcie4 [19] is (fd_field) {parameter d = 28; parameter f = 3;}
+        field pcie3 [18] is (fd_field) {parameter d = 28; parameter f = 2;}
+        field pcie2 [17] is (fd_field) {parameter d = 28; parameter f = 1;}
+        field pcie1 [16] is (fd_field) {parameter d = 28; parameter f = 0;}
+        field ehci1 [15] is (fd_field) {parameter d = 26; parameter f = 7;}
+        field lpc   [14] is (unimplemented);  //LPC bridge
+        field ehci2 [13] is (fd_field) {parameter d = 29; parameter f = 7;}
+        field uhci5 [12] is (fd_field) {parameter d = 26; parameter f = 1;}
+        field uhci4 [11] is (fd_field) {parameter d = 26; parameter f = 0;}
+        field uhci3 [10] is (fd_field) {parameter d = 29; parameter f = 2;}
+        field uhci2  [9] is (fd_field) {parameter d = 29; parameter f = 1;}
+        field uhci1  [8] is (fd_field) {parameter d = 29; parameter f = 0;}
+        field uhci6  [7] {
+            method write(value) {
+                if ($this != value) {
+                    $pci_bus.pci_bus.set_device_status(26 + 3 * $map.uhci6, 
+                                               2 + $map.uhci6, 
+                                               cast(!value, int32));
+                    $this = value;
+                }
+            }
+        }
+        field audio  [4] is (fd_field) {parameter d = 27; parameter f = 0; } 
+        field smbus  [3] is (unimplemented);  //SM Bus
+        field sata1  [2] is (fd_field) {parameter d = 31; parameter f = 2; }
+        field f1     [0] is (cs_init_reg);
+    }
+    register cg {
+        field lpc     [31]    is (unimplemented);
+        field uhci    [29:28] is (unimplemented);
+        field sata3   [27]    is (unimplemented);
+        field sata2   [26]    is (unimplemented);
+        field sata1   [25]    is (unimplemented);
+        field lan     [23]    is (unimplemented);
+        field audiod  [22]    is (unimplemented);
+        field audios  [21]    is (unimplemented);
+        field ehcid   [20]    is (unimplemented);
+        field ehcis   [19]    is (unimplemented);
+        field sata5   [18]    is (unimplemented);
+        field sata4   [17]    is (unimplemented);
+        field pci     [16]    is (unimplemented);
+        field smbcgen [5]     is (unimplemented);
+        field prxgen  [4]     is (unimplemented);
+        field dmirx   [3]     is (unimplemented);
+        field pcitx   [2]     is (unimplemented);
+        field dmitx   [1]     is (unimplemented);
+        field pciers  [0]     is (unimplemented);
+    }
+
+    register pdsw    is (unimplemented);
+    register cir8    is (cs_init_reg) { parameter init_value = 2; }
+    register cir9    is (cs_init_reg) { parameter init_value = 0x8000000; }
+    register ppo     is (unimplemented);
+    register cir10 {
+        parameter hard_reset_value = 0x0008C008;
+        field f1 [17:16] is (cs_init_reg) { parameter init_value = 3; }
+    }
+    register map {
+        // Remapping must be done through component-script
+        field uhci6 [0] is (unimplemented);
+    }
+}
+
+template fd_field {
+    parameter d default undefined;
+    parameter f default undefined;
+    method write(value) {
+        if ($this != value) {
+            $pci_bus.pci_bus.set_device_status($d, $f, cast(!value, int32));
+            $this = value;
+        }
+    }
+}
+
+template cs_init_reg {
+    parameter init_value default 1;
+    method write(value) {
+        $this = value;
+        inline $check_val();
+    }
+
+    method check_val() {
+        if ($this != $init_value) {
+            log "spec_violation", 2: "BIOS must program %s to 0x%x",
+                $qname, $init_value;
+        }
+    }
+}
+
+template int_pin_register {
+    parameter regnum = $offset;
+}
+
+template int_pin_field {
+    method write(value) {
+        if (value>4) {
+            log "spec_violation", 1: "%s value must be within [0:4]", $qname;
+        }
+    }
+}
+
+template int_route_register {
+    parameter hard_reset_value = 0x3210;
+}
+
+template mobile_registers {
+    /* only available for Mobile */
+    register cir11   size 2 @ 0x20c4 "Chipset Initialization Register 11";
+    register cir12   size 2 @ 0x20e4 "Chipset Initialization Register 12";
+    register sbemc3  size 4 @ 0x3300 "Scheduled Break Event C3";
+    register sbemc4  size 4 @ 0x3304 "Scheduled Break Event C4";
+    register cir6 {
+        field f2 [23:21];
+    }
+    register cir11   is (unimplemented);
+    register cir12   is (unimplemented);
+    register sbemc3  is (unimplemented);
+    register sbemc4  is (unimplemented);
+    register lcap {
+        field el1 [17:15] is (read_only);
+    }
+}

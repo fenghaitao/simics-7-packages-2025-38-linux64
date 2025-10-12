@@ -1,0 +1,69 @@
+/*
+  e1000-pci-common.dml
+
+  © 2013 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+bank io_mapped {
+    param documentation =
+        "I/O-Mapped Access to Internal Registers and Memory";
+    param register_size = 4;
+
+    // retained for compatibility with the old PCI library
+    is function_mapped_bank;
+    param function = 1;
+
+    // Register used to access memory mapped registers and memory.
+    // This register contains the address.
+    register addr @ 0x0 is write "Address Register" {
+        method write(uint64 value) {
+            this.val = value & 0xFFFFF;
+        }
+    }
+
+    // Register used to access memory mapped registers and memory.
+    // This register contains the data.
+    register data @ 0x4 is (read, write) "Data Register" {
+        method read() -> (uint64) {
+            local uint64 value;
+            local bool success;
+            local uint64 val;
+
+            try {
+                val = csr.read(addr.val, 0xFFFFFFFF, NULL);
+                value = val & 0xFFFFFFFF;
+            } catch {
+                value = 0;
+            }
+            this.val = value;
+            return value;
+        }
+
+        method write(uint64 value) {
+            local bool success;
+            local uint64 val = value;
+
+            try {
+                csr.write(addr.val, val, 0xFFFFFFFF, NULL);
+            } catch {
+                // ignore
+            }
+            this.val = value;
+        }
+    }
+    register rsv[i < 6] @ 0x8 + i * 4 is (read, write) "Reserved Registers" {
+        method write(uint64 value) { /* do nothing */ }
+        method read() -> (uint64) { return 0xFFFF; }
+    }
+}

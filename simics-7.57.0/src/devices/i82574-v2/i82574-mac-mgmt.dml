@@ -1,0 +1,51 @@
+/*
+  i82574-mac-mgmt.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+bank csr {
+    // MANAGEMENT REGISTERS
+    register wuc       @ 0x05800          "Wakeup Control";
+    register wufc      @ 0x05808          "Wakeup Filter Control";
+    register wus       @ 0x05810          "Wakeup Status";
+    register manc      @ 0x05820          "Management Control";
+    register mfutp[2]  @ 0x05828 + $i * 8 "Management Flex UDP/TCP";
+    register ipav      @ 0x05838          "IP Address Valid";
+    register ip4at[4]  @ 0x05840 + $i * 8 "IPv4 Address Table";
+    register ip6at[4]  @ 0x05880 + $i * 4 "IPv6 Address Table";
+    register wupl      @ 0x05900          "Wakeup Packet Length";
+    register wupm[32]  @ 0x05a00 + $i * 4 "Wakeup Packet Memory";
+    register factps    @ 0x05b30          "Function Active & Power State";
+    register fflt[4]   @ 0x05f00 + $i * 8 "Flexible Filter Length Table";
+    register ffmt[64]  @ 0x09000 + $i * 8 "Flexible Filter Mask Table";
+    register ftft[64]  @ 0x09400 + $i * 8 "Flexible TCO Filter Table";
+    register ffvt[64]  @ 0x09800 + $i * 8 "Flexible Filter Value Table";
+
+    register wuc       is (unimplemented);
+    register wufc      is (unimplemented);
+    register wus       is (unimplemented);
+    register manc      is (unimplemented);
+    register mfutp[2]  is (unimplemented);
+    register ipav      is (unimplemented);
+    register ip4at[4]  is (unimplemented);
+    register ip6at[4]  is (unimplemented);
+    register wupl      is (unimplemented);
+    register wupm[32]  is (unimplemented);
+    register factps    is (unimplemented);
+    register fflt[4]   is (unimplemented);
+    register ffmt[64]  is (unimplemented);
+    register ftft[64]  is (unimplemented);
+    register ffvt[64]  is (unimplemented);
+}

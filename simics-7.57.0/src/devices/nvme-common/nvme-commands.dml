@@ -1,0 +1,206 @@
+
+/*
+  nvme-commands.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+param STATUS_TYPE_GENERIC = 0x0;
+param STATUS_TYPE_COMMAND_SPECIFIC = 0x1;
+
+param STATUS_INVALID_OPC = 0x01;
+param STATUS_INVALID_FIELD = 0x02;
+param STATUS_LBA_OUT_OF_RANGE = 0x80;
+
+// Common command structures:
+
+typedef layout "little-endian" {
+    uint8 opc;
+    bitfields 8 {
+        uint2 psdt @ [7:6];
+        uint4 reserved @ [5:2];
+        uint2 fuse @ [1:0];
+    } cdw0_fields;
+    uint16 cid;
+} cdw0_t;
+
+typedef layout "little-endian" {
+    cdw0_t cdw0;
+    uint32 nsid;
+    uint32 cdw2;
+    uint32 cdw3;
+    uint64 mptr;
+    uint64 dptr_prp1;
+    uint64 dptr_prp2;
+    uint32 cdw10;
+    uint32 cdw11;
+    uint32 cdw12;
+    uint32 cdw13;
+    uint32 cdw14;
+    uint32 cdw15;
+} common_command_format_t;
+
+typedef layout "little-endian" {
+    uint32 dw0;
+    uint32 dw1;
+    uint16 sqhd;
+    uint16 sqid;
+    uint16 cid;
+    bitfields 16 {
+        uint1 dnr @ [15];
+        uint1 m @ [14];
+        uint2 crd @ [13:12];
+        uint3 sct @ [11:9];
+        uint8 sc @ [8:1];
+        uint1 p @ [0];
+    } dw3;
+} common_completion_entry_t;
+
+typedef bitfields 32 {
+    uint8 log_page_identifier @ [23:16];
+    uint8 asynchronous_event_information @ [15:8];
+    uint3 asynchronous_event_type @ [2:0];
+} async_event_dw0_t;
+
+template nvme_command_handler {
+    param opc : uint8;
+
+    shared method handle_command(const common_command_format_t *cmd,
+                                 common_completion_entry_t *rsp,
+                                 error_information_log_entry_t *err);
+
+    // Should return processing time of command
+    shared method processing_time(const common_command_format_t *cmd) ->
+                                 (double) default {
+        return 0.0;
+    }
+}
+
+template nvme_q {
+    param id : uint16;  // Only the admin queue should have an idx value of 0
+    saved uint16 size;  // In number of entries (NOT 0's based)
+    saved uint64 base_addr = 0;  // An io queue is considered to exist if base_addr != 0
+
+    shared method reset() default {
+        size = 0;
+        base_addr = 0;
+    }
+
+    shared method is_created_queue() -> (bool) {
+        return size != 0;
+    }
+}
+
+template submission_q is nvme_q {
+    saved uint16 head;
+    saved uint16 cqid = id;
+
+    shared method read_entry(common_command_format_t *cmd) -> (int) {
+        if (is_empty()) {
+            log spec_viol: "No new entries to read in submission queue %d", id;
+            return -1;
+        }
+        log info, 4: "Reading entry, current sq.head: %d", head;
+        local uint64 queue_off = (head *
+            sizeoftype(common_command_format_t));
+        transport_read(base_addr + queue_off,
+                       sizeoftype(common_command_format_t), cmd);
+
+        if ((head + 1) ==  size) {
+            head = 0;
+        } else {
+            head++;
+        }
+        return 0;
+    }
+
+    shared method is_empty() -> (bool) {
+        return (head == get_submission_q_tail(id));
+    }
+
+    shared method n_available_commands() -> (uint16) {
+        local uint32 tail = get_submission_q_tail(id);
+        if (tail < head) {
+            return tail + size - head;
+        } else {
+            return (tail - head);
+        }
+    }
+
+    shared method cmd_handler(uint8 opc) -> (nvme_command_handler) throws;
+
+    method reset() {
+        default();
+        head = 0;
+        cqid = id;
+    }
+}
+
+template completion_q is nvme_q {
+    saved uint16 tail = 0;
+    saved uint1 phase = 0b1;
+    saved uint16 interrupt_vector = 0;
+    saved uint1 interrupts_enabled = 1;
+
+    shared method write_entry(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err) -> (
+                              int) default {
+        if (is_full()) {
+            log error, 1: "The completion queue with ID %d is full", id;
+            return -1;
+        }
+
+        rsp->cid = cmd->cdw0.cid;
+        rsp->dw3.p = phase;
+
+        local uint64 queue_off = (tail *
+            sizeoftype(common_completion_entry_t));
+        transport_write(base_addr + queue_off,
+                        sizeoftype(common_completion_entry_t), rsp);
+
+        if (rsp->dw3.sc !=0 ) {
+            increment_128(stats.number_of_error_information_log_entries);
+            log_pages.write_lid_error_entry(cmd, rsp);
+        }
+
+        if ((tail + 1) ==  size) {
+            tail = 0;
+            phase = !phase;
+        } else {
+            tail++;
+        }
+        if (interrupts_enabled == 1) {
+            interrupt(interrupt_vector);
+        }
+        return 0;
+    }
+
+    shared method is_full() -> (bool) {
+        local uint32 head = get_completion_q_head(id);
+        if (head == 0) {
+            return ((size - 1) == tail);
+        } else {
+            return ((head - 1) == tail);
+        }
+    }
+
+    method reset() {
+        default();
+        tail = 0;
+        phase = 1;
+        interrupt_vector = 0;
+        interrupts_enabled = 1;
+    }
+}

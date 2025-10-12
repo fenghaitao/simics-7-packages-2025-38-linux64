@@ -1,0 +1,53 @@
+/*
+  ich-pci-common.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+connect chipset_config {
+    parameter documentation = "Chipset configuration registers";
+    parameter configuration = "optional";
+    interface int_register;
+}
+
+/* The ICH PCI-based models reads the chipset configuration registers to
+   determine the correct interrupt_pin value for the current model. Hence the
+   interrupt_pin is a pseudo (read-only) attribute. By preventing the register
+   attribute from being allocated, DML makes sure it's value is not available
+   by reference and the customized get() method must be used. This is also the
+   reason why model must re-implement pci_raise_interrupt() and invoke
+   pci_raise_interrupt_pin() directly.
+
+   See ich-ehci-common.dml, lan/ich-lan.dml and ich-uhci-common.dml for
+   reference on the customized interrupt_pin register. */
+bank pci_config {
+    register interrupt_pin {
+        is noalloc;
+        parameter configuration = "pseudo";
+    }
+    method pci_raise_interrupt() {
+        local uint8 pin;
+        inline $interrupt_pin.get()->(pin);
+        if (pin > 0 && pin < 5) {
+            call $pci_raise_interrupt_pin(pin - 1);
+        }
+    }
+    method pci_lower_interrupt() {
+        local uint8 pin;
+        inline $interrupt_pin.get()->(pin);
+        if (pin > 0 && pin < 5) {
+            call $pci_lower_interrupt_pin(pin - 1);
+        }
+    }
+}

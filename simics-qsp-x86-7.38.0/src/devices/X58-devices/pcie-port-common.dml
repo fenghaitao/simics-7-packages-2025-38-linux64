@@ -1,0 +1,147 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "x58-common.dml";
+
+attribute link_width is uint64_attr {
+    param documentation = "Link Width as reflected in Link Capabilities and"
+        + " Link Status registers";
+    param configuration = "pseudo";
+    param readable = false;
+    method set(attr_value_t new_val) throws {
+        local uint64 val = SIM_attr_integer(new_val);
+        pcie_config.exp.link.cap.mlw.val = val;
+        pcie_config.exp.link.status.nlw.val = val;
+    }
+}
+
+attribute port_index is uint64_attr {
+    param documentation = "The index of this port, must be in the range 1-10";
+    param configuration = "required";
+    method set(attr_value_t attr) throws {
+        local uint64 val = SIM_attr_integer(attr);
+        if (val < 1 || val > 10) {
+            SIM_attribute_error("must be 1-10");
+            throw;
+        }
+        pcie_config.device_id.val = 0x3407 + val;
+        this.val = val;
+    }
+}
+
+is pcie_root_port;
+connect downstream_port {
+    param classname = "pcie-downstream-port-legacy";
+}
+
+implement pcie_device {
+    method hot_reset() default {
+        default();
+        downstream_port.pcie_port_control.hot_reset();
+    }
+}
+
+bank pcie_config is x58_config {
+    param map_prio = port_index.val;
+    register capabilities_ptr { param init_val = 0x40; }
+    register interrupt_pin { param init_val = 0x1; }
+    group prefetchable {
+        register base {
+            field cap { param init_val = 0x1; }
+        }
+        register limit {
+            field cap { param init_val = 0x1; }
+        }
+    }
+    group ssid is ssid_capability {
+        param base = 0x40;
+        param next_ptr = 0x60;
+        register ssvid { param init_val = 0x8086; }
+    }
+
+    group msi is msi_capability {
+        param base = 0x60;
+        param next_ptr = 0x90;
+        param is_64bit_capable = false;
+        param is_pvm_capable = true;
+        param is_emd_capable = false;
+        param num_vectors = 2;
+    }
+
+    group exp is exp_capability {
+        param base = 0x90;
+        param next_ptr = 0xe0;
+        param has_links = true;
+        param has_slots = true;
+        param has_root = true;
+        param dp_type = PCIE_DP_Type_RP;
+
+        register capability {
+            field si {
+                param writable_after_hreset = true;
+            }
+        }
+
+        group device {
+            register cap {
+                field mpss { param init_val = 0x1; }
+                field etfs { param init_val = 0x1; }
+                field rber { param init_val = 0x1; }
+            }
+            register cap2 {
+                field ctrs { param init_val = 0xe; }
+            }
+        }
+        group link {
+            register cap {
+                field mls { param init_val = 0x1; }
+                field mlw is pcie_sticky { param init_val = 0x4; }
+                field aspms { param init_val = 0x3; }
+                field l0el { param init_val = 0x3; }
+                field l1el { param init_val = 0x2; }
+                field sder { param init_val = 0x1; }
+                field dlllar { param init_val = 0x1; }
+                field lbn { param init_val = 0x1; }
+            }
+            register status {
+                field ls { param init_val = 0x1; }
+                field nlw is pcie_sticky { param init_val = 0x4; }
+            }
+        }
+        group slot {
+            register control {
+                field pcc { param init_val = 0x1; }
+                field pic { param init_val = 0x3; }
+                field aic { param init_val = 0x3; }
+            }
+        }
+        group root {
+            register cap {
+                field csv { param init_val = 0x1; }
+            }
+        }
+    }
+
+    group pm is pm_capability {
+        param base = 0xe0;
+        param next_ptr = 0x0;
+        register capability {
+            field pmes { param init_val = 0x19; }
+        }
+        register status_control {
+            field nsr { param init_val = 0x1; }
+        }
+    }
+}

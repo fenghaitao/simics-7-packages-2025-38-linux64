@@ -1,0 +1,117 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/util/os.h>
+%}
+
+import "simics/module-host-config.dml";
+import "simics/base-types.dml";
+import "simics/util/str-vec.dml";
+import "simics/util/strbuf.dml";
+
+extern char *os_absolutify(char const *path, char const *base);
+extern int os_access(char const *path, int mode);
+extern char const *os_basename(char const *path);
+extern int os_chdir(char const *filename);
+extern void os_clean_path(char *path);
+extern void os_close_descriptors(int from, int except);
+extern int os_copy(char const *src, char const *dst);
+extern int os_create_unique_autoremoved_file(char const *name);
+extern uint64 os_current_time(void);
+extern uint64 os_current_time_us(void);
+extern char *os_describe_last_dlerror(void);
+extern char *os_describe_last_error(void);
+extern char const *os_describe_last_socket_error(void);
+extern bool os_dir_contains_path(char const *parent, char const *path);
+extern char *os_dirname(char const *filename);
+extern bool os_dladdr(void *addr, os_dlinfo_t *ret);
+extern int os_dlclose(os_dlhandle_t handle);
+extern os_dlsymbol_t os_dllookup(os_dlhandle_t handle, char const *symbol);
+extern os_dlhandle_t os_dlopen(char const *filename, int flags);
+extern bool os_file_exists(char const *filename);
+extern int os_ftruncate(int fd, uint64 newsize);
+extern int64 os_get_file_size(char const *filename);
+extern int os_get_last_error(void);
+extern char *os_get_library_path(void);
+extern char *os_get_process_binary_path(void);
+extern bool os_get_thread_name(char *name);
+extern char *os_get_user_name(void);
+extern char *os_getcwd(void);
+extern char *os_getcwd_nice(void);
+extern char *os_gethostname(void);
+extern uint32 os_getpid(void);
+extern int64 os_gettid(void);
+extern uint32 os_host_ncpus(void);
+extern uint64 os_host_phys_mem_size(void);
+extern uint64 os_host_virt_mem_size(void);
+extern void os_initialize_sockets(void);
+extern bool os_is_same_file(char const *name1, char const *name2);
+extern bool os_isabs(char const *path);
+extern bool os_isdir(char const *);
+extern bool os_isfile(char const *filename);
+extern int os_last_error_was_error(void);
+extern os_socket_status_t os_last_socket_error(void);
+extern str_vec_t *os_listdir(char const *dir);
+extern int64 os_lseek(int fd, int64 off, int whence);
+extern char *os_make_readable_path(char const *path);
+extern int os_make_sparse(int fd);
+extern void os_millisleep(int t);
+extern int os_mkdir(char const *filename, int mode);
+extern void *os_mmap(int fd, uint64 offset, uint64 size, os_mmap_flags_t flags);
+extern void os_munmap(void *block, uint64 size);
+extern char *os_normalize_path(char const *path);
+extern int os_open(char const *path, int flags, ...);
+extern char *os_path_expand_user(char const *path);
+extern void os_path_join(strbuf_t *path, char const *name);
+extern int os_pread(int fd, void *buf, size_t nbyte, uint64 offset);
+extern int os_pwrite(int fd, void const *buf, size_t nbyte, uint64 offset);
+extern char *os_quote_filename(char const *file);
+extern char *os_realpath(char const *path);
+extern int os_remove(char const *filename);
+extern int os_rename(char const *src, char const *dst);
+extern int os_rmdir(char const *dirname);
+extern void os_rmenv(char const *name);
+extern void os_set_socket_blocking(socket_t s, bool blocking);
+extern int os_set_socket_nodelay(socket_t s);
+extern int os_set_socket_non_blocking(socket_t s);
+extern int os_set_socket_reuseaddr(socket_t s);
+extern void os_set_thread_name(char const *name);
+extern int os_setenv(char const *name, char const *value, int overwrite);
+extern int os_socket_close(socket_t sock);
+extern os_socket_status_t os_socket_get_status(socket_t s);
+extern int os_socket_read(socket_t central_fd, void *buf, int len);
+extern int os_socket_write(socket_t central_fd, void const *buf, int len);
+extern int os_socket_write_non_blocking(socket_t central_fd, void const *buf, int len);
+extern int os_stat(char const *file, os_stat_t *result);
+extern uint64 os_user_cpu_time_us(void);
+extern typedef int os_socket_status_t;
+constant Os_No_Error = 0;
+constant Os_Connection_Refused = 1;
+constant Os_Connection_Reset = 2;
+constant Os_Timed_Out = 3;
+constant Os_Net_Unreach = 4;
+constant Os_Host_Unreach = 5;
+constant Os_In_Progress = 6;
+constant Os_Other = 7;
+extern typedef int os_mmap_flags_t;
+constant Os_Mmap_Read = 1;
+constant Os_Mmap_Write = 2;
+constant Os_Mmap_Exec = 4;
+constant Os_Mmap_Shared = 8;
+extern typedef struct { char const *sym_name; void *sym_base; char const *file_name; void *file_base; } os_dlinfo_t;
+extern typedef struct { uint64 size; uint64 mtime; } os_stat_t;
+extern typedef struct {  } *os_dlhandle_t;
+extern typedef struct {  } *os_dlsymbol_t;

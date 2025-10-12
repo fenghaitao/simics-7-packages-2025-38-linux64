@@ -1,0 +1,123 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_timer_device;
+param desc = "sample timer device";
+param documentation = "This is the <class>sample_timer_device</class> "
+                          + "class, an example of how timer devices "
+                          + "can be written in Simics.";
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+
+connect irq_dev is signal_connect {
+    param documentation = "Device an interrupt should be forwarded to "
+                              + "(interrupt controller)";
+}
+
+bank regs {
+    param register_size = 2;
+    param byte_order = "big-endian";
+    param use_io_memory = false;
+
+    // Records the time when the counter register was started.
+    saved cycles_t counter_start_time;
+    // Records the start value of the counter register.
+    saved cycles_t counter_start_value;
+
+    register counter   @ 0x0 "Counter register";
+    register reference @ 0x2 "Reference counter register";
+    register step      @ 0x4
+        "Counter is incremented every STEP clock cycles. 0 means stopped.";
+    register config    @ 0x6 "Configuration register" {
+        field clear_on_match @ [1]
+            "If 1, counter is cleared when counter matches reference.";
+        field interrupt_enable @ [0]
+            "If 1, interrupt is enabled.";
+    }
+}
+
+bank regs {
+    register counter is (get, read, write) {
+        param configuration = "none";
+
+        method write(uint64 value) {
+            counter_start_value = value;
+            restart();
+        }
+
+        method get() -> (uint64) {
+            if (step.val == 0) {
+                return counter_start_value;
+            }
+
+            local cycles_t now = SIM_cycle_count(dev.obj);
+            return (now - counter_start_time) / step.val
+                + counter_start_value;
+        }
+
+        method read() -> (uint64) {
+            return get();
+        }
+
+        method restart() {
+            counter_start_time = SIM_cycle_count(dev.obj);
+            update_event();
+        }
+
+        method on_match() {
+            log info, 4: "Counter matches reference";
+
+            if (regs.config.clear_on_match.val) {
+                regs.counter.write(0);
+            }
+
+            if (regs.config.interrupt_enable.val) {
+                log info, 4: "Raising interrupt";
+
+                irq_dev.set_level(1);
+                irq_dev.set_level(0);
+            }
+        }
+
+        method update_event() {
+            cancel_after();
+
+            if (step.val == 0)
+                return;
+
+            local cycles_t now = SIM_cycle_count(dev.obj);
+            local cycles_t cycles_left =
+                (reference.val - counter_start_value) * step.val
+                - (now - counter_start_time);
+            after cycles_left cycles: on_match();
+        }
+    }
+
+    register step is write {
+        method write(uint64 value) {
+            default(value);
+            counter.restart();
+        }
+    }
+
+    register reference is write {
+        // after changing the reference register the event should be updated
+        method write(uint64 value) {
+            default(value);
+            counter.update_event();
+        }
+    }
+}

@@ -1,0 +1,188 @@
+/*
+  simple-i2c-slave.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+// This module contains types needed when using or implementing the
+// i2c interface
+
+dml 1.2;
+
+// This template can help users updating old i2c slaves which use 
+// i2c_bus interface to new i2c slaves. The new i2c slaves will use
+// i2c_link_v2 interface instead.
+// Updating process include:
+// a. compare with the template below, fill in the operation methods:
+//    i2c_start_request_read, i2c_start_request_write, i2c_read_request,
+//    i2c_write_request, i2c_stop_request, get_slave_address
+// b. include the template and remove the old implementation of i2c_device
+// c. change the configuration of i2c_bus to "optional"
+// d. if there is any other places calling i2c_bus connector, make a similar
+//    call to i2c_link_v2 connector.
+// e. call the i2c_register_address() method from post_init()
+template simple_i2c_slave {
+    connect i2c_link_v2 {
+        parameter desc = "model of I2C link connection";
+        parameter configuration = "optional";
+        interface i2c_master_v2;
+    }
+
+    // Here we will simplify the code by assume i2c_bus will always follow
+    // I2C protocol, so no checking for state
+    implement i2c_device {
+        method set_state(i2c_device_state_t state, uint8 address) -> (int ret) {
+            log info, 4: "i2c_device.set_state(%d), address(0x%x)",
+                state, address;
+
+            ret = 1;
+            switch (state) {
+            case I2C_idle:
+                // Equivalent to stop request in i2c_slave interface
+                call $i2c_stop_request();
+                break;
+            case I2C_slave_transmit:
+            case I2C_slave_receive:
+                // Equivalent to start request
+                call $i2c_start_request(address) -> (ret);
+                break;
+            case I2C_master_transmit:
+            case I2C_master_receive:
+                log error:
+                    "slave device does not handle master transfers";
+                return;
+            default:
+                assert false;
+            }
+        }
+
+        method read_data() -> (uint8 read_val) {
+            log info, 4: "i2c_device.read_data";
+            // Equivalent to read request in i2c_slave interface
+            call $i2c_read_request() -> (read_val);
+        }
+
+        method write_data(uint8 value) {
+            log info, 4: "i2c_device.write_data";
+            // Equivalent to write request in i2c_slave interface
+            local i2c_status_t ack;
+            call $i2c_write_request(value) -> (ack);
+
+            if (ack == I2C_status_success)
+                log info, 4: "writing data (%d) is successful", value;
+            else
+                log info, 4: "writing data (%d) is unsuccessful", value;
+        }
+    }
+
+    implement i2c_slave_v2 {
+        method start(uint8 address) {
+            log info, 4: "i2c_slave.start_request(0x%x)", address;
+
+            // start request
+            local i2c_status_t ack;
+            call $i2c_start_request(address) -> (ack);
+
+            // start response
+            if ($i2c_link_v2.obj != NULL) {
+                $i2c_link_v2.i2c_master_v2.acknowledge(
+                    ack == I2C_status_success ? I2C_ack : I2C_noack);
+            }
+            else
+                log error: "No connection with I2C link/bus.";
+        }
+
+        method read() {
+            // read data
+            local uint8 val;
+            call $i2c_read_request() -> (val);
+
+            // read response
+            if ($i2c_link_v2.obj != NULL) {
+                $i2c_link_v2.i2c_master_v2.read_response(val);
+            }
+            else
+                log error: "No connection with I2C link/bus.";
+        }
+
+        method write(uint8 value) {
+            // write data
+            local i2c_status_t ack;
+            call $i2c_write_request(value) -> (ack);
+
+            // write response
+            if ($i2c_link_v2.obj != NULL) {
+                $i2c_link_v2.i2c_master_v2.acknowledge(
+                    ack == I2C_status_success ? I2C_ack : I2C_noack);
+            }
+            else
+                log error: "No connection with I2C link/bus.";
+
+        }
+
+        method stop() {
+            // terminate a transaction
+            call $i2c_stop_request();
+        }
+
+        method addresses() -> (attr_value_t result) {
+            local uint8 addr;
+            local bool enable;
+            call $get_slave_address() -> (enable, addr);
+            result = SIM_make_attr_list(
+                2, SIM_make_attr_uint64(addr * 2),
+                SIM_make_attr_uint64(addr * 2 + 1));
+        }
+    }
+
+    // Slave methods
+    method i2c_start_request(uint8 addr) -> (i2c_status_t ack) default {
+        local uint8 address;
+        local bool enable;
+        call $get_slave_address() -> (enable, address);
+        if (!enable || address != addr[7:1]) {
+            ack = I2C_status_noack;
+        } else if (addr[0] == 1) {
+            // start request read
+            call $i2c_start_request_read() -> (ack);
+        } else {
+            // start request write
+            call $i2c_start_request_write() -> (ack);
+        }
+    }
+    method i2c_start_request_read() -> (i2c_status_t ack) default {}
+    method i2c_start_request_write() -> (i2c_status_t ack) default {}
+    method i2c_read_request() -> (uint8 value) default {}
+    method i2c_write_request(uint8 value) -> (i2c_status_t ack) default {}
+    method i2c_stop_request() default {}
+
+    method i2c_register_address(uint8 addr) {
+        if ($i2c_bus.obj != NULL) {
+            SIM_require_object($i2c_bus.obj);
+            $i2c_bus.i2c_bus.register_device($obj, addr, 0xff, 
+                                             I2C_flag_exclusive);
+        } else if ($i2c_link_v2.obj == NULL)
+            log error: "No connection with I2C link/bus.";
+    }
+    method i2c_unregister_address(uint8 addr) {
+        if ($i2c_bus.obj != NULL) {
+            $i2c_bus.i2c_bus.unregister_device($obj, addr, 0xff, 
+                                               I2C_flag_exclusive);
+        } else if ($i2c_link_v2.obj == NULL) {
+            log error: "No connection with I2C link/bus.";
+        }
+    }
+    method get_slave_address() -> (bool enable, uint8 addr) default {
+        enable = false;
+        addr = -1;
+    }
+}

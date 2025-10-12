@@ -1,0 +1,293 @@
+/*
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device cdrom_image;
+
+import "simics/model-iface/cdrom.dml";
+import "simics/model-iface/image.dml";
+
+parameter desc = "model of CD-ROM media backed by image";
+
+parameter documentation = "This class allows an image containing the contents"
+    + " of a CD-ROM in ISO9660 format to be accessible from the simulated"
+    + " target machine. This is a convenient way to import files into the"
+    + " simulated system.";
+
+parameter limitations = "Multi track images are not supported."
+    + " Read raw block is not supported.";
+
+header %{
+    static bool str_equal(const char *str1, const char *str2) {
+        if (str1 == str2)    // Same ptr or NULL
+            return true;
+
+        if ((str1 == NULL && str2 != NULL) || (str2 == NULL && str1 != NULL))
+            return false;
+
+        return strcmp(str1, str2) == 0;
+    }
+
+%}
+
+extern int fill_toc_template(uint8 *buf);
+extern bool str_equal(const char *str1, const char *str2);
+
+struct msf_addr_t {
+    uint8 m;
+    uint8 s;
+    uint8 f;
+}
+
+constant BLOCK_SIZE = 2048;
+constant FRAMES_PER_SECOND = 75;
+constant FRAMES_PER_MINUTE = FRAMES_PER_SECOND * 60;
+
+connect image {
+    interface image;
+    parameter documentation =
+        "An image object that holds the data on the CD-ROM.";
+
+    data int64 capacity;     // Image size / block size (2048)
+
+    method get_obj_port(attr_value_t value)
+        -> (conf_object_t *obj, const char *port)  {
+        if (SIM_attr_is_object(value)) {
+            obj = SIM_attr_object(value);
+        } else if (SIM_attr_is_list(value)) {
+            obj  = SIM_attr_object(SIM_attr_list_item(value, 0));
+            port = SIM_attr_string(SIM_attr_list_item(value, 1));
+        } else {
+            assert SIM_attr_is_nil(value);
+        }
+    }
+
+    method verify_interfaces(conf_object_t *obj, const char *port) {
+        if (obj)
+            foreach iface in ($interfaces)
+                inline iface.verify(obj, port);
+    }
+
+    method commit(conf_object_t *obj, const char *port) {
+        $obj = obj;
+        delete $port;
+        $port = port ? MM_STRDUP(port) : NULL;
+        foreach iface in ($interfaces)
+            inline iface.connect(obj, port);
+    }
+
+    method set_attribute(attr_value_t value) -> (set_error_t err) {
+        err = Sim_Set_Ok;
+
+        local conf_object_t *obj;
+        local const char *port;
+        call $get_obj_port(value) -> (obj, port);
+
+        if (obj == $obj && str_equal(port, $port))
+            return;     // No change, exit early
+
+        if ($in_use) {
+            log error: "The image may not be changed while the"
+                + " cdrom-image is in use.";
+            err = Sim_Set_Illegal_Value;
+            return;
+        }
+
+        try {
+            call $verify_interfaces(obj, port);
+        } catch {
+            err = Sim_Set_Interface_Not_Found;
+            return;
+        }
+
+        call $commit(obj, port);
+
+        if ($obj && SIM_object_is_configured($obj))
+            call $update_capacity;
+    }
+
+    method update_capacity {
+        if ($obj) {
+            local uint64 size = $image.size();
+            $capacity = size / BLOCK_SIZE;
+            if ($capacity * BLOCK_SIZE == size)     // Not an ISO if false
+                return;
+
+            log error: "The image does not appear to be of an ISO."
+                + " Its size is not divisible by 2048.";
+            $capacity = 0;
+            throw;
+        }
+
+        $capacity = 0;
+    }
+}
+
+attribute in_use {
+    // Must keep track of if this is in use since controller will not re-insert
+    // the media after a checkpoint restore.
+    parameter allocate_type = "bool";
+    parameter internal = true;
+}
+
+attribute capacity {
+    parameter documentation = "The capacity of the CD-ROM in blocks.";
+    parameter configuration = "pseudo";
+    parameter type = "i";
+    method get() -> (value) {
+        value = SIM_make_attr_int64($image.capacity);
+    }
+}
+
+/*
+  Accessing sections of a cd is in one of two formats logical block address
+  (LBA) or (Minutes, Sectors, Frames) (MSF). A logical block address is
+  expressed in frames (starting at 0). The start of MSF addressing is biased
+  150 frames (2 seconds) into the cd. Thus an msf of 0:0:0 is an lba address of
+  frame 149.
+
+  Reference: http://linux-sxs.org/bedtime/cdapi.html
+*/
+method lba_to_msf(int lba) -> (msf_addr_t msf)
+{
+    if (lba >= 1151849) {
+        msf.f = 74;
+        msf.s = 59;
+        msf.m = 255;
+    } else {
+        lba += 150;     // MSF addressing is biased 150 frames
+        lba &= 0xffffff;     // truncate to 24 bits (from Linux source code)
+        msf.m = lba / FRAMES_PER_MINUTE;
+        msf.s = (lba - msf.m * FRAMES_PER_MINUTE) / FRAMES_PER_SECOND;
+        msf.f = lba % FRAMES_PER_SECOND;
+    }
+}
+
+method verify_in_use() {
+    if (!$in_use) {
+        log error: "Access to CD-ROM media that has not been inserted.";
+    }
+}
+
+method write_track_head(uint8 *buf, int first, int last) -> (int next_offset)
+{
+    buf[0] = 0; // size (hi byte)
+    buf[1] = 2; // size (lo byte) next two bytes in header
+    buf[2] = first;
+    buf[3] = last;
+    next_offset = 4;
+}
+
+method write_track_desc(uint8 *buf, int offset, int track,
+                        int msf, uint32 lba) -> (int next_offset)
+{
+    // add descriptor size (8 bytes) to total reply size
+    assert buf[1] + 8 < 256;
+    buf[1] += 8;
+    
+    buf[offset + 0] = 0;           // Reserved
+    buf[offset + 1] = 0x14;        // ADR|Control: Copyable digital data
+    buf[offset + 2] = track;       // Track number
+    buf[offset + 3] = 0;           // Reserved
+
+    // bytes 4 - 7 contain the address to the track
+    if (msf != 0) {
+        local msf_addr_t addr;
+        call $lba_to_msf(lba) -> (addr);
+        buf[offset + 4] = 0;
+        buf[offset + 5] = addr.m;
+        buf[offset + 6] = addr.s;
+        buf[offset + 7] = addr.f;
+    } else {
+        buf[offset + 4] = (lba >> 24) & 0xff;
+        buf[offset + 5] = (lba >> 16) & 0xff;
+        buf[offset + 6] = (lba >> 8) & 0xff;
+        buf[offset + 7] = lba & 0xff;
+    }
+    next_offset = offset + 8;
+}
+
+implement cdrom_media {
+    method read_toc(uint8 *buf, int msf, int start_track) -> (int len) {
+        call $verify_in_use;
+
+        // 0 means first track, 0xaa means lead-out area
+        if (start_track != 0 && start_track != 1 && start_track != 0xaa) {
+            log unimpl: "TOC requested for non-existent track %d", start_track;
+            len = -1;
+            return;
+        } else {
+            log info, 2: "Reading TOC for track %d", start_track;
+        }
+
+        // header: track 1 is the first and last track on the disc
+        call $write_track_head(buf, 1, 1) -> (len);
+        
+        // descriptor for track 1 (i.e. the actual data)
+        call $write_track_desc(buf, len, 1, msf, 0) -> (len);
+
+        // descriptor for lead-out area that starts directly after track 1
+        call $write_track_desc(buf, len, 0xaa, msf, $image.capacity) -> (len);
+    }
+
+    method capacity -> (uint32 cap) {
+        call $verify_in_use;
+
+        cap = $image.capacity;
+    }
+
+    method read_block(uint8 *buf, int lba) -> (int len) {
+        call $verify_in_use;
+
+        if (lba < $image.capacity) {
+            local int64 offset = cast(lba, int64) * BLOCK_SIZE;
+            $image.image.read(buf, offset, BLOCK_SIZE);
+            len = BLOCK_SIZE;
+        } else {
+            log error: "Attempt to read block %d outside ISO image"
+                + " which only has %u blocks.", lba, $image.capacity;
+            len = -1;
+        }
+    }
+
+    method insert -> (int result) {
+        result = -1;
+
+        if (!$image.obj) {
+            log error: "Cannot insert media without image.";
+            return;
+        }
+
+        if ($in_use) {
+            log error: "Media already inserted.";
+            return;
+        }
+
+        $in_use = true;
+        result = 0;
+    }
+
+    method eject {
+        if (!$in_use)
+            log error: "Trying to eject media that is not in use.";
+        $in_use = false;
+    }
+
+    // Interface function not implemented:
+    // method read_raw_block(uint8 *buf, int lba) -> (int len)
+}
+
+method post_init() {
+    call $image.update_capacity;
+}

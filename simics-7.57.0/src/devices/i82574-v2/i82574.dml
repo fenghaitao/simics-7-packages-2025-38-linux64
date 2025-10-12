@@ -1,0 +1,213 @@
+/*
+* i82574.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device i82574_v2;
+
+parameter desc = "model of Intel® 82574 Gb Ethernet controller";
+parameter documentation = "Intel® 82574 PCIe Gigabit Ethernet Controller.";
+
+parameter I82574_ETHERNET_LAN = true;
+parameter INTERRUPT_DELAY_ENABLE = true;
+parameter TCPIP_TX_CONTEXT = true;
+parameter NUM_TRANSMIT_QUEUES = 2;
+parameter NUM_RECEIVE_QUEUES = 2;
+parameter VLAN_PACKET_FILTER = true;
+parameter HAS_EEPROM = true;
+parameter HAS_ACK_ACCELERATION = true;
+parameter HAS_RSS = true;
+parameter HAS_RSS_CPU_SELECTION = false;
+parameter HAS_SMALL_PACKET_DETECTION = true;
+parameter HAS_MTDq1 = false;
+parameter HAS_TIMESYNC = true;
+parameter HAS_INTERRUPT_AUTOMASKING = true;
+parameter HAS_CEXTERR_REGISTER = true;
+parameter HAS_TX_INTERRUPT_DELAY = true;
+parameter HAS_TARC = true;
+parameter HAS_TX_THRESHOLD_INTERRUPTS = true;
+
+/* This is wrong, but the Linux drivers still access those registers */
+parameter HAS_INTERRUPT_STATISTICS = true;
+
+import "utility.dml";
+
+import "pci/common.dml";
+
+import "i82574-mac.dml";
+import "i82574-pci-common.dml";
+
+parameter limitations = $e1000_limitations
+    + "<li>MSI-X is unimplemented.</li>"
+    + "<li>System management via SMBus or NC-SI connection to management "
+    + "controller is unimplemented.</li>"
+    + "<li>Checksum offloading for Ethernet II and SNAP packets is "
+    + "unimplemented.</li>"
+    + "<li>Checksum verification acceleration for fragmented UDP packets is "
+    + "unimplemented (RXCSUM.IPPCSE).</li>"
+    + "</ul>";
+
+connect flash {
+    parameter documentation = "Connection to the SPI interface.";
+    parameter configuration = "required";
+}
+
+attribute flash_func {
+    parameter documentation = "Function number of GbE SPI flash program register bank";
+    parameter configuration = "required";
+    parameter allocate_type = "int32";
+}
+
+parameter pci_hotplug = "true";
+is pcie_device;
+
+bank pci_config {
+    parameter base_address_registers = ["membar", "flashbar", "iobar", "msixbar"];
+
+    /* --------------------------------------------------------------
+       BASE PCI CONFIGURATION SPACE REGISTERS
+       -------------------------------------------------------------- */
+
+    register vendor_id { parameter hard_reset_value = 0x8086; }
+    register device_id { parameter hard_reset_value = 0x10d3; }
+    register status {
+        field c { parameter hard_reset_value = 1; }
+    }
+    register revision_id { parameter hard_reset_value = 0x00; }
+    register class_code { parameter hard_reset_value = 0x020000; }
+
+    register membar @ 0x10 is (memory_base_address_32) {
+        parameter desc = "Memory BAR Base Address";
+        parameter size_bits = 17; // 2^17 = 128 KB
+        parameter map_func = 0; // internal csr bank
+    }
+
+    register flashbar @ 0x14 is (memory_base_address_32) {
+        parameter desc = "Memory Base Address B";
+        parameter size_bits = 12; // ?
+        parameter map_func = 0;
+
+        method remove_map() {
+            local int succ;
+            succ = $pci_bus.pci_bus.remove_map($flash.obj, Sim_Addr_Space_Memory, $flash_func);
+            log "info", 2, PCI_config: "%s to remove memory mapping for bank %s of SPI flash %s",
+                (succ == 1) ? "succeeded" : "failed", $flash.port, SIM_object_name($flash.obj);
+        }
+
+        method add_map() {
+            local int        succ;
+            local map_info_t info;
+
+            memset(&info, 0, sizeoftype(map_info_t));
+            info.function = $flash_func;
+            inline $pci_mapping_base() -> (info.base);
+            inline $pci_mapping_length() -> (info.length);
+            succ = $pci_bus.pci_bus.add_map($flash.obj, Sim_Addr_Space_Memory, NULL, info);
+            log "info", 2, PCI_config: "%s to map bank %s of SPI flash %s to memory space at 0x%x",
+                (succ == 1) ? "succeeded" : "failed", $flash.port, SIM_object_name($flash.obj), info.base;
+        }
+    }
+
+    register iobar @ 0x18 is (io_base_address) {
+        parameter desc = "IO Bar Base Address";
+        parameter size_bits = 5; // 2^5 = 32 bytes
+        parameter map_func = 1; // io-window
+    }
+
+    register msixbar @ 0x1C is (memory_base_address_32) {
+        parameter desc = "MSI-X Bar Base Address";
+        parameter size_bits = 14;
+        parameter map_func = 0; // internal msi-x offset in csr bank
+        method remove_map() {
+        }
+
+        method add_map() {
+            log "unimplemented", 2: "MSI-X is unimplemented in %s",  $dev.qname;
+        }
+    }
+
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+
+    register subsystem_vendor_id { parameter hard_reset_value = 0x8086; }
+    register subsystem_id { parameter hard_reset_value = 0x0000; }
+    register interrupt_line { parameter hard_reset_value = 0x00; }
+    register interrupt_pin { parameter hard_reset_value = 0x01; }
+    register min_gnt { parameter hard_reset_value = 0x00; }
+    register max_lat { parameter hard_reset_value = 0x00; }
+
+    // Assume no Flash memory. If a Flash memory is attached, this register
+    // define the address and size information for boot-time access
+    // register expansion_rom_base;
+
+    register capabilities_ptr { parameter value = 0xc8; }
+
+    /* --------------------------------------------------------------
+       PCI POWER MANAGEMENT REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+
+    is defining_pci_pm_capability;
+    parameter pm_offset = 0xc8;
+    parameter pm_next_ptr = 0xd0;
+
+    register pm_capabilities {
+        field dsi { parameter hard_reset_value = 0b1; }
+    }
+
+    /* --------------------------------------------------------------
+       MESSAGE SIGNALED INTERRUPT (MSI) CONFIGURATION REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+
+    is defining_pci_msi64_capability;
+    parameter msi_offset    = 0xd0;
+    parameter msi_next_ptr  = 0xe0;
+
+    /* --------------------------------------------------------------
+       PCIE CONFIGURATION REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+    is defining_i82574_pci_express_capability;
+    parameter exp_offset = 0xe0;
+    parameter exp_next_ptr = 0xa0;
+
+    /* --------------------------------------------------------------
+       MSI-X CONFIGURATION REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+    is defining_i82574_msi_extended_capability;
+    parameter ext_offset = 0xa0;
+    parameter ext_next_ptr = 0x00;
+
+    /* --------------------------------------------------------------
+       PCIE EXTENDED CONFIGURATION SPACE
+       ADVANCED ERROR REPORTING CAPABILITY
+       -------------------------------------------------------------- */
+    is defining_pcie_aer_capability_v2;
+    parameter aer_offset = 0x100;
+    parameter aer_next_ptr = 0x140;	// Not a documented value
+
+    /* --------------------------------------------------------------
+       DEVICE SERIAL NUMBER CAPABILITY
+       -------------------------------------------------------------- */
+    is defining_pcie_dsn_capability_v1;
+    parameter dsn_offset = 0x140;	// Not a documented value
+    parameter dsn_next_ptr = 0x0;
+    // dsn_serial_number (low and high) are based on the MAC address and are loaded from EEPROM
+
+    method soft_reset() {
+        // PCI config space is not affected by software reset
+    }
+}
+
+method init() {
+    inline $tx_init();
+}

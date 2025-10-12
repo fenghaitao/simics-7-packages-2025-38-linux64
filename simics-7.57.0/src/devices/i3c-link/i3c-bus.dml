@@ -1,0 +1,736 @@
+/*
+  © 2017 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i3c_bus;
+
+import "utility.dml";
+import "simics/devs/i3c.dml";
+import "i3c-bus-utils.dml";
+
+is hreset;
+
+header %{
+    #include <simics/util/vect.h>
+%}
+extern void VINIT(...);
+extern int VLEN(...);
+extern uint8* VVEC(...);
+extern void VRESIZE(...);
+extern void VRESIZE_FREE(...);
+extern void VADD(...);
+extern void VFREE(...);
+extern void VCOPY(...);
+
+param desc = "model of I3C bus";
+param documentation = "The <class>i3c_bus</class> allows to attach "
+                        + "up to 16 I3C devices on it for I3C communicating.";
+
+param DEV_NBR           = 16;
+param INVALID_PORT      = 0xff;
+param INVALID_ADDRESS   = 0xff;
+param INVALID_COMMAND   = 0xff;
+param I3C_Addr_Bcst     = 0x7e;
+param I3C_Addr_Hot_Join = 0x02;
+param CCC_ENTDAA        = 0x07;
+param CCC_SETDASA       = 0x87;  // Set Dynamic Address from Static Address
+param CCC_GETACCMST     = 0x91;
+
+param MAX_UINT64 = ~0;
+
+attribute status is (read_only_attr) {
+    param documentation = "Current i3c bus status";
+    param type = "s";
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_string(i3c_bus_status_name(i3c.status.val));
+    }
+}
+
+attribute known_address {
+    param documentation = "Known slave address for the bus";
+    is known_address_attr;
+}
+
+connect i3c_devices[i < DEV_NBR] {
+    param documentation = "Connect to I3C devices";
+    interface i3c_master { param required = false; }
+    interface i3c_slave { param required = false; }
+    interface i3c_daa_snoop { param required = false; }
+}
+
+port I3C[i < DEV_NBR] {
+    implement i3c_slave {
+        method ibi_start() {
+            i3c.ibi_start(i);
+        }
+        method ibi_acknowledge(i3c_ack_t ack) {
+            i3c.ibi_acknowledge(i, ack);
+        }
+        method start(uint8 address) {
+            i3c.start_request(i, address);
+        }
+        method read() {
+            i3c.master_read(i);
+        }
+        method daa_read() {
+            i3c.master_daa_read(i);
+        }
+        method write(uint8 data) {
+            i3c.master_write(i, data);
+        }
+        method sdr_write(bytes_t buffer) {
+            i3c.master_sdr_write(i, buffer);
+        }
+        method stop() {
+            i3c.master_stop(i);
+        }
+    }
+    implement i3c_master {
+        method ibi_request() {
+            i3c.ibi_request(i);
+        }
+        method ibi_address(uint8 address) {
+            i3c.ibi_address(i, address);
+        }
+        method acknowledge(i3c_ack_t ack) {
+            i3c.acknowledge(i, ack);
+        }
+        method read_response(uint8 data, bool more) {
+            i3c.slave_read_response(i, data, more);
+        }
+        method daa_response(uint64 uid, uint8 bcr, uint8 dcr) {
+            i3c.slave_daa_data(i, uid, bcr, dcr);
+        }
+    }
+    implement i3c_daa_snoop {
+        method assigned_address(uint64 uid, uint8 bcr, uint8 dcr,
+                                uint8 address) {
+            log info, 4:
+                "DAA broadcast (DAA data 0x%x, address 0x%x) from port %d",
+                (uid << 16) | (bcr << 8) | dcr, address, i;
+            i3c.assigned_address(i, uid, bcr, dcr, address);
+        }
+    }
+}
+
+bank i3c {
+    param register_size = 2;
+    param mappable = false;
+
+    register status size 1        is (unmapped) "I3C bus status";
+    register address size 1       is (unmapped) "Last address";
+    register command size 1       is (unmapped) "I3C command";
+    register main_master          is (unmapped) "Main master";
+    register new_master           is (unmapped) "New current master";
+    register active_slaves        is (unmapped) "Active slave devices";
+    register responded            is (unmapped) "Responded slaves";
+    register ibi_requests         is (unmapped) "IBI request slaves";
+    register data[i < DEV_NBR] size 8 is (unmapped) "Data registers";
+    register daa_data size 8      is (unmapped) "The winner DAA data";
+    register started_slaves       is (unmapped) "Slaves received start";
+    register ibi_slaves         is (unmapped) "";
+
+    register command is (hard_reset) { param init_val = INVALID_COMMAND; }
+    register main_master { param init_val = INVALID_PORT; }
+    register new_master is (hard_reset) { param init_val = INVALID_PORT; }
+    register daa_data {
+        field uid @ [63:16];
+        field bcr @ [15:8];
+        field dcr @ [7:0];
+    }
+    register data[i < DEV_NBR] is (hard_reset) {
+        param init_val = MAX_UINT64;
+    }
+}
+
+
+bank i3c {
+    // DAA snoop operation
+    method assigned_address(int idx, uint64 uid, uint8 bcr, uint8 dcr,
+                            uint8 address) {
+        local int i;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (!i3c_devices[i].i3c_daa_snoop.val || i == idx)
+                continue;
+
+             log info, 4: "forward DAA broadcast to port %d", i;
+             i3c_devices[i].i3c_daa_snoop.assigned_address(uid, bcr,
+                                                            dcr, address);
+        }
+    }
+
+    // IBI operations
+    method ibi_request(int idx) {
+        if (main_master.val == INVALID_PORT || idx == main_master.val) {
+            log spec_viol, 1: "invalid IBI request from port %d", idx;
+            return;
+        }
+
+        log info, 3: "received IBI request from port %d", idx;
+        ibi_requests.val[idx] = 1;
+        if (status.val == St_Idle)
+            forward_ibi_request();
+    }
+
+    method ibi_start(int idx) {
+        if (idx != main_master.val || status.val != St_Wait_IBI_Start) {
+            log spec_viol, 1: "unexpected IBI start from port %d", idx;
+            return;
+        }
+
+        log info, 3: "received IBI start from port %d", idx;
+
+        local int i;
+        status.val = St_Wait_IBI_Address;
+        clear_response_status();
+        for (i = 0; i < DEV_NBR; i++) {
+            if (ibi_requests.val[i] == 1) {
+                log info, 3: "forwarding IBI start to port %d", i;
+                i3c_devices[i].i3c_slave.ibi_start();
+            }
+        }
+    }
+
+    method ibi_address(int idx, uint8 address) {
+        if (idx == main_master.val || status.val != St_Wait_IBI_Address) {
+            log spec_viol, 1:
+                "invalid IBI address(0x%x) from port %d for status.val %s",
+                address, idx, i3c_bus_status_name(status.val);
+            return;
+        }
+
+        log info, 3: "received IBI address (0x%x) from port %d", address, idx;
+
+        responded.val[idx] = 1;
+        data[idx].val = address;
+        if (responded.val == ibi_requests.val)
+            process_ibi_arbitration();
+    }
+
+    method process_ibi_arbitration() {
+        local int winner = -1;
+        local int i;
+
+        address.val = 0xff;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (data[i].val < address.val && ibi_requests.val[i] == 1) {
+                address.val = data[i].val;
+                winner = i;
+            }
+        }
+        active_slaves.val = 1 << winner;
+        status.val = St_Wait_IBI_Ack;
+        started_slaves.val |= ibi_requests.val;
+        ibi_requests.val = 0;
+        log info, 3: "forwarding %s request (0x%x) to port %d",
+            ((address.val >> 1) == I3C_Addr_Hot_Join 
+             ? "Host Join" : ((address.val & 1) == 1 ? "IBI" : "mastership")),
+            address.val, main_master.val;
+        i3c_devices[main_master.val].i3c_master.ibi_address(address.val);
+    }
+
+    method ibi_acknowledge(int idx, i3c_ack_t ack) {
+        if (idx != main_master.val || status.val != St_Wait_IBI_Ack) {
+            log spec_viol, 1: "unexpected IBI acknowledge from port %d", idx;
+            return;
+        }
+
+        log info, 3: "received IBI %s from port %d", i3c_ack_name(ack), idx;
+        if (ack == I3C_noack || (address.val >> 1) == I3C_Addr_Hot_Join) {
+            status.val = St_Wait_Start;
+        } else {
+            status.val = (address.val & 1) == 1 ? St_I3C_Read : St_I3C_Command;
+        }
+
+        local int i;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (active_slaves.val[i] == 1) {
+               log info, 3: "forwarding IBI acknowledge (%s) to port %d",
+                    i3c_ack_name(ack), i;
+                i3c_devices[i].i3c_slave.ibi_acknowledge(ack);
+                break;
+            }
+        }
+    }
+
+    method forward_ibi_request() {
+        if (ibi_requests.val == 0)
+            return;
+        log info, 3: "forwarding IBI request to port %d", main_master.val;
+        status.val = St_Wait_IBI_Start;
+        i3c_devices[main_master.val].i3c_master.ibi_request();
+    }
+
+    method start_request(int idx, uint8 address) {
+        if (main_master.val == INVALID_PORT) {
+            log info, 3:
+                "first start pattern, device at port %d is the main master",
+                idx;
+            main_master.val = idx;
+        } else if (main_master.val != idx) {
+            log spec_viol, 1: "only current master can issue start pattern";
+            return;
+        }
+
+        if (status.val == St_Idle
+            || (status.val == St_Wait_Start && ibi_requests.val != 0)) {
+            log info, 3: "received start (0x%x) from port %d", address, idx;
+            if (status.val != St_Idle)
+                ibi_requests.val = 0;
+        } else if (i3c_bus_allow_repeated_start(status.val)) {
+            log info, 3: "received repeated start (0x%x) from port %d",
+                address, idx;
+        } else {
+            log spec_viol, 1: "unexpected repeated-start (0x%x) from port %d",
+                address, idx;
+            return;
+        }
+
+        i3c.address.val = address;
+        forward_start();
+    }
+
+    method master_read(int idx) {
+        if (idx != main_master.val) {
+            log error: "drop read request from invalid port %d", idx;
+            return;
+        }
+
+        if (status.val != St_I2C_Read && status.val != St_I3C_Read
+            || command.val == CCC_ENTDAA) {
+            log error: "drop unexpected read request from port %d", idx;
+            return;
+        }
+        log info, 4: "received read request from port %d", idx;
+        read_request(idx);
+    }
+
+    method master_daa_read(int idx) {
+        if (idx != main_master.val) {
+            log error: "drop read request from invalid port %d", idx;
+            return;
+        }
+
+        if (status.val != St_I3C_Read || command.val != CCC_ENTDAA) {
+            log error: "drop unexpected daa read request from port %d", idx;
+            return;
+        }
+
+        log info, 4: "received daa read request from port %d", idx;
+
+        local int i;
+        status.val = St_Wait_DAA_Data;
+        responded.val = 0;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (active_slaves.val[i] == 1) {
+                log info, 4: "forwarding DAA read request to port %d", i;
+                i3c_devices[i].i3c_slave.daa_read();
+            }
+        }
+    }
+
+    method master_write(int idx, uint8 data) {
+        if (idx != main_master.val) {
+            log error: "drop write request from invalid port %d", idx;
+            return;
+        }
+
+        if (status.val != St_I2C_Write && status.val != St_I3C_DAA_Addr) {
+            log error: "drop unexpected write (0x%x) from port %d, state=%d",
+                data, idx, status.val;
+            return;
+        }
+
+        log info, 4: "received write (0x%x) from port %d", data, idx;
+        i3c.write_byte(data);
+    }
+
+    method master_sdr_write(int idx, bytes_t buffer) {
+        if (idx != main_master.val) {
+            log error: "drop write request from invalid port %d", idx;
+            return;
+        }
+
+        if (status.val != St_I3C_Command && status.val != St_I3C_Write) {
+            log error:
+                "drop unexpected write sequence from port %d, state %s",
+                idx, i3c_bus_status_name(status.val);
+            return;
+        }
+
+        sdr_write(buffer);
+    }
+
+    method master_stop(int idx) {
+        if (main_master.val != idx) {
+            log spec_viol, 1:
+                "only the device holding the bus can stop the transaction";
+            return;
+        }
+
+        log info, 4: "received stop from port %d", idx;
+        stop(idx);
+    }
+
+    method forward_start() {
+        if (address.val == (I3C_Addr_Bcst << 1))
+            command.hard_reset();
+
+        local int pindex = known_address.find(address.val >> 1);
+        local int i;
+        if (pindex >= 0) {
+            active_slaves.val = 1 << known_address.mapping[pindex].port;
+            started_slaves.val[known_address.mapping[pindex].port] = 1;
+        } else {
+            active_slaves.val = 0;
+            for (i = 0; i < DEV_NBR; i++) {
+                if (i != main_master.val && i3c_devices[i].i3c_slave.val) {
+                    started_slaves.val[i] = 1;
+                    active_slaves.val[i] = 1;
+                }
+            }
+        }
+
+        if (active_slaves.val == 0) {
+            log info, 4: "No slave on bus, send NACK to port %d", main_master.val;
+            status.val = St_Wait_Start;
+            i3c_devices[main_master.val].i3c_master.acknowledge(I3C_noack);
+        } else {
+            status.val = St_Wait_Start_Ack;
+            clear_response_status();
+            for (i = 0; i < DEV_NBR; i++) {
+                if (active_slaves.val[i] == 1) {
+                    log info, 4:
+                        "forwarding start (0x%x) to port %d", address.val, i;
+                    i3c_devices[i].i3c_slave.start(address.val);
+                }
+            }
+        }
+    }
+
+    method acknowledge(int idx, i3c_ack_t ack) {
+        if ((status.val != St_Wait_Start_Ack && status.val != St_Wait_I2C_Ack
+             && status.val != St_Wait_DAA_Ack) || active_slaves.val[idx] == 0) {
+            log spec_viol, 1:
+                "received unexpected acknowledge from port %d", idx;
+            return;
+        }
+        log info, 4: "received %s from port %d", i3c_ack_name(ack), idx;
+        responded.val[idx] = 1;
+        data[idx].val = ack;
+        if (responded.val == active_slaves.val)
+            process_acknowledge();
+    }
+
+    method slave_read_response(int idx, uint8 data, bool more) {
+        if (active_slaves.val[idx] == 0) {
+            log error: "drop read response from invalid port %d", idx;
+            return;
+        }
+
+        if (status.val != St_Wait_I2C_Response
+            && status.val != St_Wait_I3C_Response
+            && status.val != St_Wait_IBI_Data) {
+            log spec_viol, 1:
+                "received unexpected read response from port %d", idx;
+            return;
+        }
+
+        log info, 4: "received read response (0x%x) from port %d", data, idx;
+        if (command.val == CCC_GETACCMST && ((data >> 1) == (address.val >> 1))) {
+            log info, 2:
+                "new current master will be address 0x%x from port %d",
+                data >> 1, idx;
+            new_master.val = idx;
+        }
+        read_response(data, more);
+    }
+
+    method slave_daa_data(int idx, uint64 uid, uint8 bcr, uint8 dcr) {
+        if (active_slaves.val[idx] == 0) {
+            log error: "drop DAA data from wrong port %d", idx;
+            return;
+        }
+
+        if (status.val != St_Wait_DAA_Data) {
+            log spec_viol, 1: "drop unexpected DAA data for invalid status";
+            return;
+        }
+
+        log info, 4:
+            "received DAA data (ID 0x%x, bcr 0x%x, dcr 0x%x) from port %d",
+            uid, bcr, dcr, idx;
+        responded.val[idx] = 1;
+        data[idx].val = (uid << 16) | (bcr << 8) | dcr;
+        if (responded.val == active_slaves.val)
+            process_daa_arbitration();
+    }
+
+    method process_daa_arbitration() {
+        local int i;
+        local uint64 daa_data_v = MAX_UINT64;
+        local int slave_port = -1;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (responded.val[i] == 1 && data[i].val < daa_data_v) {
+                daa_data_v = data[i].val;
+                slave_port = i;
+            }
+        }
+        status.val = St_I3C_DAA_Addr;
+        log info, 4:
+            "forwarding DAA data (0x%x) to port %d", daa_data_v, main_master.val;
+        active_slaves.val = 1 << slave_port;
+        daa_data.set(daa_data_v);
+        i3c_devices[main_master.val].i3c_master.daa_response(daa_data.uid.val,
+                                                      daa_data.bcr.val,
+                                                      daa_data.dcr.val);
+    }
+
+    method clear_response_status() {
+        local int i;
+        responded.val = 0;
+        for (i = 0; i < DEV_NBR; i++)
+            data[i].hard_reset();
+    }
+
+    method write_byte(uint8 data) {
+        local int i;
+        local bool forward_daa = status.val == St_I3C_DAA_Addr;
+        local int target = -1;
+        status.val = forward_daa ? St_Wait_DAA_Ack : St_Wait_I2C_Ack;
+        responded.val = 0;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (active_slaves.val[i] == 1) {
+                target  = i;
+            } else if (forward_daa && i3c_devices[i].i3c_daa_snoop.val) {
+                log info, 4:
+                    "%s(ID 0x%x, bcr 0x%x, dcr 0x%x, address 0x%x) to port %d",
+                    "broadcast DAA ",
+                    daa_data.uid.val, daa_data.bcr.val, daa_data.dcr.val, data >> 1, i;
+                i3c_devices[i].i3c_daa_snoop.assigned_address(
+                        daa_data.uid.val, daa_data.bcr.val, daa_data.dcr.val, data >> 1);
+            }
+        }
+        if (forward_daa)
+            known_address.update(data >> 1, target, true);
+        log info, 4: "forwarding %s (0x%x) to port %d",
+            forward_daa ? "DAA address" : "i2c write", data, target;
+        i3c_devices[target].i3c_slave.write(data);
+    }
+
+    method sdr_write(bytes_t buffer) {
+        local bool dynamic_address;
+        if (status.val == St_I3C_Command && buffer.len > 0) {
+            command.val = buffer.data[0];
+            log info, 3: "I3C command: %s", i3c_ccc_command_name(command.val);
+            status.val = St_I3C_Write;
+        } else if (status.val == St_I3C_Write && command.val == CCC_SETDASA) {
+            dynamic_address = true;
+        }
+
+        local int i;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (active_slaves.val[i] != 0) {
+                log info, 4: "forwarding I3C write (%zd bytes) to port %d",
+                            buffer.len, i;
+                if (dynamic_address)
+                    known_address.update(buffer.data[0], i, true);
+                i3c_devices[i].i3c_slave.sdr_write(buffer);
+            }
+        }
+    }
+
+    method stop(uint8 idx) {
+        // clean the status.val to idle
+        if (new_master.val != INVALID_PORT) {
+            log info, 2: "device from port %d became the new current master",
+                new_master.val;
+            main_master.val = new_master.val;
+            new_master.hard_reset();
+        }
+        goto_idle();
+
+        local int i;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (i != idx && started_slaves.val[i] == 1) {
+                log info, 4: "forwarding stop to port %d", i;
+                i3c_devices[i].i3c_slave.stop();
+            }
+        }
+
+        started_slaves.val = 0;
+        forward_ibi_request();
+    }
+
+    method goto_idle() {
+        status.val = St_Idle;
+        active_slaves.val = 0;
+        command.hard_reset();
+    }
+
+    method read_response(uint8 data, bool more) {
+        status.val = status.val == St_Wait_I2C_Response ? St_I2C_Read : St_I3C_Read;
+        log info, 4: "forwarding read response (0x%x) to port %d",
+            data, main_master.val;
+        i3c_devices[main_master.val].i3c_master.read_response(data, more);
+    }
+
+    method read_request(int idx) {
+        responded.val = 0;
+        if (status.val == St_I2C_Read) {
+            status.val = St_Wait_I2C_Response;
+        } else {
+            status.val = St_Wait_I3C_Response;
+        }
+
+        local int i;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (active_slaves.val[i] == 1) {
+                log info, 4: "forwarding %s read request to port %d",
+                    status.val == St_Wait_I2C_Response ? "i2c" : "i3c", i;
+                i3c_devices[i].i3c_slave.read();
+                break;
+            }
+        }
+    }
+
+    method process_acknowledge() {
+        local uint16 acked_slaves = 0;
+        local int i;
+        for (i = 0; i < DEV_NBR; i++) {
+            if (responded.val[i] == 1 && data[i].val == I3C_ack)
+                acked_slaves[i] = 1;
+        }
+        local i3c_ack_t ack = acked_slaves == 0 ? I3C_noack : I3C_ack;
+        local uint8 addr = address.val >> 1;
+        local bool read = (address.val & 1) == 1;
+        active_slaves.val = acked_slaves;
+        if (ack == I3C_noack) {
+            status.val = St_Wait_Start;
+        } else {
+            switch (status.val) {
+            case St_Wait_Start_Ack:
+                if (addr == I3C_Addr_Bcst) {
+                    status.val = read ? St_I3C_Read : St_I3C_Command;
+                } else if (known_address.find(addr) >= 0
+                           || (command.val == CCC_SETDASA && !read)) {
+                    status.val = read ? St_I3C_Read : St_I3C_Write;
+                } else {
+                    status.val = read ? St_I2C_Read : St_I2C_Write;
+                }
+                break;
+            case St_Wait_I2C_Ack: status.val = St_I2C_Write; break;
+            case St_Wait_DAA_Ack: status.val = St_Wait_Start; break;
+            default: assert(false);
+            }
+        }
+        log info, 4: "forward %s to port %d", i3c_ack_name(ack), main_master.val;
+        i3c_devices[main_master.val].i3c_master.acknowledge(ack);
+    }
+}
+
+connect i3c_devices[i < DEV_NBR] {
+   method validate(conf_object_t *obj) -> (bool) {
+        local const void *tgt_iface = SIM_c_get_port_interface(obj, "i3c_slave", port);
+        local const void *controller_iface = SIM_c_get_port_interface(obj, "i3c_master", port);
+        local bool ok = tgt_iface || controller_iface;
+        return ok;
+    }
+}
+
+typedef struct {
+    int address;
+    int port;
+    bool is_dynamic;
+} known_address_t;
+
+template known_address_attr {
+    param type = "[[iib]*]|n";
+    session known_address_t vect mapping;
+    // TODO: now we only log the I3C dynamic address
+
+    method set(attr_value_t val) throws {
+        local known_address_t vect new_mapping;
+        VINIT(new_mapping);
+        if (SIM_attr_is_list(val)) {
+            local int i;
+            for (i = 0; i < SIM_attr_list_size(val); i++) {
+                local attr_value_t e = SIM_attr_list_item(val, i);
+                local known_address_t addr;
+                addr.address = SIM_attr_integer(SIM_attr_list_item(e, 0));
+                addr.port = SIM_attr_integer(SIM_attr_list_item(e, 1));
+                addr.is_dynamic = SIM_attr_boolean(SIM_attr_list_item(e, 2));
+                VADD(new_mapping, addr);
+            }
+        }
+
+        VCOPY(mapping, new_mapping);
+        VFREE(new_mapping);
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t val;
+        if (VLEN(mapping) == 0) {
+            return SIM_make_attr_nil();
+        }
+        local int i;
+        val = SIM_alloc_attr_list(VLEN(mapping));
+        for (i = 0; i < VLEN(mapping); i++) {
+            local attr_value_t m = SIM_make_attr_list(
+                    3,
+                    SIM_make_attr_uint64(mapping[i].address),
+                    SIM_make_attr_uint64(mapping[i].port),
+                    SIM_make_attr_boolean(mapping[i].is_dynamic));
+            SIM_attr_list_set_item(&val, i, m);
+        }
+        return val;
+    }
+
+    method find(uint8 address) -> (int) {
+        local int i;
+        for (i = 0; i < VLEN(mapping); i++) {
+            if (mapping[i].address == address) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /// DEAD, SIMICS-21601
+    method remove(uint8 address) {
+        local int pindx = find(address);
+        if (pindx >= 0)
+            VREMOVE(mapping, pindex);
+    }
+
+    method update(uint8 address, int port, bool is_dynamic) {
+        log info, 3: "update known %s address 0x%x, port %d",
+            is_dynamic ? "dynamic" : "static", address, port;
+        local int pindex = find(address);
+        if (pindex >= 0) {
+            mapping[pindex].port = port;
+            mapping[pindex].is_dynamic = is_dynamic;
+        } else {
+            local known_address_t addr;
+            addr.address = address;
+            addr.is_dynamic = is_dynamic;
+            addr.port = port;
+            VADD(mapping, addr);
+        }
+    }
+}
+
+method init() {
+    VINIT(known_address.mapping);
+}

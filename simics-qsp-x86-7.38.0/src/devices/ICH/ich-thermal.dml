@@ -1,0 +1,261 @@
+/*
+  ich-thermal.dml - thermal sensor
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "pci/common.dml";
+import "io-memory.dml";
+
+constant thermal_func_function  = 1;
+constant thermal_sensor_count   = 2;
+constant thermal_sensing_period = 3; // every 3 seconds to sense one time
+
+is pci_device;
+bank pci_config {
+    parameter busmaster = false;
+    parameter io_capable = false;
+    parameter mem_capable = true; // "Memory Space Enable" bit is effective
+    parameter base_address_registers
+        = ["thermal_base_addr", "thermal_base_addr_bios"];
+
+    register vendor_id  { parameter hard_reset_value = 0x8086; }
+    register status     { parameter hard_reset_value = 0x0010; }
+    register class_code { parameter hard_reset_value = 0x118000; }
+
+    register thermal_base_addr @ 0x10 is (memory_base_address_64) {
+        parameter size_bits = 12;
+        parameter map_func = thermal_func_function;
+
+        method update_mapping() {
+            call $thermal_base_addr_bios.update_mapping();
+        }
+    }
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1c is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+    register capabilities_ptr { parameter hard_reset_value = 0x50; }
+    register interrupt_pin    { parameter hard_reset_value = 1; } // Must > 0
+
+    // BIOS assigned thermal base address
+    register thermal_base_addr_bios @ 0x40 is (memory_base_address_64) {
+        parameter size_bits = 12;
+        parameter map_func = thermal_func_function;
+        parameter override_map_bit = 0;
+
+        method pci_mapping_enabled() -> (bool enabled) {
+            /* The 's' bit is normally the space type bit, IO or mem. But the
+               bit 0 in this BAR determines if the BAR is enabled (bit == 1). */
+            enabled = $this.s;
+        }
+
+        method update_mapping() {
+            // This does the work for both BAR-registers since they map
+            // the same register-bank (thermal_func)
+            local bool enabled;
+
+            inline $this.remove_map;
+            inline $thermal_base_addr.remove_map;
+
+            inline $this.pci_mapping_enabled() -> (enabled);
+            if ($command.mem && enabled) {
+                inline $this.add_map;
+            }
+            inline $thermal_base_addr.pci_mapping_enabled() -> (enabled);
+            if ($command.mem && enabled) {
+                inline $thermal_base_addr.add_map;
+            }
+        }
+    }
+
+    // Capability registers from 0x50
+    parameter pm_offset     = 0x50;
+    parameter pm_next_ptr   = 0x00;
+
+    is defining_pci_pm_capability;
+
+    register pm_capabilities { parameter hard_reset_value = 0x0023; }
+
+    register pm_status_control {
+        field ps {
+            method write(val) {
+                if (val == 0x1 || val == 0x2) {
+                    log "info", 2:
+                        "write of %d to power state will be omitted", val;
+                    return;
+                }
+
+                if ($this == val)
+                    return;
+
+                $this = val;
+                if (val == 0x3) {
+                    // Disable the accessing of I/O and memory spaces
+                    $pci_config.command.mem = 0;
+                    inline $pci_config.update_mappings("memory");
+                    log "info", 3:
+                        "sensor memory-mapped config registers are hided";
+                    // Block the interrupts
+                    $pci_config.command.id = 1;
+                    inline $pci_lower_interrupt();
+                } else {
+                    // Enable the accessing of I/O and memory spaces
+                    $pci_config.command.mem = 1;
+                    inline $pci_config.update_mappings("memory");
+                    log "info", 3:
+                        "sensor memory-mapped configuration regs are revealed";
+                    // Enable the interrupts
+                    $pci_config.command.id = 0;
+                    if ($pci_config.status.ins == 1)
+                        inline $pci_raise_interrupt();
+                }
+            }
+        }
+    }
+}
+
+
+bank thermal_func {
+    parameter function      = thermal_func_function;
+    parameter register_size = 1;
+    parameter overlapping   = true;
+
+    group sensor[s in 0..thermal_sensor_count - 1] {
+        register tse @ (0x40 * $s + 1) "Thermal Sensor Enable" {
+            method write(val) {
+                local bool posted;
+                if (val != 0xBA)
+                    log "spec_violation", 2:
+                        "only the value of 0x%02x can be programmed to %s",
+                        0xBA, "this sensor enable register";
+                else {
+                    $this = val;
+                    log "info", 3: "the thermal sensor is enabled, %s %d secs",
+                        "and sensing will be done every", 
+                        thermal_sensing_period;
+                    inline $sensing.posted(NULL) -> (posted);
+                    if (!posted)
+                        inline $sensing.post(thermal_sensing_period, NULL);
+                }
+            }
+        }
+
+        register tss @ (0x40 * $s + 2) "Thermal Sensor Status" {
+            field cti[7] "Catastrophic Trip Indicator";
+        }
+
+        register tsttp size 4  @ (0x40 * $s + 4)
+                "Thermal Sensor Catastrophic Trip Point" {
+            field ctps[7:0] "Catastrophic Trip Point Setting" {
+                method write(val) {
+                    if ($tsco.lbc == 1)
+                        log "info", 3:
+                            "this CTPS bit is locked by TSCO.bit 7";
+                    else
+                        $this = val;
+                }
+            }
+        }
+
+        register tsco   @ (0x40 * $s + 8)
+                    "Thermal Sensor Catastrophic Lock-Down" {
+            field lbc[7] "Lock Bit for Catastrophic" {
+                method write(val) {
+                    if (val == 0)
+                        log "spec_violation", 2:
+                            "software maybe cannot unlock the %s",
+                            "catastrophic programming interface";
+                    else {
+                        $this = val;
+                        log "info", 3:
+                            "the catastrophic programming interface is locked";
+                    }
+                }
+            }
+        }
+        // Stupid SW reads 4 byte from tsco
+        register dummy size 3 @ (0x40 * $s + 9) is (constant);
+
+        register tspc   @ (0x40 * $s + 0xE) "Thermal Sensor Policy Control" {
+            field pld[7]  "Policy Lock-Down" ;
+            field cpde[6] "Catastrophic Power-Down Enable";
+
+            method write_access(generic_transaction_t *mop, msb1, lsb, value) {
+                if ($pld == 1) {
+                    log "spec_violation", 2:
+                        "software cannot write the %s",
+                        "locked sensor policy control register";
+                } else {
+                    if (value[6] != $cpde)
+                        $cpde = value[6];
+
+                    if (value[7] == 1) {
+                        if ($tsco.lbc == 0 || $tslock.lc == 0)
+                            log "spec_violation", 2:
+                                "%s and %s must be set to 1 %s",
+                                "TSCO.bit 7", "TCLOCK.bit 2",
+                                "when set this TSPC.bit 7";
+                        else {
+                            $pld = 1;
+                            log "info", 3:
+                                "enabling/disabling %s is prevented",
+                                "the catastrophic power-down bit";
+                        }
+                    }
+                }
+            }
+        }
+
+        register tslock @ (0x40 * $s + 0x83)
+                "Thermal Sensor Register Lock Control" {
+            field lc[2] "Lock Control";
+        }
+
+        method measure_temp() -> (uint8 temp) {
+            temp = ($s == 0) ? 38 : 83;
+        }
+
+        method process_temp(uint8 temp) {
+            if (temp >= $tsttp.ctps) {
+                $tss.cti = 1;
+            } else {
+                $tss.cti = 0;
+            }
+        }
+    }
+
+    event sensing {
+        parameter timebase = "seconds";
+
+        method event(void *data) {
+            local int   i;
+            local bool  all_disabled;
+            local uint8 temp;
+
+            // Do the thermal sensing operations
+            all_disabled = true;
+            for (i = 0; i < thermal_sensor_count; i++) {
+                if ($sensor[i].tse != 0) {
+                    call $sensor[i].measure_temp() -> (temp);
+                    call $sensor[i].process_temp(temp);
+                    all_disabled = false;
+                }
+            }
+
+            if (!all_disabled)
+                inline $sensing.post(thermal_sensing_period, NULL);
+        }
+    }
+}

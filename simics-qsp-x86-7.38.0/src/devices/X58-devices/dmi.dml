@@ -1,0 +1,188 @@
+/*
+
+  dmi.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device x58_dmi;
+param classname = "x58-dmi";
+
+param desc = "Intel® X58 DMI unit";
+param documentation = "DMI unit in the Intel® X58 Express Chipset.";
+
+import "simics/devs/signal.dml";
+import "x58-common.dml";
+import "remap-dispatcher.dml";
+
+is pcie_endpoint;
+
+connect downstream_target is map_target "PCIe Downstream Target" {
+    interface pcie_port_control;
+}
+
+bank pcie_config is x58_ep_config {
+    register device_id { param init_val = 0x3400; }
+    register subsystem_vendor_id { param init_val = 0x8086; }
+    register status {
+        field c { param init_val = 1; }
+    }
+}
+
+bank io_regs {
+    param register_size = 4;
+
+    register config_address @ 0xCF8 "PCIe Configuration Address";
+    register config_data    @ 0xCFC "PCIe Configuration Data";
+
+    register config_address {
+        field enabled   @ [31:31];
+        field bus       @ [23:16];
+        field device    @ [15:11];
+        field function  @ [10:8];
+        field dword     @ [7:2];
+        field ignore    @ [1:0] is ignore_write;
+    }
+
+    register config_data is (get, set) {
+        param configuration = "pseudo";
+        param enabled = config_address.enabled.val;
+        param addr = (config_address.val[23:8] << 16) | config_address.val[7:0];
+
+        method get_size_and_offset(uint64 bytes) -> (uint64, uint64) {
+            local uint64 sz = 0;
+            local uint64 offs = 0;
+            for (local uint64 b = bytes; b > 0; b >>= 8) {
+                if (b[7:0] > 0) {
+                    ++sz;
+                } else if (sz == 0) {
+                    ++offs;
+                } else {
+                    if ((b >> 8) > 0) {
+                        log error: "bad bytemask 0x%x", bytes;
+                        return (0, 0);
+                    }
+                    break;
+                }
+            }
+            return (sz, offs);
+        }
+
+        method read_register(uint64 bytes, void *aux) -> (uint64) {
+            local uint64 sz;
+            local uint64 offs;
+            (sz, offs) = get_size_and_offset(bytes);
+
+            if (sz == 0) {
+                log error: "invalid size/offset read from %s (bytemask 0x%x)",
+                    qname, bytes;
+                return 0;
+            }
+
+            return _read(sz, addr + offs, 0) << (offs * 8);
+        }
+
+        method get() -> (uint64) {
+            return _read(size, addr, Sim_Transaction_Inquiry);
+        }
+
+        method _read(uint64 sz, uint64 address,
+                     transaction_flags_t flags) -> (uint64) {
+            if (!enabled)
+                return 0;
+            if (!downstream_target.obj) {
+                log error: "Can't read from PCIe, no downstream target";
+                return 0;
+            }
+
+            local uint8 buf[sz];
+            local atom_t atoms[6] = {
+                ATOM_pcie_type(PCIE_Type_Cfg),
+                ATOM_flags(flags),
+                ATOM_completion(NULL),
+                ATOM_data(buf),
+                ATOM_size(sz),
+                ATOM_list_end(0),
+            };
+
+            local transaction_t t = { .atoms = atoms, ... };
+            local exception_type_t exc = SIM_issue_transaction(downstream_target.map_target,
+                                                               &t, address);
+            exc = SIM_transaction_wait(&t, exc);
+            if (exc == Sim_PE_No_Exception) {
+                local uint64 value = SIM_get_transaction_value_le(&t);
+
+                local uint16 bdf = address[31:16];
+                log info, 2: "PCIe read 0x%x from %x:%d.%d offset 0x%x, %d bytes",
+                    value, bdf[15:8], bdf[7:3], bdf[2:0], address[15:0], sz;
+
+                return value;
+            } else {
+                log info, 2: "Failed to write to %s",
+                    SIM_object_name(downstream_target.obj);
+                return 0;
+            }
+        }
+
+        method write_register(uint64 value, uint64 bytes, void *aux) {
+            local uint64 sz;
+            local uint64 offs;
+            (sz, offs) = get_size_and_offset(bytes);
+            if (sz == 0) {
+                log error: "invalid size/offset written to %s (bytemask 0x%x)",
+                    qname, bytes;
+                return;
+            }
+            _write(value >> (offs * 8), sz, addr + offs, 0);
+        }
+
+        method set(uint64 value) {
+            _write(value, size, addr, Sim_Transaction_Inquiry);
+        }
+
+        method _write(uint64 value, uint64 sz, uint64 address,
+                      transaction_flags_t flags) {
+            if (!enabled)
+                return;
+            if (!downstream_target.obj) {
+                log error: "Can't write to PCIe, no downstream target";
+                return;
+            }
+
+            local uint8 buf[sz];
+            local atom_t atoms[6] = {
+                ATOM_pcie_type(PCIE_Type_Cfg),
+                ATOM_flags(Sim_Transaction_Write | flags),
+                ATOM_completion(NULL),
+                ATOM_data(buf),
+                ATOM_size(sz),
+                ATOM_list_end(0),
+            };
+            local transaction_t t = { .atoms = atoms, ... };
+            SIM_set_transaction_value_le(&t, value);
+
+            local uint16 bdf = address[31:16];
+            log info, 2: "PCIe write 0x%x to %x:%d.%d offset 0x%x, %d bytes",
+                value, bdf[15:8], bdf[7:3], bdf[2:0], address[15:0], sz;
+
+            local exception_type_t exc = SIM_issue_transaction(downstream_target.map_target,
+                                                               &t, address);
+            exc = SIM_transaction_wait(&t, exc);
+            if (exc != Sim_PE_No_Exception) {
+                log info, 2: "Failed to write to %s",
+                    SIM_object_name(downstream_target.obj);
+            }
+        }
+    }
+}

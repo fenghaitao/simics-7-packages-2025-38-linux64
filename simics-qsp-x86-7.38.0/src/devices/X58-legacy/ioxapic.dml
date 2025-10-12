@@ -1,0 +1,69 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device x58_ioxapic_legacy;
+parameter classname = "x58-ioxapic-legacy";
+
+parameter desc = "model of X58 IOxAPIC unit";
+parameter documentation = "IOxAPIC unit in the Intel® X58 Express Chipset. - legacy variant, using old PCIe libraries";
+
+import "pci/common.dml";
+import "x58-pcie-header.dml";
+import "io-apic.dml";
+
+is pcie_device;
+
+/* points to the actual ioapic object that implements the functionality */
+connect ioapic {
+    parameter documentation = "IOAPIC object that implements the"
+        + " functionality.";
+    parameter configuration = "required";
+    interface ioapic;
+}
+
+bank pci_config {
+    register device_id { parameter hard_reset_value = 0x342d; }
+    register status {
+        field c { parameter hard_reset_value = 1; }
+    }
+    register class_code { parameter hard_reset_value = 0x080020; }
+    register mbar @ 0x10 is (memory_base_address_32) {
+        parameter size_bits = 12;
+        parameter map_func = 0;
+        method pci_mapping_object() -> (map_target) {
+            map_target = $ioapic.obj;
+        }
+    }
+    register base_address_1 @ 0x14 is (no_base_address_32);
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1c is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+
+    register capabilities_ptr { parameter hard_reset_value = 0x6c; }
+
+    is defining_pci_pm_capability;
+    parameter pm_offset = 0x6c;
+    parameter pm_next_ptr = 0;
+    register pm_capabilities {
+        field v { parameter hard_reset_value = 0x3; }
+        field pmes { parameter hard_reset_value = 0x19; }
+    }
+
+    register abar size 2 @ 0x40 is (unimplemented);
+    register rdindex size 1 @ 0x80 is (unimplemented);
+    register rdwindow size 4 @ 0x90 is (unimplemented);
+    register ioapictetpc size 4 @ 0xA0 is (unimplemented);
+}

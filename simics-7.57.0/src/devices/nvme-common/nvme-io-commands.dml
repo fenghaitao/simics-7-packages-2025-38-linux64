@@ -1,0 +1,187 @@
+
+/*
+  nvme-io-commands.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+typedef bitfields 64 {
+    uint32 cdw11 @ [63:32];
+    uint32 cdw10 @ [31:0];
+} slba_t;
+
+param LOGICAL_BLOCK_SIZE = 512;  // (As defined by lbaf[0].lbads: 2^9)
+param MEGA_BYTE = 1024*1024;
+
+
+// Opcodes
+param OPC_FLUSH = 0x00;
+param OPC_WRITE = 0x01;
+param OPC_READ = 0x02;
+
+template io_submission_q is submission_q {
+    method cmd_handler(uint8 opc) -> (nvme_command_handler) throws {
+        foreach handler in (each nvme_io_command_handler in (this.parent)) {
+            if (opc == handler.opc) {
+                return cast(handler, nvme_command_handler);
+            }
+        }
+        throw;
+    }
+}
+
+template io_completion_q is completion_q {
+
+    method write_entry(const common_command_format_t *cmd,
+                       common_completion_entry_t *rsp,
+                       error_information_log_entry_t *err) -> (int) {
+        local int res = default(cmd, rsp, err);
+
+        if (res == 0) {
+            if (cmd->cdw0.opc == OPC_WRITE) {
+                increment_128(stats.host_write_commands);
+            } else if (cmd->cdw0.opc == OPC_READ) {
+                increment_128(stats.host_read_commands);
+            }
+        }
+        return res;
+    }
+}
+
+template nvme_io_command_handler is nvme_command_handler {}
+
+template standard_io_commands {
+    group flush is nvme_io_command_handler {
+        param opc = OPC_FLUSH;
+        method handle_command(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err) default {
+            // No volatile write cache, just return successfully
+            log info, 4: "IO Flush command received. Doing nothing since there"
+                       + " is no volatile write cache";
+        }
+    }
+
+    group read is nvme_io_command_handler {
+        param opc = OPC_READ;
+        method handle_command(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err) default {
+            if (!ns_id_is_ok(cmd->nsid, rsp, err)) {
+                return;
+            }
+
+            if (images[cmd->nsid - 1].obj == NULL) {
+                log error, 3: "Inactive NSID in READ command";
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 4, 0,
+                          rsp, err);
+                return;
+            }
+
+            local slba_t slba;
+            slba.cdw10 = cmd->cdw10;
+            slba.cdw11 = cmd->cdw11;
+
+            local uint16 nlb = cmd->cdw12[15:0];  // Number of logical blocks
+
+            local uint64 data_len = (nlb + 1) * LOGICAL_BLOCK_SIZE;
+
+            if (!lba_range_is_ok(namespace_sizes.val[cmd->nsid-1], data_len,
+                slba, rsp, err)) {
+                log error, 2: "Invalid LBA range";
+                return;
+            }
+
+            local uint8 *buf = new uint8[data_len];
+            images[cmd->nsid - 1].image.read(buf, slba * LOGICAL_BLOCK_SIZE,
+                                             data_len);
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, data_len, buf, PRP_OP_WRITE);
+
+            delete buf;
+        }
+
+        method processing_time(const common_command_format_t *cmd) -> (double) {
+            return io_processing_time(cmd);
+        }
+    }
+
+    group write is nvme_io_command_handler {
+        param opc = OPC_WRITE;
+        method handle_command(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err) default {
+            if (!ns_id_is_ok(cmd->nsid, rsp, err)) {
+                return;
+            }
+            if (images[cmd->nsid - 1].obj == NULL) {
+                log error, 3: "Inactive NSID in WRITE command";
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 4, 0, rsp,
+                          err);
+                return;
+            }
+
+            local slba_t slba;
+            slba.cdw10 = cmd->cdw10;
+            slba.cdw11 = cmd->cdw11;
+
+            local uint16 nlb = cmd->cdw12[15:0];  // Number of logical blocks
+
+            local uint64 data_len = (nlb + 1) * LOGICAL_BLOCK_SIZE;
+
+            if (!lba_range_is_ok(namespace_sizes.val[cmd->nsid-1], data_len,
+                slba, rsp, err)) {
+                log error, 2: "Invalid LBA range";
+                return;
+            }
+
+            local uint8 *buf = new uint8[data_len];
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, data_len, buf, PRP_OP_READ);
+            images[cmd->nsid - 1].image.write(buf, slba * LOGICAL_BLOCK_SIZE,
+                                              data_len);
+
+            delete buf;
+        }
+
+        method processing_time(const common_command_format_t *cmd) -> (double) {
+            return io_processing_time(cmd);
+        }
+    }
+
+    method io_processing_time(const common_command_format_t *cmd) -> (double) {
+        local uint16 nlb = cmd->cdw12[15:0];  // Number of logical blocks
+        local uint64 data_len = (nlb + 1) * LOGICAL_BLOCK_SIZE;
+        if (bandwidth.val != 0) {
+            return cast(data_len, double) /
+                    cast((MEGA_BYTE * bandwidth.val), double);
+        } else {
+            return 0.0;
+        }
+    }
+
+    method lba_range_is_ok(uint64 ns_size, uint64 data_len, uint64 slba,
+                        common_completion_entry_t *rsp,
+                        error_information_log_entry_t *err) -> (bool) {
+        if (data_len > ns_size) {
+            set_error(STATUS_TYPE_GENERIC, STATUS_LBA_OUT_OF_RANGE, 40, 1, rsp,
+                    err);
+            return false;
+        }
+        if ((data_len + (slba * LOGICAL_BLOCK_SIZE)) > ns_size) {
+            set_error(STATUS_TYPE_GENERIC, STATUS_LBA_OUT_OF_RANGE, 48, 0, rsp,
+                    err);
+            return false;
+        }
+        return true;
+    }
+}

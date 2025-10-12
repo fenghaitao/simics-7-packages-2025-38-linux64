@@ -1,0 +1,179 @@
+
+/*
+  nvme-admin-features.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "nvme-admin-log-page.dml";
+
+param STATUS_FEATURE_NOT_CHANGEABLE = 0x0E;
+
+constant FEATURE_GET = 0;
+constant FEATURE_SET = 1;
+
+// Feature Identifiers
+param FEATURE_ARBITRATION = 0x01;
+param FEATURE_POWER_MANAGEMENT = 0x02;
+param FEATURE_TEMPERATURE_THRESHOLD = 0x04;
+param FEATURE_NUMBER_OF_QUEUES = 0x07;
+param FEATURE_INTERRUPT_COALESCING = 0x08;
+param FEATURE_INTERRUPT_VECTOR_CONFIGURATION = 0x09;
+param FEATURE_ASYNCHRONOUS_EVENT_CONFIGURATION = 0x0B;
+
+typedef bitfields 32 {
+    uint3 sel @ [10:8];
+    uint8 fid @ [7:0];
+} cdw10_get_features_t;
+
+typedef bitfields 32 {
+        uint1 sv @ [31];
+        uint8 fid @ [7:0];
+} cdw10_set_features_t;
+
+typedef bitfields 32 {
+        uint2 thsel @ [21:20];
+        uint4 tmpsel @ [19:16];
+        uint16 tmpth @ [15:0];
+} dw_tt_feature_t;
+
+template nvme_feature {
+    param fid : uint8;
+    shared method handle_feature(const common_command_format_t *cmd,
+                                 common_completion_entry_t *rsp,
+                                 error_information_log_entry_t *err,
+                                 uint64 type);
+}
+
+template features {
+    group n_queues is nvme_feature {
+        param fid = FEATURE_NUMBER_OF_QUEUES;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            // Return max_ioqpair for both set/get and don't care about set values
+
+            rsp->dw0[31:16] = max_ioqpairs-1;  // Completion Queues Allocated (ncqa)
+            rsp->dw0[15:0] = max_ioqpairs-1;  // Submission Queues Allocated (nsqa)
+        }
+    }
+
+    group arbitration is nvme_feature {
+        param fid = FEATURE_ARBITRATION;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            // Do nothing
+            log info, 4: "Arbitration feature request. No need for any action"
+                       + " given no support for weighted RR";
+        }
+    }
+
+    group pm is nvme_feature {
+        param fid = FEATURE_POWER_MANAGEMENT;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            if (type == FEATURE_SET) {
+                if (cmd->cdw11[4:0] != 0) {
+                    log spec_viol: "Software tried to set power state to %d."
+                                + " Controller only supports power state 0 as"
+                                + " per NPSS", cmd->cdw11[4:0];
+                }
+            }
+            // For NVME_FEATURE_SET we let the response be 0
+        }
+    }
+
+    group tt is nvme_feature {
+        param fid = FEATURE_TEMPERATURE_THRESHOLD;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            local dw_tt_feature_t w = cmd->cdw11;
+
+            // Temperature sensors 1-8 unimplemented
+            if (w.tmpsel != 0 || w.tmpsel != 0xF) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 46, 0, rsp,
+                          err);
+                return;
+            }
+
+            if (type == FEATURE_SET) {
+                set_error(STATUS_TYPE_COMMAND_SPECIFIC,
+                          STATUS_FEATURE_NOT_CHANGEABLE, 0, 0, rsp, err);
+            } else if (type == FEATURE_GET) {
+                // Default threshold values for composite
+                if (w.tmpsel == 0xF) {
+                    set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 46, 0,
+                              rsp, err);
+                    return;
+                }
+
+                if (w.thsel == 0b00) {
+                    rsp->dw0 = 0xFFFF;
+                } else if (w.thsel == 0b01) {
+                    rsp->dw0 = 0x0;
+                } else {
+                    log spec_viol: "Reserved threshold type select %d", w.thsel;
+                    set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 46, 4,
+                              rsp, err);
+                }
+            }
+        }
+    }
+
+    group ic is nvme_feature {
+        param fid = FEATURE_INTERRUPT_COALESCING;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            set_error(STATUS_TYPE_COMMAND_SPECIFIC,
+                      STATUS_FEATURE_NOT_CHANGEABLE, 0, 0, rsp, err);
+            log info, 3: "Interrupt coalescing feature can not be set by"
+                       + " software";
+        }
+    }
+
+    group ivc is nvme_feature {
+        param fid = FEATURE_INTERRUPT_VECTOR_CONFIGURATION;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            set_error(STATUS_TYPE_COMMAND_SPECIFIC,
+                      STATUS_FEATURE_NOT_CHANGEABLE, 0, 0, rsp, err);
+            log info, 3: "Interrupt vector configuration feature can not be set"
+                       + " by software as it is configured during queue"
+                       + " creation";
+        }
+    }
+
+    group async_evt_conf is nvme_feature {
+        param fid = FEATURE_ASYNCHRONOUS_EVENT_CONFIGURATION;
+        method handle_feature(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 type) {
+            log info, 3: "This NVMe device model only supports asynchronous"
+                       + " events that can not be disabled by the async event"
+                       + " feature";
+        }
+    }
+}

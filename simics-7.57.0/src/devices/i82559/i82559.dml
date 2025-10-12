@@ -1,0 +1,1981 @@
+/*
+  i82559.dml - INTEL 82559 fast Ethernet controller
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device i82559;
+
+import "utility.dml";
+import "io-memory.dml";
+
+import "simics/devs/ieee_802_3.dml";
+import "pci/common.dml";
+import "simics/devs/microwire.dml";
+import "ethernet.dml";
+import "simics/devs/mii.dml";
+
+parameter byte_order = "little-endian";
+parameter classname = "i82559";
+parameter documentation = "Intel® 82559 Fast Ethernet Controller.";
+parameter desc = "model of Intel® 82559 Fast Ethernet controller";
+parameter limitations = "<ul><li>Unimplemented CardBus interface</li>>"
+    + "<li>Unimplemented TCO SMB interface</li>"
+    + "<li>Unimplemented FLASH/Modem accessing interface</li>"
+    + "<li>Unimplemented the feature of Wake on LAN</li>"
+    + "<li>Unimplemented 802.3 PHY</li>"
+    + "</ul>";
+
+constant FUNC_CSR    = 1;
+constant FUNC_FLASH  = 0x2;
+constant FUNC_MDI    = 0x3;
+
+// Module error numbers valid in the scope the module
+constant I82559_ME_No_Exception                = -100;
+constant I82559_ME_No_Host_Memory              = I82559_ME_No_Exception - 1;
+constant I82559_ME_Null_Ptr                    = I82559_ME_No_Exception - 2;
+constant I82559_ME_Read_Target_Memory_Error    = I82559_ME_No_Exception - 3;
+constant I82559_ME_Invalid_Parameter           = I82559_ME_No_Exception - 4;
+constant I82559_ME_Write_Target_Memory_Error   = I82559_ME_No_Exception - 5;
+constant I82559_ME_No_RFD                      = I82559_ME_No_Exception - 6;
+constant I82559_ME_Not_Enough_Data             = I82559_ME_No_Exception - 7;
+constant I82559_ME_No_Bandwidth                = I82559_ME_No_Exception - 8;
+
+constant DEFAULT_MAC_ADDRESS                = 0xFFFFFFFFFFFF;
+constant DEFAULT_MULTICAST_ADDRESS          = 0xFFFFFFFFFFFF;
+
+constant I82559_NULL_POINTER    = 0xFFFFFFFF;
+constant SIMPLE_DATA_OFF        = 0x10; // Data offset in a simple command
+constant SIMPLE_TCB_MODE        = 0;
+constant FLEXIBLE_TCB_MODE      = 1;
+constant MAX_FRAME_LEN          = 2600;
+constant MIN_FRAME_LEN          = 64;
+constant MAX_TBD_COUNT          = 50;   // A normal programmer can prepare!
+constant MAX_CMD_COUNT          = 100;  // Maximum command count in a CBL
+constant MAX_CONFIG_BYTES       = 22;
+constant DUMP_AREA_BYTES        = 596;
+constant MAX_MULTICAST_ADDR     = 8;
+constant TBD_SIZE               = 8;    // 8 bytes
+constant MAX_RETRANSMIT_COUNT   = 16;  // Maximum re-transmit count if no band
+constant MAX_STAT_COUNTERS      = 20;  // Maximum statistical counter registers
+
+constant CU_NOP                                 = 0b0000;
+constant CU_START                               = 0b0001;
+constant CU_RESUME                              = 0b0010;
+constant CU_LOAD_DUMP_COUNTERS_ADDRESS          = 0b0100;
+constant CU_DUMP_STATISTICAL_COUNTERS           = 0b0101;
+constant CU_LOAD_CU_BASE                        = 0b0110;
+constant CU_DUMP_RESET_STATISTICAL_COUNTERS     = 0b0111;
+constant CU_STATIC_RESUME                       = 0b1010;
+
+constant RUC_NOP                                = 0b000;
+constant RUC_START                              = 0b001;
+constant RUC_RESUME                             = 0b010;
+constant RUC_RECEIVE_DMA_REDIRECT               = 0b011;
+constant RUC_ABORT                              = 0b100;
+constant RUC_LOAD_HEADER_DATA_SIZE              = 0b101;
+constant RUC_LOAD_RU_BASE                       = 0b110;
+constant RUC_RBD_RESUME                         = 0b111;
+
+constant ACTION_CMD_NOP                         = 0b000;
+constant ACTION_CMD_INDIVIDUAL_ADDRESS_SETUP    = 0b001;
+constant ACTION_CMD_CONFIGURE                   = 0b010;
+constant ACTION_CMD_MULTICAST_ADDRESS_SETUP     = 0b011;
+constant ACTION_CMD_TRANSMIT                    = 0b100;
+constant ACTION_CMD_LOAD_MICROCODE              = 0b101;
+constant ACTION_CMD_DUMP                        = 0b110;
+constant ACTION_CMD_DIAGNOSE                    = 0b111;
+
+constant MDI_WRITE_OP           = 0x1;
+constant MDI_READ_OP            = 0x2;
+constant PORT_OP_SOFT_RESET     = 0x0;
+constant PORT_OP_SELF_TEST      = 0x1;
+constant PORT_OP_SELECT_RESET   = 0x2;
+constant PORT_OP_DUMP           = 0x3;
+constant PORT_OP_DUMP_WAKE_UP   = 0x7;
+
+constant RUS_IDLE               = 0b0000;
+constant RUS_SUSPENDED          = 0b0001;
+constant RUS_NO_RESOURCES       = 0b0010;
+constant RUS_READY              = 0b0100;
+
+constant CUS_IDLE               = 0b00;
+constant CUS_SUSPENDED          = 0b01;
+constant CUS_LPQ_ACTIVE         = 0b10;
+constant CUS_HQP_ACTIVE         = 0b11;
+
+constant NANSECS_TO_SEND_ONE_BYTE   = 0.00000008;   // 8bit/100Mbps
+
+typedef layout "little-endian" {
+    uint16 data;
+} le_word_t;
+
+typedef layout "little-endian" {
+    uint32 data;
+} le_dword_t;
+
+// Command bits
+typedef bitfields 8 {
+        uint4   special_bits_0_3    @ [3:0];
+        uint1   underrun            @ [4:4];
+        uint1   OK                  @ [5:5];
+        uint1   special_bits_6      @ [6:6];
+        uint1   completed           @ [7:7];
+} command_status_t;
+
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint14  tcb_byte_count      @ [13:0];
+        int1    special_bits_14     @ [14:14];
+        int1    eof                 @ [15:15];
+        uint8   transmit_threshold  @ [23:16];
+        uint8   tbd_number          @ [31:24];
+    } bits;
+} transmit_command_optional_1_bits_t;
+
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint1   failure                 @ [11:11]; // Used in "Diagnose"
+        uint1   underrun                @ [12:12]; // Used in "Transmit"
+        uint1   ok                      @ [13:13];
+        uint1   completion              @ [15:15];
+        uint3   cmd                     @ [18:16];
+        uint1   simple_or_fixed         @ [19:19];
+        uint1   no_crc_source_addr      @ [20:20];
+        uint5   cna_interrupt_delay     @ [28:24];
+        uint1   interrupt               @ [29:29];
+        uint1   suspend                 @ [30:30];
+        uint1   enter_idle              @ [31:31];
+    } hdr_bits;
+    uint32  link_address;
+    uint32  optional_0;
+    uint32  optional_1;
+} general_action_command_t;
+
+typedef layout "little-endian" {
+    uint32  address;
+    bitfields 32 {
+        uint15  size    @ [14:0];
+        uint1   el      @ [16:16];
+    } bits;
+} transmit_buffer_descriptor_t;
+
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint1   rcv_collision   @ [0:0];
+        uint1   ia_match        @ [1:1];
+        uint1   no_addr_match   @ [2:2];
+        uint1   rcv_err         @ [4:4];
+        uint1   type_length     @ [5:5];
+        uint1   too_short       @ [7:7];
+        uint1   dma_overrun     @ [8:8];
+        uint1   out_of_space    @ [9:9];
+        uint1   align_err       @ [10:10];
+        uint1   crc_err         @ [11:11];
+        uint1   ok              @ [13:13]; // without errors
+        uint1   c               @ [15:15]; // completion
+        uint1   sf              @ [19:19]; // simplified mode
+        uint1   h               @ [20:20]; // header RFD
+        uint1   s               @ [30:30]; // suspend
+        uint1   el              @ [31:31]; // end-of-list
+    } cmd_stat_bits;
+    uint32 link_address;
+    uint32 rbd_address;
+    bitfields 32 {
+        uint14  act_cnt @ [13:0];
+        uint1   f       @ [14:14];
+        uint1   eof     @ [15:15];
+        uint14  size    @ [29:16];
+    } size_bits;
+} receive_frame_descriptor_t;
+
+typedef layout "little-endian" {
+    bitfields 16 {
+        uint14  count @ [13:0];
+        uint1   f     @ [14:14];
+        uint1   eof   @ [15:15];
+    } count_bits;
+    uint16 reserved0;
+    uint32 link_address;
+    uint32 buffer_address;
+    bitfields 16 {
+        uint15  size  @ [14:0];
+        uint1   el    @ [15:15];
+    } size_bits;
+    uint16 reserved1;
+} rbd_t;
+
+typedef layout "little-endian" {
+    uint8   ia_byte_1;
+    uint8   ia_byte_2;
+    uint8   ia_byte_3;
+    uint8   ia_byte_4;
+    uint8   ia_byte_5;
+    uint8   ia_byte_6;
+    uint16  unused[7];
+    bitfields 16 {
+        uint1   mdm         @ [0:0];
+        uint1   stb_ena     @ [1:1];
+        uint1   wmr         @ [2:2];
+        uint1   wol         @ [5:5];
+        uint1   dpd         @ [6:6];
+        uint1   alt_id      @ [7:7];
+        uint3   rev_id      @ [10:8];
+        uint1   bd          @ [11:11];
+        uint1   id          @ [13:13];
+        uint2   sig         @ [15:14];
+    } control_bits;
+    uint16  subsystem_id;
+    uint16  vendor_id;
+    bitfields 16 {
+        uint8   smb_cis_field       @ [7:0];
+        uint4   hb_packet_pointer   @ [11:8];
+    } pointer_bits;
+} eeprom_config_header_t;
+
+typedef layout "little-endian" {
+    uint16  modem_vendor_id;
+    uint16  modem_device_id;
+    uint8   modem_revision_number;
+    uint8   modelm_program_interface;
+    uint8   model_power_consumption;
+    uint8   modem_power_dissipation;
+} eeprom_config_tail_t;
+
+typedef layout "little-endian" {
+    uint8   fext_bytes[24];
+    uint8   conf_byte_8_21[14];
+    uint8   reserved_38;
+    uint8   individual_addr[6];
+    uint8   transmit_status_low;
+    uint8   transmit_status_high;
+    uint8   transmit_crc[4];
+    uint8   receive_crc[4];
+    uint8   temporary_memory[6];
+    uint8   receive_status_low;
+    uint8   receive_status_high;
+    uint8   hash[8];
+    uint8   undefined_71_74[4];
+    uint8   receive_len_high;
+    uint8   receive_len_low;
+    uint8   reserved_77_79[3];
+    uint32  reserved_20_29[10];
+    uint32  micromachine_39;
+    uint32  micromachine_38;
+    uint32  micromachine_37;
+    uint32  micromachine_36;
+    uint32  micromachine_35;
+    uint32  micromachine_34;
+    uint32  micromachine_33;
+    uint32  micromachine_32;
+    uint32  receive_short_frames;
+    uint32  receive_cdt_errors;
+    uint32  receive_overrun_errors;
+    uint32  receive_resource_errors;
+    uint32  receive_alignment_errors;
+    uint32  receive_crc_errors;
+    uint32  receive_good_frames;
+    uint32  transmit_total_collisions;
+    uint32  transmit_multiple_collisions;
+    uint32  transmit_single_collisions;
+    uint32  transmit_deferred;
+    uint32  transmit_lost_crs;
+    uint32  transmit_underrun_errors;
+    uint32  transmit_late_collisions;
+    uint32  transmit_maximum_collisions;
+    uint32  transmit_good_frames;
+    uint32  reserved_54_64[11];
+    uint32  execution_status_port;
+    uint32  others_66_148[83];
+} dump_data_t;
+
+attribute phy_address {
+    parameter documentation = "The PHY address of which object mii connects to";
+    parameter configuration = "required";
+    parameter allocate_type = "int64";
+}
+
+data double retrans_interval;
+
+connect phy {
+    parameter documentation = "Phy object";
+    parameter configuration = "required";
+    interface ieee_802_3_phy_v2 {
+        parameter required = true;
+    }
+}
+
+connect mii {
+  parameter documentation = "Object connected to the MII management interface.";
+  parameter configuration = "required";
+  interface mii {
+      parameter required = true;
+    }
+}
+
+connect serial_eeprom {
+    parameter documentation = "Serial EEPROM";
+    parameter configuration = "required";
+    interface microwire {
+        parameter required = true;
+    }
+}
+
+implement ieee_802_3_mac {
+    // Receive a frame from PHY
+    method receive_frame(int phy, dbuffer_t *buf, int crc_ok) -> (int result) {
+        call $receive_packet(buf);
+        result = 0;
+    }
+    method tx_bandwidth_available(int phy) {
+        call $ieee_802_3_mac_v3.tx_bandwidth_available(phy);
+    }
+    method link_status_changed(int phy, ieee_802_3_link_status_t status) {
+        call $ieee_802_3_mac_v3.link_status_changed(phy, status);
+    }
+}
+
+implement ieee_802_3_mac_v3 {
+    method receive_frame(int phy, const frags_t *frame, int crc_ok) {
+        local dbuffer_t *db = new_dbuffer();
+        dbuffer_append_external_data(db, frags_extract_alloc(frame),
+                                     frags_len(frame), true);
+        call $receive_packet(db);
+        dbuffer_free(db);
+    }
+
+    // Notification when bandwidth is available for next frame
+    method tx_bandwidth_available(int phy) {
+        if ($csr.scb_status.cus == CUS_LPQ_ACTIVE) {
+            local bool posted;
+            inline $retrans_packet.posted(NULL) -> (posted);
+            if (!posted) {
+                call $start_command_unit();
+                inline $update_int();
+            }
+        }
+    }
+
+    method link_status_changed(int phy, ieee_802_3_link_status_t status) {
+        log info, 3: "IEEE 802.3: link status changed";
+    }
+}
+
+implement pci_device {
+    method bus_reset() {
+        inline $reset();
+    }
+}
+
+event retrans_packet {
+    parameter timebase = "seconds";
+
+    method event(void *param) {
+        log info, 3: "periodic packet re-transmit event triggered";
+
+        // Try to retransmit the packet again.
+        if ($csr.scb_status.cus == CUS_LPQ_ACTIVE) {
+            call $start_command_unit();
+            inline $update_int();
+        } else
+            log error: "CU status MUST be active to post a retrans_packet";
+
+    }
+}
+
+is pci_device;
+bank pci_config {
+    // List of base address registers used by the device
+    parameter base_address_registers = ["csr_mem_bar", "csr_io_bar"];
+    // This device can perform PCI DMA accesses
+    parameter busmaster = true;
+
+    register vendor_id { parameter hard_reset_value = 0x8086; }
+    register device_id { parameter hard_reset_value = 0x1229; }
+    register command { parameter hard_reset_value = 0x0; }
+    register status { parameter hard_reset_value = 0x0; }
+    register revision_id { parameter hard_reset_value = 9; }
+    register class_code { parameter hard_reset_value = 0x20000; }
+    register cache_line_size {
+        method write(value) {
+            if (value == 0x8 || value == 0x10)
+                $this = value;
+        }
+    }
+    register latency_timer { parameter hard_reset_value = 0x0; }
+    register header_type { parameter hard_reset_value = 0x80; }
+
+    register csr_mem_bar @ 0x10 is (memory_base_address_32) {
+        parameter size_bits = 12; // 4K bytes for memory space
+        parameter map_func = FUNC_CSR;
+    }
+    register csr_io_bar @ 0x14 is (io_base_address) {
+        parameter size_bits = 6; // 64 bytes for io space
+        parameter map_func = FUNC_CSR;
+    }
+    register bar2 @ 0x18 is (no_base_address_32);
+    register bar3 @ 0x1C is (no_base_address_32);
+    register bar4 @ 0x20 is (no_base_address_32);
+    register bar5 @ 0x24 is (no_base_address_32);
+
+    register capabilities_ptr { parameter hard_reset_value = 0xdc; }
+    register min_gnt { parameter hard_reset_value = 0x8; }
+    register max_lat { parameter hard_reset_value = 0x18; }
+    register interrupt_pin { parameter hard_reset_value = 0x1; }
+}
+
+bank csr {
+    parameter documentation = "Control/Status Registers";
+    parameter byte_order = "little-endian";
+    parameter partial = true;
+    parameter overlapping = true;
+    parameter function = FUNC_CSR;
+
+    register scb_status         size 2 @ 0x0  "SCB Status Word";
+    register scb_command        size 2 @ 0x2  "SCB Command Word";
+    register scb_gp             size 4 @ 0x4  "SCB General Pointer";
+    register port               size 4 @ 0x8  "PORT";
+    register flash_control      size 2 @ 0xC  "Flash Control Register";
+    register eeprom_control     size 2 @ 0xE  "EEPROM Control Register";
+    register mdi_control        size 4 @ 0x10 "MDI Control Register";
+    register rx_dma_byte_count  size 4 @ 0x14 "RX DMA Byte Count";
+    register early_rx_int       size 1 @ 0x18 "Early Receive Interrupt";
+    register flow_control       size 2 @ 0x19 "Flow Control Register";
+    register pmdr               size 1 @ 0x1B "PMDR";
+    register general_control    size 1 @ 0x1C "General Control";
+    register general_status     size 1 @ 0x1D "General Status";
+    register func_event         size 4 @ 0x30 "Function Event Register";
+    register func_event_mask    size 4 @ 0x34 "Function Event Mask Register";
+    register func_present_state size 4 @ 0x38 "Function Present State Register";
+    register force_event        size 4 @ 0x3C "Force Event Register";
+
+    register internal_status    size 4 @ undefined "Internal status of CU and RU";
+    register cu_base            size 4 @ undefined "CU base address";
+    register ru_base            size 4 @ undefined "RU base address";
+    register rfa_header         size 4 @ undefined "RFA header address";
+    register next_rfd_addr      size 4 @ undefined "Next RFD address";
+    register next_rbd_addr      size 4 @ undefined "Next RBD address";
+    register next_cmd_off       size 4 @ undefined "Next CB to be processed";
+    register irq_raised         size 1 @ undefined;
+
+    // Statistical counters
+    register tx_good_frames         size 4 @ undefined  "Transmit good frames";
+    register tx_max_collisions      size 4 @ undefined  "Transmit maximum collision frames";
+    register tx_total_collisions    size 4 @ undefined  "Transmit total collision frames";
+    register rx_good_frames         size 4 @ undefined  "Receive good frames";
+    register rx_crc_errors          size 4 @ undefined  "Receive CRC errors";
+    register rx_res_errors          size 4 @ undefined  "Receive discarded frames due to no resources";
+    register rx_discarded           size 4 @ undefined  "Receive discarded frames";
+    register rx_too_long_frames     size 4 @ undefined  "Too long received frames";
+    register rx_too_short_frames    size 4 @ undefined  "Too short received frames";
+
+    register counters_dump_address  size 8 @ undefined  "Counter registers dump address";
+    register mac_address            size 8 @ undefined  "MAC address";
+    register multicast_address[MAX_MULTICAST_ADDR]  size 8 @ undefined  "Multicast address";
+    register eeprom_start size 1 @ undefined;
+    register eeprom_clk   size 1 @ undefined {
+        parameter hard_reset_value = 6;
+    }
+}
+
+bank csr {
+    register scb_status {
+        field rus[5:2] {
+            is ignore_write;
+            parameter hard_reset_value = RUS_IDLE;
+        }
+        field cus[7:6] {
+            is ignore_write;
+            parameter hard_reset_value = CUS_IDLE;
+        }
+        field fcp[8] is (write_1_clears);
+        field swi[10] is (write_1_clears);
+        field mdi[11] is (write_1_clears);
+        field rnr[12] is (write_1_clears);
+        field cna[13] is (write_1_clears);
+        field fr[14] is (write_1_clears);
+        field cx[15] is (write_1_clears);
+
+        method check_intr_val() -> (bool req) {
+            req = $mdi == 1 || $swi == 1
+                || (($cx & ~$csr.scb_command.cxm)  == 1
+                    ||  ($fr & ~$csr.scb_command.frm)   == 1
+                    ||  ($cna & ~$csr.scb_command.cnam) == 1
+                    ||  ($rnr & ~$csr.scb_command.rnrm) == 1
+                    ||  ($fcp & ~$csr.scb_command.fcpm) == 1);
+        }
+        method after_write(memop) {
+            call $update_int();
+        }
+    }
+
+    register scb_command {
+        field ruc[2:0];
+        field cuc[7:4];
+        field m[8];
+        field si[9] is (read_zero) {
+            method write(value) {
+                $scb_status.swi = value;
+            }
+        }
+        field fcpm[10];
+        field erm[11];
+        field rnrm[12];
+        field cnam[13];
+        field frm[14];
+        field cxm[15];
+
+        method after_write(memop) {
+            call $process_cu_command();
+            call $process_ru_command();
+
+            inline $update_int();
+            // Clear the command fields to know it's changed when written again
+            $ruc = RUC_NOP;
+            $cuc = CU_NOP;
+        }
+    }
+
+    register port {
+        field op   [3:0];
+        field addr [31:4];
+        method after_write(memop) {
+            if ($op == PORT_OP_SOFT_RESET)
+                inline $i82559_soft_reset();
+            else if ($op == PORT_OP_SELF_TEST)
+                inline $i82559_self_test($addr << 4);
+            else if ($op == PORT_OP_SELECT_RESET)
+                inline $i82559_selective_reset();
+            else if ($op == PORT_OP_DUMP)
+                inline $i82559_dump($addr << 4);
+            else if ($op == PORT_OP_DUMP_WAKE_UP)
+                log unimpl, 3: "PORT dump wake-up";
+        }
+    }
+
+    register flash_control {
+        is unimplemented;
+    }
+
+    register eeprom_control {
+        //TODO: should to be re-write if issue in micro-eeprom fixed
+        field eesk[0] {
+            method write(val) {
+                if ($this == 0 && val == 1) {
+                    $eeprom_clk = 1;
+                }
+                $this = val;
+            }
+        }
+        field eecs[1] ;
+        field eedi[2] ;
+        field eedo[3] {
+            method read() -> (val) {
+                if ($eeprom_start < 10)
+                    val = 1;
+                else
+                    val = $serial_eeprom.microwire.get_do();
+            }
+        }
+        method after_write(memop) {
+            if ($eecs == 0) {
+                $eeprom_start = 0;        //to de-assert
+                $eeprom_clk = 0;
+            } else {
+                if ($eeprom_start == 0)
+                    $eeprom_start = 1;    //chip-selected
+                if ($eeprom_clk == 1) {
+                    $eeprom_clk = 0;
+                    if ($eeprom_start == 1 && $eedi == 1)
+                        $eeprom_start = 2;
+                    else if ($eeprom_start > 1)
+                        $eeprom_start += 1;
+                }
+            }
+            $serial_eeprom.microwire.set_cs($eecs);
+            $serial_eeprom.microwire.set_di($eedi);
+            $serial_eeprom.microwire.set_sk($eesk);
+        }
+    }
+
+    register mdi_control {
+        field data[15:0];
+        field phy_reg[20:16];
+        field phy_addr[25:21];
+        field opcode[27:26];
+        field ready[28]{
+            parameter hard_reset_value = 1;
+        }
+        field ie[29];
+        method after_write(memop) {
+            $ready = 1;
+            if ($phy_addr != $phy_address)
+                return;
+            if ($opcode == MDI_WRITE_OP)
+                $mii.mii.write_register($phy_reg, $data);
+            else if ($opcode == MDI_READ_OP)
+                $data = $mii.mii.read_register($phy_reg);
+            else {
+                log spec_viol, 2: "error opcode %d", $opcode;
+                return;
+            }
+            if ($ie == 1) {
+                $scb_status.mdi = 1;
+                call $update_int();
+            }
+        }
+    }
+
+    register rx_dma_byte_count {
+        is read_only;
+    }
+
+    register early_rx_int {
+        is unimplemented;
+    }
+
+    register flow_control {
+        field fc_threshold[2:0];
+        field xon[8];
+        field xoff[9];
+        field fc_full[10];
+        field fc_paused[11];
+        field fc_paused_low[12];
+    }
+
+    register pmdr {
+        field pme_status[0];
+        field tco_request[1];
+        field force_tco[2];
+        field tco_ready[3];
+        field interesting_packet[5];
+        field magic_packet[6];
+        field link_status_change[7];
+    }
+
+    register general_control {
+        is unimplemented;
+    }
+
+    register general_status {
+        field status[0] is (read_only) { // Linked
+            parameter hard_reset_value = 1;
+        }
+        field speed[1] is (read_only) { // 100M
+            parameter hard_reset_value = 1;
+        }
+        field mode[2] is (read_only) { // Full
+            parameter hard_reset_value = 1;
+        }
+    }
+
+    register internal_status {
+        // Promiscuous mode, 1 - YES, 0 - NO
+        field promis[1];
+        // Disable broadcast, 1 - Disable, 0 - Enable
+        field dis_broadcast[2];
+        // Dynamic tbd enabling, 1 - Enable, 0 - Disable
+        field dyn_tbd[3];
+        // Save bad frames, 1 - Save, 0 - Discard
+        field save_bad_frames[4];
+        // Discard overrun frames, 1 - Pass, 0 - Discard
+        field discard_overrun[5];
+        // Extended statistical counters, 1 - Standard, 0 - Extended
+        field ex_stat_counters[6] {
+            parameter hard_reset_value = 1;
+        }
+        // Extended transmit control block, 1 - Standard, 0 - Extended
+        field ex_tcb[7] {
+            parameter hard_reset_value = 1;
+        }
+        // CNA(Not-Active) or only CI(Idle) interrupt, 1 - CI, 0 - CNA
+        field cna_intr[8];
+        // Discard short receive frames, 0 - Pass, 1 - Discard
+        field discard_short[9];
+        // CSMA disable, 1 - Disable, 0 - Enable
+        field disable_csma[10];
+        // TCP/UDP checksum for incoming packets, 1 - Add , 0 - Not add
+        field tcp_udp_checksum[11];
+        // Loopback type, 00 - No loopback, 01 - Internal, 11 - External
+        field loopback_type[13:12];
+        // No source address insertion, 0 - SA insertion, 1 - No
+        field no_sa_ins[14];
+        // CRC16 or CRC32, 0 - 32-bit CRC engine, 1 - 16-bit
+        field crc32_crc16[15];
+        // Long receive OK, 0 - Disable, 1 - Enable
+        field recv_long[16];
+        // Transfer received CRC, 0 - Disable, 1 - Enable
+        field tx_recv_crc[17];
+        // Multiple IA, 0 - Disable, 1 - Enable
+        field multi_ia[18];
+        // Multicast all, 0 - Disable, 1 - Enable
+        field multicast_all[19];
+        // Padding of short outgoing packets, 1 - Disable, 0 - Enable
+        field tx_disable_padding[20];
+
+        // Re-transmit counter, decrement from MAX_RETRANSMIT_COUNT
+        field retrans_counter[31:24] {
+            parameter hard_reset_value = MAX_RETRANSMIT_COUNT;
+        }
+        method after_write(memop) {
+            inline $update_internal_status();
+        }
+    }
+}
+
+method update_int() {
+    local bool should_raise;
+    local bool has_intr;
+    inline $csr.scb_status.check_intr_val() -> (has_intr);
+    should_raise = $csr.scb_command.m == 0 && has_intr;
+    if ($csr.irq_raised == 0 && should_raise) {
+        log info, 3: "raise %d interrupt pin", $pci_config.interrupt_pin - 1;
+        call $pci_raise_interrupt_pin($pci_config.interrupt_pin - 1 );
+        $csr.irq_raised = 1;
+    }
+    if ($csr.irq_raised == 1 && !should_raise) {
+        log info, 3: "lower %d interrupt pin", $pci_config.interrupt_pin - 1;
+        call $pci_lower_interrupt_pin($pci_config.interrupt_pin - 1 );
+        $csr.irq_raised = 0;
+    }
+}
+
+method update_internal_status() {
+    log info, 3: "turn %s promiscuous mode",
+        ($csr.internal_status.promis == 1) ? "on" : "off";
+    $phy.ieee_802_3_phy_v2.set_promiscous_mode($csr.internal_status.promis);
+}
+
+method process_cu_command() {
+    local uint32 cmd;
+
+    cmd = $csr.scb_command.cuc;
+    log info, 3: "receive a CU command %4x", cmd;
+    switch(cmd) {
+        case CU_NOP:
+            break;
+        case CU_START:
+            if ($csr.scb_status.cus == CUS_LPQ_ACTIVE
+                || $csr.scb_status.cus == CUS_HQP_ACTIVE) {
+                log spec_viol, 3:
+                    "prohibited to start CU when CU is in active state";
+            } else {
+                // Assuming start a new CBL even in suspended state
+                $csr.next_cmd_off = $csr.scb_gp;
+                $csr.internal_status.retrans_counter = MAX_RETRANSMIT_COUNT;
+                $csr.scb_status.cus = CUS_LPQ_ACTIVE;
+                call $start_command_unit();
+            }
+            break;
+        case CU_RESUME:
+        case CU_STATIC_RESUME:
+            if ($csr.scb_status.cus == CUS_IDLE) {
+                log info, 3: "CU ignores resume when in idle";
+            } else if( $csr.scb_status.cus == CUS_LPQ_ACTIVE
+                || $csr.scb_status.cus == CUS_HQP_ACTIVE ) {
+                log info, 2: "CU is active now, cannot execute any command";
+            } else {
+                $csr.scb_status.cus = CUS_LPQ_ACTIVE;
+                call $start_command_unit();
+            }
+            break;
+        case CU_LOAD_DUMP_COUNTERS_ADDRESS:
+            $csr.counters_dump_address = $csr.scb_gp;
+            $csr.scb_gp = 0;
+            break;
+        case CU_DUMP_STATISTICAL_COUNTERS:
+            call $dump_stat_counters($csr.counters_dump_address);
+            break;
+        case CU_LOAD_CU_BASE:
+            if ($csr.scb_status.cus == CUS_IDLE) {
+                $csr.cu_base = $csr.scb_gp;
+                log info, 3: "CU base is configured to 0x%x", $csr.scb_gp;
+                // CU is still in idle state for it doesn't know the first block
+                $csr.scb_gp = 0;
+            } else {
+                log spec_viol, 3:
+                    "prohibited to load CU base if CU not in idle";
+            }
+            break;
+        case CU_DUMP_RESET_STATISTICAL_COUNTERS:
+            call $dump_stat_counters($csr.counters_dump_address);
+            inline $clear_stat_counters();
+            break;
+        default:
+            log info, 2: "unknown command unit command %4x", cmd;
+            break;
+    }
+}
+
+method process_ru_command() {
+    log info, 3: "receive a RU command %4x", $csr.scb_command.ruc;
+    switch ($csr.scb_command.ruc) {
+        case RUC_NOP:
+            break;
+        case RUC_LOAD_RU_BASE:
+            if ($csr.scb_status.rus == RUS_IDLE) {
+                $csr.ru_base = $csr.scb_gp;
+                log info, 3: "RU base is configured to 0x%x", $csr.scb_gp;
+                // RU is still in idle state for it doesn't know the first RFD!
+                $csr.scb_gp = 0;
+            } else {
+                log spec_viol, 3:
+                    "prohibited to load RU base if RU not in idle";
+            }
+            break;
+        case RUC_LOAD_HEADER_DATA_SIZE:
+            log unimpl, 3: "not supported";
+            break;
+        case RUC_START:
+            if ($csr.scb_status.rus != RUS_READY) {
+                // Software launches a new first RFD
+                $csr.rfa_header = $csr.scb_gp;
+                // The next RFD will reset too!
+                $csr.next_rfd_addr = $csr.rfa_header;
+                $csr.next_rbd_addr = I82559_NULL_POINTER;
+                $csr.scb_gp = 0; // Clear it to prevent software starts again
+                $csr.scb_status.rus = RUS_READY;
+                log info, 3: "RU is ready";
+            } else {
+                log spec_viol, 3:
+                    "prohibited to start when RU is in ready";
+            }
+            break;
+        case RUC_RBD_RESUME:
+                $csr.next_rbd_addr = I82559_NULL_POINTER;
+            break;
+        case RUC_RESUME:
+            if ($csr.scb_status.rus == RUS_SUSPENDED) {
+                $csr.scb_status.rus = RUS_READY;
+                log info, 3: "RU is resumed to be ready";
+            } else {
+                log info, 3: "RU ignores RESUME if it is not in SUSPENDED";
+            }
+            break;
+        case RUC_ABORT:
+            if ($csr.scb_status.rus == RUS_READY) {
+                // Raise a RNR(RU Not Ready) interrupt
+                $csr.scb_status.rnr = 1; // update_int() will be called in ONCE!
+            }
+            $csr.scb_status.rus = RUS_IDLE;
+            break;
+        case RUC_RECEIVE_DMA_REDIRECT:
+            log unimpl, 3: "receive DMA redirect";
+            break;
+        default:
+            log spec_viol, 3: "invalid RU command 0%x",
+                $csr.scb_command.ruc;
+            break;
+    }
+}
+
+method read_target_memory_data(uint32 data_addr, uint32 data_len, uint8 *buf)
+        -> (int result) {
+    local exception_type_t ex;
+
+    if (buf == NULL || data_len == 0) {
+        result = I82559_ME_Invalid_Parameter;
+        return;
+    }
+
+    log info, 3: "fetching a %d bytes target memory at 0x%x",
+            data_len, data_addr;
+    call $pci_data_from_memory(Sim_Addr_Space_Memory, cast(buf, void *),
+            data_addr, data_len) -> (ex);
+    if (ex != Sim_PE_No_Exception) {
+        log error: "exception %d in fetching %d bytes at 0x%x",
+            ex, data_len, data_addr;
+        result = I82559_ME_Read_Target_Memory_Error;
+        return;
+    }
+
+    result = I82559_ME_No_Exception;
+}
+
+method write_target_memory_data(uint8 *buf, uint32 data_len,
+                                uint32 data_addr) -> (int result) {
+    local exception_type_t ex;
+
+    if (buf == NULL || data_len == 0) {
+        result = I82559_ME_Invalid_Parameter;
+        return;
+    }
+
+    log info, 3: "writing a %d bytes data to target memory at 0x%x",
+        data_len, data_addr;
+    call $pci_data_to_memory(Sim_Addr_Space_Memory, cast(buf, void *),
+            data_addr, data_len) -> (ex);
+    if (ex != Sim_PE_No_Exception) {
+        log error: "exception %d in writing data %d bytes at 0x%x",
+            ex, data_len, data_addr;
+        result = I82559_ME_Write_Target_Memory_Error;
+        return;
+    }
+
+    result = I82559_ME_No_Exception;
+}
+
+method read_command(general_action_command_t *cmd, uint32 addr,
+                    uint32 read_more) -> (int result) {
+    local uint32    cmd_len = sizeoftype(general_action_command_t) + read_more;
+inline $read_target_memory_data(addr, cmd_len, cast(cmd, uint8*))
+    -> (result);
+}
+
+method write_rfd(receive_frame_descriptor_t *rfd, uint32 addr) -> (int result) {
+local uint32    rfd_len = sizeoftype(receive_frame_descriptor_t);
+call $write_target_memory_data(cast(rfd, uint8*), rfd_len, addr)
+    -> (result);
+}
+
+method start_command_unit() {
+    local int       result;
+    local uint8     high_byte;
+    local uint8     low_byte;
+    local uint16    status_word;
+    local uint32    cmd_cnt;
+    local uint32    cmd_addr;
+    local uint3     op_code;
+    local general_action_command_t  cmd;
+
+    cmd_cnt = 0;
+    while (true) {
+        // Get the address of CBL from SCB general pointer
+        cmd_addr = $csr.cu_base + $csr.next_cmd_off;
+        // Wrap around tail to the head???
+
+        // Read the command in the CB
+        call $read_command(&cmd, cmd_addr, 0) -> (result);
+        if (result != I82559_ME_No_Exception) {
+            log info, 2: "read command errors, stops command processing";
+            $csr.scb_status.cus = CUS_IDLE; // Back to idle state for a new CBL!
+            $csr.scb_status.cna = 1;
+            return;
+        }
+
+        // default is command successful, command-specific code
+        // can overwrite this flag if non-successful.
+        cmd.hdr_bits.ok = 1;
+
+        // Process the command
+        op_code = cmd.hdr_bits.cmd;
+        result = I82559_ME_No_Exception;
+        switch (op_code) {
+        case ACTION_CMD_TRANSMIT:
+            call $do_transmit(&cmd, cmd_addr) -> (result);
+            break;
+        case ACTION_CMD_INDIVIDUAL_ADDRESS_SETUP:
+            call $do_ia_setup(&cmd, cmd_addr) -> (result);
+            break;
+        case ACTION_CMD_CONFIGURE:
+            call $do_configure(&cmd, cmd_addr) -> (result);
+            break;
+        case ACTION_CMD_MULTICAST_ADDRESS_SETUP:
+            call $do_ma_setup(&cmd, cmd_addr) -> (result);
+            break;
+        case ACTION_CMD_NOP:
+            break;
+        case ACTION_CMD_LOAD_MICROCODE:
+            log unimpl, 3: "load microcode";
+            break;
+        case ACTION_CMD_DIAGNOSE:
+            log unimpl, 3: "diagnose";
+            break;
+        case ACTION_CMD_DUMP:
+            call $do_dump(&cmd, cmd_addr) -> (result);
+            break;
+        default:
+            log spec_viol, 2: "undefined command %d", op_code;
+            break;
+        }
+
+        if (result == I82559_ME_No_Bandwidth) {
+            if( --$csr.internal_status.retrans_counter > 0) {
+                local bool posted;
+                $csr.scb_status.cus = CUS_LPQ_ACTIVE;
+                // DNT update the next command offset
+                // DNT trigger the interrupt
+                // Post a re-transmit event to transmit this packet again
+                inline $retrans_packet.posted(NULL) -> (posted);
+                if (!posted)
+                    inline $retrans_packet.post($retrans_interval, NULL);
+                break;
+            }
+            // Terminate this packet transmission
+            log info, 2: "all %d times re-transmission failed",
+                MAX_RETRANSMIT_COUNT;
+            cmd.hdr_bits.ok = 0;
+            $csr.tx_max_collisions++;
+            $csr.tx_total_collisions++;
+        }
+
+        /* Always mark the descriptor completed, even if it was
+           non-successful */
+        cmd.hdr_bits.completion = 1;
+
+        call $write_target_memory_data(cast(&cmd, uint8*), 2, cmd_addr)
+            -> (result);
+        status_word = cast(cmd.hdr_bits, uint32) & 0xFFFF;
+        if (result == I82559_ME_No_Exception)
+            log info, 3: "write command status word 0x%02x to 0x%x",
+                status_word, cmd_addr;
+        else
+            log info, 2: "write command status word 0x%02x to 0x%x failed",
+                status_word, cmd_addr;
+
+        if (cmd.hdr_bits.interrupt == 1) {
+            $csr.scb_status.cx = 1;
+        }
+
+        if (cmd.hdr_bits.suspend == 1) {
+            $csr.scb_status.cus = CUS_SUSPENDED;
+            if ($csr.internal_status.cna_intr == 0)
+                $csr.scb_status.cna = 1;
+        }
+
+        if (cmd.hdr_bits.enter_idle == 1) {
+            $csr.scb_status.cus = CUS_IDLE;
+            $csr.scb_status.cna = 1;
+        }
+
+        // How to assure this link_address is not an uninitialized value?
+        if (cmd.link_address == 0) {
+            // 82559 thinks 0 maybe cause backing to CU_BASE and endless loop
+            log info, 2:
+            "82559 will terminate handling CBL when meeting a 0 link address";
+            $csr.scb_status.cus = CUS_IDLE;
+            $csr.scb_status.cna = 1;
+        } else {
+            if (++cmd_cnt > MAX_CMD_COUNT) {
+                log info, 2:
+                "command count exceeds %d in one list, terminates at once",
+                MAX_CMD_COUNT;
+                $csr.scb_status.cus = CUS_IDLE;
+                $csr.scb_status.cna = 1;
+            } else
+                $csr.next_cmd_off = cmd.link_address;
+        }
+        $csr.internal_status.retrans_counter = MAX_RETRANSMIT_COUNT;
+
+        if ($csr.scb_status.cus==CUS_IDLE || $csr.scb_status.cus==CUS_SUSPENDED)
+            break;
+    }
+}
+
+method crc32(const uint8 *src, uint32 length) -> (uint32 crc) {
+    local int i;
+    local uint32 crc_poly_le = 0xedb88320;
+    crc = 0xFFFFFFFF;
+    while (length > 0) {
+        crc ^= *src++;
+        for (i=0; i<8; i++)
+            crc = (crc >> 1) ^ (((crc & 1) != 0) ? crc_poly_le : 0);
+        length--;
+    }
+    crc ^= 0xFFFFFFFF;
+}
+
+method do_transmit(general_action_command_t *cmd,
+                   uint32 cmd_addr) -> (int result) {
+    // Check bandwidth firstly
+    if ($csr.internal_status.loopback_type == 0x0
+        && $phy.obj != NULL
+        && $phy.ieee_802_3_phy_v2.check_tx_bandwidth() == 0) {
+        result = I82559_ME_No_Bandwidth;
+        log info, 3: "cannot transmit due to no bandwidth";
+        return;
+    }
+    result = I82559_ME_No_Exception;
+    cmd->hdr_bits.completion = 1;
+    cmd->hdr_bits.ok = 0;
+    cmd->hdr_bits.underrun = 0;
+
+    local dbuffer_t *frame = new_dbuffer();
+    local dbuffer_t *array_buf = new_dbuffer();
+    call $do_do_transmit(cmd, cmd_addr, frame, array_buf) -> (result);
+    dbuffer_free(frame);
+    dbuffer_free(array_buf);
+}
+
+method do_do_transmit(general_action_command_t *cmd,
+                   uint32 cmd_addr, dbuffer_t *frame,
+                   dbuffer_t *array_buf) -> (int result) {
+    local uint8     tbd_cnt;
+    local uint8    *some_bytes;
+    local uint8    *data_buf;
+    local uint1     array_mode;
+    local uint1     no_crc;
+    local uint32    byte_idx;
+    local uint32    byte_end;
+    local uint32    data_len = 0;
+    local uint32    data_addr;
+    local uint32    tbd_addr;
+    local uint32    tbd_arr_addr;
+    local uint32    data_in_tcb;
+    local transmit_buffer_descriptor_t          tbd_buf;
+    local transmit_command_optional_1_bits_t    t_opt1;
+
+    memcpy(&t_opt1, &cmd->optional_1,
+           sizeoftype(transmit_command_optional_1_bits_t));
+    array_mode = cmd->hdr_bits.simple_or_fixed;
+    no_crc = cmd->hdr_bits.no_crc_source_addr;
+
+    if (array_mode == SIMPLE_TCB_MODE) {
+        if (cmd->optional_0 != I82559_NULL_POINTER) {
+            log spec_viol:
+                "Third command word is 0x%x, should be 0x%x in Simple TCB mode",
+                cmd->optional_0, I82559_NULL_POINTER;
+        }
+        // Simple data array mode, data is in the TCB, and length is next word
+        data_len = t_opt1.bits.tcb_byte_count;
+        data_addr = cmd_addr + SIMPLE_DATA_OFF;
+
+        // Read the data from the memory
+        call $read_target_memory_data(
+            data_addr, data_len, dbuffer_append(frame, data_len)) -> (result);
+        if (result != I82559_ME_No_Exception)
+            return;
+    } else if (array_mode == FLEXIBLE_TCB_MODE) {
+        // Flexible mode, data is in the TCB(optional) and a linked list of the TBDs
+        tbd_arr_addr = cmd->optional_0 + $csr.cu_base;
+        tbd_cnt = t_opt1.bits.tbd_number;
+        data_in_tcb = t_opt1.bits.tcb_byte_count;
+
+        log info, 3:
+            "TBD pointer: 0x%X, data in TCB: %d bytes, TBD count: %d",
+            tbd_arr_addr, data_in_tcb, tbd_cnt;
+        if (data_in_tcb > MAX_FRAME_LEN || tbd_cnt > MAX_TBD_COUNT) {
+            log info, 2:
+                "%s: pointer: 0x%X, data in TCB: %d bytes, TBD count: %d",
+                "Invalid transmit buffer descriptor array parameters",
+                tbd_arr_addr, data_in_tcb, tbd_cnt;
+            result = I82559_ME_Invalid_Parameter;
+            return;
+        }
+        if (tbd_cnt == 0 ) {
+            if (tbd_arr_addr != 0)
+                log info,3: "TBD array address 0x%X must be null", tbd_arr_addr;
+            if (t_opt1.bits.eof != 1)
+                log info, 3: "TCB EOF %d must be set", t_opt1.bits.eof;
+            if (data_in_tcb == 0) {
+                log info,3:"the frame byte count cannot be 0";
+                result = I82559_ME_Not_Enough_Data;
+                return;
+            }
+        }
+
+        if (tbd_cnt == 0xFF && $csr.internal_status.dyn_tbd == 0) {
+            log info, 2: "dynamic mode is not set while using such TBD";
+            result = I82559_ME_Not_Enough_Data;
+            return;
+        }
+
+        if (data_in_tcb > 0) {
+            data_addr = cmd_addr + SIMPLE_DATA_OFF;
+            data_buf = dbuffer_append(frame, data_in_tcb);
+            call $read_target_memory_data(data_addr, data_in_tcb, data_buf)
+                -> (result);
+            if (result != I82559_ME_No_Exception)
+                return;
+        }
+
+        // Read the TBD array with maximum 255 elements in dynamic mode
+        tbd_addr = tbd_arr_addr;
+        while (true) {
+            // Read one by one
+            call $read_target_memory_data(tbd_addr, TBD_SIZE,
+                                          cast(&tbd_buf, uint8*)) -> (result);
+            if (result != I82559_ME_No_Exception) {
+                log info, 3: "read 8-byte TBD at 0x%X failed", tbd_addr;
+                return;
+            }
+
+            data_addr = tbd_buf.address;
+            data_len = tbd_buf.bits.size;
+            if (data_len == 0 || data_len > MAX_FRAME_LEN)  {
+                log info, 2:
+                    "too large or too short length upto %d bytes", data_len;
+                result = I82559_ME_Invalid_Parameter;
+                return;
+            }
+
+            data_buf = dbuffer_append(frame, data_len);
+            call $read_target_memory_data(data_addr, data_len, data_buf)
+                    -> (result);
+            if (result != I82559_ME_No_Exception)
+                return;
+
+            if (tbd_buf.bits.el == 1) { // Last TBD associated with this frame
+                log info, 3: "82559 meets the EL set buffer in the frame";
+                break;
+            }
+
+            tbd_addr += 8;
+            if (tbd_addr >= (tbd_arr_addr + TBD_SIZE * tbd_cnt))
+                break;
+        }
+    }
+
+    // Build the frame if necessary
+    if ($csr.internal_status.no_sa_ins == 0) { // 82559 should insert the SA
+        inline $insert_source_mac(frame);
+    }
+
+    data_len = dbuffer_len(frame);
+    if ($csr.internal_status.tx_disable_padding == 1) {
+	if(data_len < 64) {
+	    log info, 2: "Suspicious packet is %d bytes only", data_len;
+	}
+    }
+    else {
+	 // HW-pad small packets
+	if((data_len < 60) && (no_crc == 0)) {
+	    // this checks for size 60 since the CRC appended below is 4 bytes
+	    dbuffer_append_value(frame, 0x7e, 60 - data_len);
+	}
+	else if((data_len < 64) && (no_crc)) {
+	    // there's a CRC field already added to strip off
+	    dbuffer_remove_tail(frame, 4); //remove old 4-byte CRC
+	    dbuffer_append_value(frame, 0x7e, 64 - data_len + 4);
+	    no_crc = 0; // ask for new CRC
+	}
+    }
+
+    if (no_crc == 0) { // Controller should insert the CRC
+        inline $insert_crc(frame);
+    }
+
+    // Check whether to loopback this frame
+    if ($csr.internal_status.loopback_type == 0x1
+        || $csr.internal_status.loopback_type == 0x3) {
+        call $receive_packet(frame);
+        result = I82559_ME_No_Exception;
+        cmd->hdr_bits.ok = 1;
+        return;
+    }
+
+    if ($phy.obj == NULL) {
+        log error, 2: "802.3 PHY is not connected";
+        result = I82559_ME_Null_Ptr;
+        return;
+    }
+
+    // Check bandwidth again
+    if ($phy.ieee_802_3_phy_v2.check_tx_bandwidth() == 0) {
+        log info, 2: "802.3 PHY reports no bandwidth";
+        result = I82559_ME_No_Bandwidth;
+        return;
+    }
+
+    // Now send out the frame,
+    result = $phy.ieee_802_3_phy_v2.send_frame(frame, 0); // 0 - CRC is ready!
+    if (result == -1) {
+        result = I82559_ME_No_Bandwidth;
+        log info, 2: "send frame to PHY failed for no bandwidth";
+        return;
+    } else {
+        // At first log this important event to let user know it
+        data_len = dbuffer_len(frame);
+        some_bytes = dbuffer_update(frame, 0, data_len);
+        log info, 3: "%s %d %s, %s: %2x %2x %2x %2x %2x %2x",
+            "send a frame having", data_len, "bytes",
+            "beginning bytes are", some_bytes[0], some_bytes[1], some_bytes[2],
+            some_bytes[3], some_bytes[4], some_bytes[5];
+        $csr.tx_good_frames++;
+        $retrans_interval = NANSECS_TO_SEND_ONE_BYTE * data_len;
+    }
+
+    // Update transmit specific status
+    result = I82559_ME_No_Exception;
+    cmd->hdr_bits.ok = 1;
+}
+
+method dump_stat_counters(uint32 addr) {
+    local int       result;
+    local uint8     stat_buf[MAX_STAT_COUNTERS * 4];
+
+    memset(stat_buf, 0, sizeof(stat_buf));
+    UNALIGNED_STORE_LE32(stat_buf +  0, $csr.tx_good_frames);
+    UNALIGNED_STORE_LE32(stat_buf +  4, $csr.tx_max_collisions);
+    UNALIGNED_STORE_LE32(stat_buf + 36, $csr.rx_good_frames);
+    UNALIGNED_STORE_LE32(stat_buf + 48, $csr.rx_res_errors);
+    UNALIGNED_STORE_LE32(stat_buf + 40, $csr.rx_crc_errors);
+    UNALIGNED_STORE_LE32(stat_buf + 60, $csr.rx_too_short_frames);
+
+    call $write_target_memory_data(stat_buf,
+                                   sizeof(stat_buf), addr) -> (result);
+    if (result != sizeof(stat_buf)) {
+        log info, 2:
+            "dump %d counters at 0x%x failed",MAX_STAT_COUNTERS, addr;
+        result = I82559_ME_Write_Target_Memory_Error;
+        return;
+    }
+    result = I82559_ME_No_Exception;
+}
+
+method clear_stat_counters() {
+    $csr.rx_res_errors = 0;
+}
+
+method del_mac(uint64 mac_addr) {
+    local byte_string_t mac_string;
+    local uint8 bytes[8];
+
+    if (mac_addr == 0x00)
+        return;
+    mac_string.len = 6;
+    mac_string.str = bytes;
+    UNALIGNED_STORE_LE64(bytes, mac_addr);
+    $phy.ieee_802_3_phy_v2.del_mac(mac_string);
+}
+
+method add_mac(uint64 mac_addr) {
+    local byte_string_t mac_string;
+    local uint8 bytes[8];
+
+    if (mac_addr == 0x00)
+        return;
+    mac_string.len = 6;
+    mac_string.str = bytes;
+    UNALIGNED_STORE_LE64(bytes, mac_addr);
+    $phy.ieee_802_3_phy_v2.add_mac(mac_string);
+}
+
+method do_ia_setup(general_action_command_t *cmd, uint32 cmd_addr)
+-> (int result) {
+    local uint64    mac_addr;
+
+    if (cmd == NULL) {
+        result = I82559_ME_Invalid_Parameter;
+        return;
+    }
+
+    mac_addr = UNALIGNED_LOAD_LE64(cast(cmd, uint8*) + 8);
+    // Un-register current mac address
+    if (mac_addr != $csr.mac_address) {
+        inline $del_mac($csr.mac_address);
+        inline $add_mac(mac_addr);
+        $csr.mac_address = mac_addr;
+        log info, 3:
+            "register a MAC address: %02x:%02x:%02x:%02x:%02x:%02x",
+             mac_addr[47:40], mac_addr[39:32], mac_addr[31:24],
+             mac_addr[23:16], mac_addr[15:8],  mac_addr[7:0];
+        call $save_eeprom_configurations();
+    } else  {
+        log info, 2: "try to setup same MAC address as current";
+    }
+
+    result = I82559_ME_No_Exception;
+}
+
+method le_dword_arr_to_byte_arr(le_dword_t *dword_arr,
+                                uint8 *byte_arr, uint32 byte_cnt) {
+    local int byte_idx;
+    local int dword_idx;
+
+    for (dword_idx = 0, byte_idx = 0; dword_idx < byte_cnt/4;
+         dword_idx++, byte_idx += 4) {
+        byte_arr[byte_idx + 0] =  dword_arr[dword_idx].data        & 0xFF;
+        byte_arr[byte_idx + 1] = (dword_arr[dword_idx].data >>  8) & 0xFF;
+        byte_arr[byte_idx + 2] = (dword_arr[dword_idx].data >> 16) & 0xFF;
+        byte_arr[byte_idx + 3] = (dword_arr[dword_idx].data >> 24) & 0xFF;
+    }
+}
+
+method do_ma_setup(general_action_command_t *cmd, uint32 cmd_addr)
+-> (int result) {
+    local int       multi_idx;
+    local int       mac_bytes_off = 10;
+    local int       max_cmd_len = 256;
+    local uint8    *byte_ptr;
+    local uint8    *mac_ptr;
+    local uint32    byte_cnt;
+    local uint64    mac_addr;
+    local uint8     byte_buf[256];
+    local le_dword_t    mac_buf[256 / 4];
+
+    result = I82559_ME_No_Exception;
+
+    byte_cnt = cmd->optional_0 & 0x3FFF;
+    byte_cnt -= (byte_cnt % 6);
+
+    if (byte_cnt == 0) {
+        log info, 3:
+            "multicast setup command byte count %d is not enough",
+            cmd->optional_0 & 0x3FFF;
+        result = I82559_ME_Not_Enough_Data;
+        return;
+    }
+
+    if ((byte_cnt + mac_bytes_off) >= max_cmd_len) {
+        log info, 2:
+            "multicast setup command length is larger than %d bytes",
+            max_cmd_len;
+        byte_cnt = max_cmd_len - mac_bytes_off;
+    }
+
+    // Load the bytes into a new buffer
+    call $read_command(
+        cast(mac_buf, general_action_command_t*), cmd_addr,
+        byte_cnt + mac_bytes_off - sizeoftype(general_action_command_t))
+        -> (result);
+    if (result != I82559_ME_No_Exception) {
+        log info, 3: "failed to load the multicast addresses";
+        return;
+    }
+    // Copy the little-endian dword into a byte array
+    inline $le_dword_arr_to_byte_arr(mac_buf, byte_buf, byte_cnt + mac_bytes_off);
+    byte_ptr = byte_buf + mac_bytes_off;
+
+    // Remove current multicast mac address
+    if ($phy.obj != NULL) {
+        for (multi_idx = 0; multi_idx < MAX_MULTICAST_ADDR; multi_idx++) {
+            if ($csr.multicast_address[multi_idx] != 0x00)
+                inline $del_mac($csr.multicast_address[multi_idx]);
+            $csr.multicast_address[multi_idx] = 0x000000000000;
+        }
+    }
+    // Add new multicast mac address one by one
+    for (mac_ptr = byte_ptr, multi_idx = 0; mac_ptr < byte_ptr + byte_cnt;
+         mac_ptr = mac_ptr + 6, multi_idx++) {
+         if (multi_idx >= MAX_MULTICAST_ADDR) {
+            log info,3:"multicast address count exceeds %d, won't set it up",
+                    MAX_MULTICAST_ADDR;
+            break;
+        }
+        mac_addr = UNALIGNED_LOAD_LE64(mac_ptr);
+
+        if ($phy.obj != NULL) {
+            inline $add_mac(mac_addr);
+            if ((mac_addr & 0x1) == 0x1) log info, 3:
+                "setup a multicast 0x%12x", mac_addr;
+            else log info, 3:
+                "won't setup a multicast 0x%12x not beginning with bit 1",
+                mac_addr;
+        } else {
+            log info, 3: "cannot setup a multicast for no 802.3 PHY";
+        }
+        $csr.multicast_address[multi_idx] = mac_addr;
+    }
+
+    result = I82559_ME_No_Exception;
+}
+
+method fixup_configure_bytes(uint8 *byte_ptr, int byte_cnt) {
+    assert(byte_cnt >= MAX_CONFIG_BYTES);
+
+    memset(byte_ptr, 0, byte_cnt);
+
+    byte_ptr[0] = 0x16;
+
+    byte_ptr[6] = ($csr.internal_status.cna_intr << 3)
+        + ($csr.internal_status.ex_tcb << 4)
+        + ($csr.internal_status.ex_stat_counters << 5)
+        + ($csr.internal_status.discard_overrun << 6)
+        + ($csr.internal_status.save_bad_frames << 7)
+        + 0x02;
+
+    byte_ptr[7] = ($csr.internal_status.discard_short << 0)
+        + ($csr.internal_status.dyn_tbd << 7);
+
+    byte_ptr[8] = ($csr.internal_status.disable_csma << 7) + 0x01;
+
+    byte_ptr[9] = ($csr.internal_status.tcp_udp_checksum << 0);
+
+    byte_ptr[10] = ($csr.internal_status.no_sa_ins << 3)
+        + ($csr.internal_status.loopback_type << 6)
+        + 0x06;
+
+    byte_ptr[11] = 0x00;
+    byte_ptr[12] = 0x01;
+    byte_ptr[13] = 0x00;
+    byte_ptr[14] = 0xF2;
+
+    byte_ptr[15] = ($csr.internal_status.promis << 0)
+        + ($csr.internal_status.dis_broadcast << 1)
+        + ($csr.internal_status.crc32_crc16 << 5)
+        + 0x08 + 0x40;
+
+    byte_ptr[18] = (($csr.internal_status.tx_disable_padding ^ 1) << 1) | 
+    ($csr.internal_status.tx_recv_crc << 2) |
+        ($csr.internal_status.recv_long << 3) | 0x80;
+
+    byte_ptr[20] = ($csr.internal_status.multi_ia << 6) + 0x1F;
+
+    byte_ptr[21] = ($csr.internal_status.multicast_all << 3) + 1 + 0x04;
+}
+
+method load_eeprom_configurations() {
+    local int           word_idx;
+    local le_word_t    *word_ptr;
+    local uint64        mac_addr;
+    local uint8         conf_buf[MAX_CONFIG_BYTES];
+    local eeprom_config_header_t    ee_hdr;
+    local eeprom_config_tail_t      ee_tail;
+
+    word_ptr = cast(&ee_hdr, le_word_t*);
+    for (word_idx = 0;
+         word_idx < sizeoftype(eeprom_config_header_t)/sizeoftype(le_word_t);
+         word_idx++) {
+        word_ptr[word_idx].data=$serial_eeprom.microwire.read_word(word_idx);
+    }
+
+    // Check the valid bit
+    if (ee_hdr.control_bits.sig != 1) {
+        log info, 3: "EEPROM configurations are invalid, default values are used";
+        return;
+    }
+
+    local uint64 *ptr = cast(&ee_hdr, uint64*);
+    mac_addr = UNALIGNED_LOAD_LE64(ptr);
+    if (mac_addr == 0x00) {
+       mac_addr = DEFAULT_MAC_ADDRESS;
+        log info, 3:
+            "MAC address is reset to the default FF:FF:FF:FF:FF:FF";
+    }
+    if ($csr.mac_address != mac_addr && $phy.obj != NULL) {
+        inline $del_mac($csr.mac_address);
+        inline $add_mac(mac_addr);
+        $csr.mac_address = mac_addr;
+        log info, 3:
+            "MAC address is configured to %02x:%02x:%02x:%02x:%02x:%2x.",
+            ee_hdr.ia_byte_1, ee_hdr.ia_byte_2, ee_hdr.ia_byte_3,
+            ee_hdr.ia_byte_4, ee_hdr.ia_byte_5, ee_hdr.ia_byte_6;
+    }
+}
+
+method save_eeprom_configurations() {
+    local int           word_idx;
+    local le_word_t    *word_ptr;
+    local uint8         mac_bytes[8];
+
+    // It only needs to save the MAC address
+    UNALIGNED_STORE_LE64(mac_bytes, $csr.mac_address);
+    word_ptr = cast(&mac_bytes, le_word_t*);
+    for( word_idx = 0; word_idx < 3; word_idx++) {
+        $serial_eeprom.microwire.write_word(word_idx,
+                                            word_ptr[word_idx].data);
+    }
+}
+
+method config_internal_status(uint8 *byte_ptr, int byte_cnt) {
+    if (byte_cnt >= 6) {
+        $csr.internal_status.cna_intr           = (byte_ptr[6] & 0x08) != 0;
+        $csr.internal_status.ex_tcb             = (byte_ptr[6] & 0x10) != 0;
+        $csr.internal_status.ex_stat_counters   = (byte_ptr[6] & 0x20) != 0;
+        $csr.internal_status.discard_overrun    = (byte_ptr[6] & 0x40) != 0;
+        $csr.internal_status.save_bad_frames    = (byte_ptr[6] & 0x80) != 0;
+    }
+
+    if (byte_cnt >= 7) {
+        $csr.internal_status.discard_short      = (byte_ptr[7] & 0x01) != 0;
+        $csr.internal_status.dyn_tbd            = (byte_ptr[7] & 0x80) != 0;
+    }
+
+    if (byte_cnt >= 8) {
+        $csr.internal_status.disable_csma       = (byte_ptr[8] & 0x80) != 0;
+    }
+
+    if (byte_cnt >= 9) {
+        $csr.internal_status.tcp_udp_checksum   = (byte_ptr[9] & 0x01) != 0;
+    }
+
+    if (byte_cnt >= 10) {
+        $csr.internal_status.no_sa_ins          = (byte_ptr[10] & 0x08) != 0;
+        $csr.internal_status.loopback_type      = (byte_ptr[10] & 0xC0) >> 6;
+    }
+
+    if (byte_cnt >= 15) {
+        $csr.internal_status.promis             = (byte_ptr[15] & 0x01) != 0;
+        $csr.internal_status.dis_broadcast      = (byte_ptr[15] & 0x02) != 0;
+        $csr.internal_status.crc32_crc16        = (byte_ptr[15] & 0x20) != 0;
+    }
+
+    if (byte_cnt >= 18) {
+	$csr.internal_status.tx_disable_padding = (byte_ptr[18] & 0x02) == 0;
+        $csr.internal_status.tx_recv_crc        = (byte_ptr[18] & 0x04) != 0;
+        $csr.internal_status.recv_long          = (byte_ptr[18] & 0x08) != 0;
+    }
+
+    if (byte_cnt >= 20) {
+        $csr.internal_status.multi_ia           = (byte_ptr[20] & 0x40) != 0;
+    }
+
+    if (byte_cnt >= 21) {
+        $csr.internal_status.multicast_all      = (byte_ptr[21] & 0x08) != 0;
+    }
+
+    inline $update_internal_status();
+}
+
+method do_configure(general_action_command_t *cmd,
+                    uint32 cmd_addr) -> (int result) {
+    local int           byte_cnt;
+    local int           byte_idx;
+    local uint8        *byte_ptr;
+    local uint8         byte_buf[32];
+    local uint16        word_val;
+    local le_dword_t    conf_buf[8];
+
+    result = I82559_ME_No_Exception;
+
+    // Read all maximum 22 bytes of the configuration bytes
+    call $read_command(
+        cast(conf_buf, general_action_command_t*), cmd_addr,
+        sizeof(conf_buf) - sizeoftype(general_action_command_t)) -> (result);
+    if (result != I82559_ME_No_Exception) {
+        log info, 2: "configure command failed because of reading error";
+        cmd->hdr_bits.ok = 0;
+        return;
+    }
+    inline $le_dword_arr_to_byte_arr(conf_buf, byte_buf, sizeof(conf_buf));
+    byte_ptr = byte_buf + 8; // 8 - offset in block
+
+    byte_cnt = byte_ptr[0] & 0x3F;
+    if (byte_cnt == 0 || byte_cnt > MAX_CONFIG_BYTES)
+        byte_cnt = MAX_CONFIG_BYTES;
+
+    inline $config_internal_status(byte_ptr, byte_cnt);
+}
+
+method write_uint32_to_target_memory(uint32 val, uint32 addr) -> (int result) {
+    local layout "little-endian" {
+        uint32 data;
+    } tmp_val;
+    tmp_val.data = val;
+    call $write_target_memory_data(cast(&tmp_val.data, uint8*), 4, addr)->(result);
+}
+
+method dump_info_space(uint32 addr) -> (int result) {
+    local dump_data_t   dump_data;
+    local uint8         conf_buf[MAX_CONFIG_BYTES];
+
+    result = I82559_ME_No_Exception;
+    memset(&dump_data, 0, DUMP_AREA_BYTES);
+
+    // Dump  14 configuration bytes
+    inline $fixup_configure_bytes(conf_buf, MAX_CONFIG_BYTES);
+    memcpy(&dump_data.conf_byte_8_21[0], conf_buf + 8, 14); // 8 - configure byte 8
+
+    // Dump individual address
+    local uint8 *dump_ptr = cast(&dump_data, uint8*);
+    local uint64 *dump_ptr64 = cast(
+        dump_ptr + sizeof dump_data.fext_bytes
+        + sizeof dump_data.conf_byte_8_21 + sizeof dump_data.reserved_38,
+        uint64*);
+    UNALIGNED_STORE_LE64(dump_ptr64, $csr.mac_address);
+
+    // Dump some counters
+    dump_data.receive_short_frames = $csr.rx_too_short_frames;
+    dump_data.receive_resource_errors = $csr.rx_res_errors;
+    dump_data.receive_crc_errors = $csr.rx_crc_errors;
+    dump_data.receive_good_frames = $csr.rx_good_frames;
+    dump_data.transmit_total_collisions = $csr.tx_total_collisions;
+    dump_data.transmit_maximum_collisions = $csr.tx_max_collisions;
+    dump_data.transmit_good_frames = $csr.tx_good_frames;
+
+    call $write_target_memory_data(cast(&dump_data, uint8*),
+                                   DUMP_AREA_BYTES, addr) -> (result);
+    if (result != I82559_ME_No_Exception) {
+        log info, 2:"dump %d bytes at 0x%X failed",
+            DUMP_AREA_BYTES, addr;
+        return;
+    }
+}
+
+method do_dump(general_action_command_t *cmd, uint32 cmd_addr) -> (int result) {
+    local uint32    buf_addr = cmd->optional_0 + $csr.cu_base;
+    inline $dump_info_space(buf_addr) -> (result);
+    cmd->hdr_bits.ok = (result == I82559_ME_No_Exception) ? 1 : 0;
+}
+
+
+method receive_packet(dbuffer_t *frame) {
+    local int       result;
+    local uint32    byte_idx;
+    local uint32    byte_end;
+    local bool      discarded = false;
+    local const uint8    *some_bytes;
+    local uint32    data_addr;
+    local uint32    data_len;
+    local uint32    frame_len;
+    local uint32    rfd_len;
+    local receive_frame_descriptor_t  rfd;
+
+    // Check the status to see whether it needs to discard it
+    if ($csr.scb_status.rus != RUS_READY) {
+        log info, 3: "RU is not ready, discard a frame";
+        $csr.rx_discarded++;
+        $csr.rx_res_errors++;
+        return;
+    }
+
+    rfd_len = sizeoftype(receive_frame_descriptor_t);
+    frame_len = dbuffer_len(frame);
+    some_bytes = dbuffer_read(frame, 0, frame_len);
+    log info, 3: "%s %d %s, %s: %2x %2x %2x %2x %2x %2x",
+        "receive a frame having", frame_len, "bytes",
+        "beginning bytes are", some_bytes[0], some_bytes[1], some_bytes[2],
+        some_bytes[3], some_bytes[4], some_bytes[5];
+
+    // Read the RFD at first
+    data_addr = $csr.ru_base + $csr.next_rfd_addr;
+    call $read_target_memory_data(data_addr, rfd_len, cast(&rfd, uint8*))
+            -> (result);
+    if (result != I82559_ME_No_Exception || rfd.cmd_stat_bits.c == 1) {
+        $csr.rx_res_errors++;
+        if (result != I82559_ME_No_Exception)
+            log info, 2: "error in reading RFD, has to discard a frame";
+        else
+            log info, 2: "RFDs are filled up, has to discard a frame";
+        $csr.scb_status.rnr = 1;
+        $csr.scb_status.rus = RUS_NO_RESOURCES;
+        inline $update_int();
+        return;
+    }
+
+    rfd.cmd_stat_bits.crc_err = 0;
+    rfd.cmd_stat_bits.align_err = 0;
+    rfd.cmd_stat_bits.out_of_space = 0;
+    rfd.cmd_stat_bits.dma_overrun = 0;
+    rfd.cmd_stat_bits.too_short = 0;
+    rfd.cmd_stat_bits.type_length = 0;
+    rfd.cmd_stat_bits.rcv_err = 0;
+    rfd.cmd_stat_bits.no_addr_match = 0;
+    rfd.cmd_stat_bits.ia_match = 0;
+    rfd.cmd_stat_bits.rcv_collision = 0;
+
+    if (frame_len > MAX_FRAME_LEN) {
+        rfd.cmd_stat_bits.out_of_space = 1;
+        $csr.rx_res_errors++;
+        $csr.rx_too_long_frames++;
+        discarded = true;
+        log info, 3:
+            "frame is longer than %d bytes, discards it", MAX_FRAME_LEN;
+    } else if (frame_len < MIN_FRAME_LEN) {
+        rfd.cmd_stat_bits.too_short = 1;
+        $csr.rx_res_errors++;
+        $csr.rx_too_short_frames++;
+        discarded = true;
+        log info, 3:
+            "frame is shorter than %d bytes, discards it", MIN_FRAME_LEN;
+    }
+
+    if (!discarded) { //receive frame
+        $csr.rx_good_frames++;
+        if (!rfd.cmd_stat_bits.sf) {  //simple mode receive
+            log info, 3: "simple mode receive";
+            data_addr = $csr.ru_base + $csr.next_rfd_addr + rfd_len;
+            data_len = rfd.size_bits.size;
+            if (data_len > frame_len)
+                data_len = frame_len;
+            log info, 3: "write target memory at 0x%X", data_addr;
+            call $write_target_memory_data(dbuffer_update_all(frame),
+                                       data_len, data_addr) -> (result);
+            if (result != I82559_ME_No_Exception) {
+                rfd.cmd_stat_bits.ok = 0;
+                rfd.size_bits.act_cnt = 0;
+            } else {
+                rfd.size_bits.act_cnt = data_len;
+                rfd.cmd_stat_bits.ok = 1;
+                rfd.size_bits.f = 1;
+            }
+        }
+        else { //flexible mode receive
+            local rbd_t   rbd;
+            local uint8*  receive_data;
+            local uint32  remain_len;
+            log info, 3: "flexible mode receive";
+            if ($csr.next_rbd_addr == I82559_NULL_POINTER) {
+                $csr.next_rbd_addr = $csr.ru_base + rfd.rbd_address;
+            }
+            log info, 3: "RBD address 0x%X", $csr.next_rbd_addr;
+            receive_data = dbuffer_update_all(frame);
+            remain_len = frame_len;
+            call $read_target_memory_data($csr.next_rbd_addr,
+                      sizeoftype(rbd_t), cast(&rbd, uint8*)) -> (result);
+            while (result == I82559_ME_No_Exception && remain_len != 0) {
+                data_addr = rbd.buffer_address;
+                data_len = rbd.size_bits.size;
+                if (data_len > remain_len) {
+                    data_len = remain_len;
+                }
+                log info, 3: "write RBD buffer at 0x%X (buffer size = 0x%X)",
+                    data_addr, data_len;
+                call $write_target_memory_data(receive_data,
+                            data_len, data_addr) -> (result);
+                if (result != I82559_ME_No_Exception) {
+                    break;
+                }
+                remain_len = remain_len - data_len;
+                receive_data += data_len;
+                rbd.count_bits.count = data_len;
+                rbd.count_bits.f = 1;
+                rbd.count_bits.eof = 1;
+                //write back rbd
+                call $write_target_memory_data(cast(&rbd, uint8*),
+                       sizeoftype(rbd_t), $csr.next_rbd_addr) -> (result);
+                if (result != I82559_ME_No_Exception) {
+                    break;
+                }
+                if (rbd.size_bits.el && remain_len != 0) { //the end rbd
+                    $csr.next_rbd_addr = I82559_NULL_POINTER;
+                    log error, 2: "meet the end of RBD";
+                    break;
+                }
+                $csr.next_rbd_addr = rbd.link_address;
+                log info, 3: "next RBD address 0x%X", $csr.next_rbd_addr;
+                call $read_target_memory_data($csr.next_rbd_addr,
+                       sizeoftype(rbd_t), cast(&rbd, uint8*)) -> (result);
+            }
+            rfd.size_bits.act_cnt = frame_len - remain_len;
+            if (result != I82559_ME_No_Exception || remain_len != 0){
+                rfd.cmd_stat_bits.ok = 0;
+                $csr.rx_res_errors++;
+                $csr.scb_status.rnr = 1;
+                $csr.scb_status.rus = RUS_NO_RESOURCES;
+                if (result != I82559_ME_No_Exception) {
+                    log error, 2: "error in read/write RBD buffers";
+                }
+                if (remain_len != 0) {
+                    log error, 2: "frame is not fully received";
+                }
+                inline $update_int();
+                return;
+            } else {
+                rfd.cmd_stat_bits.ok = 1;
+                rfd.size_bits.f = 1;
+            }
+        }
+    }
+
+    if (discarded) {
+        $csr.rx_discarded++;
+        $csr.rx_res_errors++;
+        log info, 2: "RU discards a frame, so no frame in this buffer";
+    }
+
+    // Trigger the interrupt to notify driver to fetch the frame
+    $csr.scb_status.fr = 1;
+
+    // Refresh CU status if necessary
+    if (rfd.cmd_stat_bits.s == 1) {
+        $csr.scb_status.rnr = 1;
+        $csr.scb_status.rus = RUS_SUSPENDED;
+        log info, 3: "RU state goes to suspended as RFD S flag requests";
+    }
+
+    data_addr = $csr.ru_base + $csr.next_rfd_addr;
+    if (!rfd.cmd_stat_bits.sf
+      || (rfd.cmd_stat_bits.sf && $csr.next_rbd_addr == I82559_NULL_POINTER)) {
+        //simple mode receive, or flexible mode but rbd is end
+        // Set the status bits
+        rfd.cmd_stat_bits.c = 1;
+        rfd.size_bits.eof = 1;
+        if (rfd.cmd_stat_bits.el == 1) {
+            $csr.next_rfd_addr = $csr.rfa_header;
+            log info, 2: "RFDs are filled up";
+            $csr.scb_status.rnr = 1;
+            $csr.scb_status.rus = RUS_NO_RESOURCES;
+            log info, 3: "RU state goes to idle as RFD EL flag requests";
+        } else {
+            $csr.next_rfd_addr = rfd.link_address;
+            log info, 3: "next descriptor moves to 0x%X", rfd.link_address;
+        }
+    }
+
+    call $write_rfd(&rfd, data_addr) -> (result);
+    log info, 3: "write receive frame descriptor at 0x%X", data_addr;
+    if (result != I82559_ME_No_Exception) {
+        if (!discarded)
+            log info, 2:
+                "RU failed to write RFD, but frame is good in the buffer";
+        else
+            log info, 2:
+                "RU failed to write RFD, and no frame in the buffer";
+    }
+
+    inline $update_int();
+}
+
+method mac_reset() {
+    local int   multi_idx;
+
+    inline $init();
+
+    // Reset MAC address to 0xFFFFFFFFFF
+    if ($csr.mac_address != 0x00)
+        inline $del_mac($csr.mac_address);
+    $csr.mac_address = 0x00; // No MAC address
+
+    // Reset multicast address to 0
+    for (multi_idx = 0; multi_idx < MAX_MULTICAST_ADDR; multi_idx++) {
+        if ($csr.multicast_address[multi_idx] != 0x00)
+            inline $del_mac($csr.multicast_address[multi_idx]);
+        $csr.multicast_address[multi_idx] = 0x0;
+    }
+
+    // Load configurations stored in EEPROM
+    call $load_eeprom_configurations();
+}
+
+method i82559_soft_reset() {
+    inline $mac_reset();
+}
+
+method i82559_self_test(uint32 address) {
+    local layout "little-endian" {
+        uint64 data;
+    } t_res;
+    local int res;
+
+    log info, 3: "running self test";
+    inline $mac_reset();
+    t_res.data = 0x1;
+    call $write_target_memory_data(cast(&t_res, uint8*), 8, address) -> (res);
+}
+
+method i82559_selective_reset() {
+    $csr.scb_status.cus = CUS_IDLE;
+    $csr.scb_status.rus = RUS_IDLE;
+    $csr.scb_status.fr = 0;
+}
+
+method i82559_dump(uint32 addr) {
+    local int result;
+    inline $dump_info_space(addr) -> (result);
+    inline $write_uint32_to_target_memory(0xA006, addr + 596) -> (result);
+}
+
+method insert_crc(dbuffer_t *frame) {
+    local uint32    crc_val;
+    inline $crc32(dbuffer_read_all(frame), dbuffer_len(frame)) -> (crc_val);
+    UNALIGNED_STORE_LE32(dbuffer_append(frame, 4), crc_val);
+}
+
+method insert_source_mac(dbuffer_t *frame) {
+    local uint8    *buf = dbuffer_update(frame, 6, 8);
+    local uint8     mac_buf[8];
+
+    UNALIGNED_STORE_LE64(mac_buf, $csr.mac_address);
+    memcpy(buf, mac_buf, 6);
+}
+
+method reset {
+    inline $mac_reset();
+}
+
+method init() {
+    $retrans_interval = NANSECS_TO_SEND_ONE_BYTE * MAX_FRAME_LEN;
+}

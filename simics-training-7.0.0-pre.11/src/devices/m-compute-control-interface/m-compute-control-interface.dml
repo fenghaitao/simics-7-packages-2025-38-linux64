@@ -1,0 +1,44 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  Interface defining how to control a compute unit:
+  - Start an operation
+  - Clear the done status 
+
+  Interface needs to be included in both the control unit and compute unit
+  modules. 
+
+*/
+
+dml 1.4;
+
+header %{
+#include "m-compute-control-interface.h"
+%}
+
+// Define the new interface type
+extern typedef struct {
+    // The two calls are trivial - just function calls without 
+    // any arguments except a pointer to the object itself. 
+    //
+    // This conf_object_t pointer is how a Simics object finds
+    // itself and its local data.  It is object-orientation 
+    // implemented in plain C. 
+    void (*start_operation)(conf_object_t *obj);
+    void (*clear_done)(conf_object_t *obj);
+} m_compute_control_interface_t;
+
+extern const char *const M_COMPUTE_CONTROL_INTERFACE;

@@ -1,0 +1,308 @@
+/*
+  ich-lpc.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "pci/common.dml";
+import "simics/devs/interrupt.dml";
+import "simics-api.dml";
+
+import "lpc-bridge.dml";
+import "ich-util.dml";
+import "ich-ports.dml";
+import "ich-chipset-conf.dml";
+import "ich-fwhi.dml";
+import "ich-lpc-intr.dml";
+import "ich-acpi.dml";
+import "ich-hpet-msi.dml";
+import "ich-gpio.dml";
+
+import "reset-ports.dml";
+
+parameter limitations = "<ul>"
+    + "<li>SIRQ routing is unimplemented.</li>"
+    + "<li>Chipset configuration registers are mostly dummy.</li>"
+    + "<li>General Purpose I/O is dummy.</li>"
+    + "</ul>";
+
+//chipset configuration registers
+parameter chipset_function = 10;
+parameter gpio_function = 11;
+
+connect reset_target {
+    parameter documentation = "Signal triggered via write to RST_CNT, should "
+        + "reset the system.";
+    interface signal;
+}
+
+connect flash {
+    parameter documentation = "Connection to the SPI interface in the ICH";
+    parameter configuration = "required";
+    interface io_memory;
+    data conf_object_t *map_obj;
+    method validate_port(conf_object_t *obj, const char *port) -> (bool valid) {
+        /* we can't map port interfaces with pci_bus so we try to grab the port
+           object if possible */
+        valid = true;
+        if (port) {
+            local strbuf_t sbuf;
+            sb_init(&sbuf);
+            sb_addfmt(&sbuf, "bank.%s", port);
+            $map_obj = SIM_object_descendant(obj, sb_str(&sbuf));
+            if (!$map_obj) {
+                SIM_attribute_error(
+                    "port interface not supported, use port object");
+                valid = false;
+            }
+            sb_free(&sbuf);
+        } else {
+            $map_obj = obj;
+        }
+    }
+}
+
+is pci_device;
+bank pci_config {
+    parameter base_address_registers = ["rcba", "gpiobase"];
+
+    register vendor_id  { parameter hard_reset_value = 0x8086; } // Intel
+    register class_code { parameter hard_reset_value = 0x060100; }
+    register command    { parameter hard_reset_value = 0x0007; }
+    register status     { parameter hard_reset_value = 0x0210; }
+    register header_type {
+        field mf { parameter hard_reset_value = 1; }
+    }
+    register base_address_0 @ 0x10 is (no_base_address_32);
+    register base_address_1 @ 0x14 is (no_base_address_32);
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1c is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+    register capabilities_ptr { parameter hard_reset_value = $feat_det_offset; }
+
+    register acpi_base @ 0x40 is (io_base_address) {
+        parameter size_bits = 7;
+        parameter map_func = 1;
+
+        // make enabling dependent on an external bit
+        method pci_mapping_enabled() -> (bool enabled) {
+            enabled = $acpi_control.acpi_en;
+        }
+    }
+    register acpi_control       size 1 @ 0x44 {
+        field sci_irq_sel [2:0] is (read_write) {
+            method decode_sci() -> (uint8 irq) {
+                if ($this == 0) {
+                    irq = 9;
+                } else if ($this == 1) {
+                    irq = 10;
+                } else if ($this == 2) {
+                    irq = 11;
+                } else if ($this == 4) {
+                    irq = 20;
+                } else if ($this == 5) {
+                    irq = 21;
+                } else {
+                    log "spec_violation", 2: "ACPI_CNTL.SCI_IRQ set to reserved value %d, using IRQ %d", $this, 9;
+                    irq = 9;
+                }
+            }
+        }
+        field acpi_en     [7:7] {
+            method write(value) {
+                $this = value;
+                call $acpi_base.update_mapping();
+            }
+        }
+    }
+
+    register lpc_ibdf size 2 @ 0x6C is (unimplemented);
+    register bios_cntl size 1 @ 0xDC {
+        field tss    [4] {
+            method read()->(value) {
+                inline $cs_conf.buc.ts.read()->(value);
+            }
+        }
+        field src  [3:2] is (ignore);
+        field ble    [1] is (unimplemented);
+        field bioswe [0] is (unimplemented);
+    }
+
+    // power management registers
+    register gen_pmcon1         size 2 @ 0xA0 {
+        field c4_disable   [12] is (unimplemented);
+        field c5_enable    [11] is (unimplemented);
+        field bios_pcie_en [10] is (unimplemented);
+        field pwr_btn_lvl   [9] is (unimplemented);
+        field c4onc3_en     [7] is (unimplemented);
+        field i64en         [6] is (unimplemented);
+        field cpuslp_en     [5] is (unimplemented);
+        field smi_lock      [4] is (write_1_only);
+        field ss_en         [3] is (unimplemented);
+        field clk_run_en    [2] is (unimplemented);
+        field per_smi_sel [1:0] is (unimplemented);
+    }
+    register gen_pmcon2         size 1 @ 0xA2 is (unimplemented);
+    register gen_pmcon3         size 2 @ 0xA4 {
+        field rst_sts          [9] is (unimplemented);
+        field s4_state_dis     [8] is (unimplemented);
+        field sw_smi_rate    [7:6] is (unimplemented);
+        field slps4_width    [5:4] is (silent_unimplemented);
+        field slps4_width_en   [3] is (silent_unimplemented);
+        field rtc_pwr_sts      [2] is (read_write);
+        field pwr_flr          [1] is (read_write);
+        field afterg3_en       [0] is (silent_unimplemented);
+    }
+    register gen_pmcon_lock     size 1 @ 0xA6 {
+        field unlock_c_trans [7] is (unimplemented);
+        field slp_s4_lock    [2] is (unimplemented);
+        field acpi_base_lock [1] is (write_1_only);
+        field c_state_cfg_lk [0] is (unimplemented);
+    }
+    register c5_exit_timing_cnt size 1 @ 0xA8 is (unimplemented);
+    register cx_state_cnf       size 1 @ 0xA9 is (unimplemented);
+    register c4_timing_cnt      size 1 @ 0xAA is (unimplemented);
+    register bm_break_en        size 1 @ 0xAB is (unimplemented);
+    register pmir               size 4 @ 0xAC {
+        field cf9_lock [31] is (unimplemented);
+        field f2       [30] is (cs_init_reg);
+        field cf9_gr   [20] is (unimplemented);
+        field f0      [9:8] is (cs_init_reg) { parameter val = 3; }
+    }
+    register dummy              size 1 @ 0xb3 is (ignore);
+
+    register gpi_rout           size 4 @ 0xB8 is (unimplemented);
+
+    register rcba                      @ 0xf0 is (memory_base_address_32) {
+        parameter desc = "Root Complex Base Address";
+        parameter size_bits = 14;
+        parameter map_func = $chipset_function;
+        parameter flash_base = 0x3800;
+
+        method pci_mapping_length() -> (map_length) {
+            map_length = $flash_base;
+        }
+        method add_map() {
+            inline default();
+            local map_info_t info;
+            inline $pci_mapping_base() -> (info.base);
+            info.base += $flash_base;
+            info.length = (1 << $size_bits) - $flash_base;
+            $pci_bus.pci_bus.add_map(
+                $flash.map_obj, Sim_Addr_Space_Memory, NULL, info);
+        }
+        method remove_map() {
+            inline default();
+            $pci_bus.pci_bus.remove_map(
+                $flash.map_obj, Sim_Addr_Space_Memory, 0);
+        }
+    }
+
+    register creating size 1 is (unmapped) { parameter hard_reset_value = 1; }
+
+    is defining_feature_detection_capability;
+    parameter feat_det_offset = 0xE0;
+    parameter feat_det_next_ptr = 0;
+}
+
+template defining_feature_detection_capability {
+    parameter feat_det_offset   default undefined;
+    parameter feat_det_next_ptr default undefined;
+
+    register feat_det_capability_id  size 1 @  $feat_det_offset      
+                "Capability ID";
+    register feat_det_next_ptr_r     size 1 @ ($feat_det_offset + 1) 
+                "Next PTR";
+    register feat_det_length         size 1 @ ($feat_det_offset + 2) 
+                "Capability length";
+    register feat_det_version        size 1 @ ($feat_det_offset + 3) 
+                "Capability version";
+    register feature_vector          size 8 @ ($feat_det_offset + 4) 
+                "Feature vector";
+
+    register feat_det_capability_id is (constant) {
+        parameter value = 0x9;
+    }
+
+    register feat_det_next_ptr_r is (constant) {
+        parameter value = $feat_det_next_ptr;
+    }
+
+    register feat_det_length is (constant) {
+        parameter value = 0xc;
+    }
+
+    register feature_vector is (unimplemented);
+}
+
+bank fixed_io {
+    parameter register_size = 1;
+    parameter function = 0;
+
+    register nmi_sc @ 0x61 "NMI Status and Control Register";
+    register port92 @ 0x92 is (unimplemented);
+    register coproc_err @ 0xf0 is (unimplemented);
+    register rst_cnt @ 0xcf9 "System Reset Control";
+
+    register nmi_sc {
+        // Default should be 0x0 but since serr and iochk are not supported we
+        // set them to disabled
+        parameter hard_reset_value = 0xc;
+        field serr_nmi_sts  [7] is (read_only);
+        field iochk_nmi_sts [6] is (read_only);
+        field tmr2_out_sts  [5] is (read_only);
+        field ref_toggle    [4] is (ignore_write);
+        field iochk_nmi_en  [3] is (unimplemented);
+        field pci_serr_en   [2] is (unimplemented);
+        method after_read(mop) {
+            $ref_toggle = !$ref_toggle;
+        }
+    }
+
+    register rst_cnt {
+        field full_rst [3] is (unimplemented) "Full Reset";
+        field rst_cpu  [2] "Trigger reset";
+        field sys_rst  [1] is (unimplemented) "Hard(1) or Soft(0) reset"; 
+        method after_write(memop) {
+            if ($rst_cpu) {
+                log "info", 2: "CPU reset initiated by write to %s", $qname;
+                $rst_cpu = 0;
+                if ($reset_target.obj != NULL) {
+                    $reset_target.signal.signal_raise();
+                    $reset_target.signal.signal_lower();
+                }
+            }
+        }
+    }
+}
+
+
+method pci_bus_disconnected() {
+    /* The command register resets to a state where both IO and Memory are
+       enabled so we must remove all mappings after the bus-reset, because they
+       are added as a side-effect of that */
+    inline $pci_config_bank.bus_reset();
+    inline $pci_config_bank.remove_all_mappings();
+}
+
+
+method post_init() {
+    if ($pci_config.creating == 1) {
+        call $reset_serial_ports_mapping();
+        call $acpi_io_regs.post_init();
+        call $add_fwh_map();
+        $pci_config.creating = 0;
+    }
+}

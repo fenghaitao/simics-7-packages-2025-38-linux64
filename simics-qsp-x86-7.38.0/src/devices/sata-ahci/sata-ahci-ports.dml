@@ -1,0 +1,405 @@
+/*
+  © 2011 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter num_ports = $default_cap & 0x1f;
+parameter ports_impl default (2 << ($default_cap & 0x1f)) - 1;
+
+bank ahci {
+    /* Port control registers */
+    group p0pcr is (ahci_pcr) { parameter port_num = 0; }
+
+    if ($num_ports > 0 && (($ports_impl & (0x1 << 1)) != 0)) {
+        group p1pcr is (ahci_pcr) { parameter port_num = 1; }
+    }
+    if ($num_ports > 1 && (($ports_impl & (0x1 << 2)) != 0)) {
+        group p2pcr is (ahci_pcr) { parameter port_num = 2; }
+    }
+    if ($num_ports > 2 && (($ports_impl & (0x1 << 3)) != 0)) {
+        group p3pcr is (ahci_pcr) { parameter port_num = 3; }
+    }
+    if ($num_ports > 3 && (($ports_impl & (0x1 << 4)) != 0)) {
+        group p4pcr is (ahci_pcr) { parameter port_num = 4; }
+    }
+    if ($num_ports > 4 && (($ports_impl & (0x1 << 5)) != 0)) {
+        group p5pcr is (ahci_pcr) { parameter port_num = 5; }
+    }
+    if ($num_ports > 5 && (($ports_impl & (0x1 << 6)) != 0)) {
+        group p6pcr is (ahci_pcr) { parameter port_num = 6; }
+    }
+    if ($num_ports > 6 && (($ports_impl & (0x1 << 7)) != 0)) {
+        group p7pcr is (ahci_pcr) { parameter port_num = 7; }
+    }
+    if ($num_ports > 7 && (($ports_impl & (0x1 << 8)) != 0)) {
+        group p8pcr is (ahci_pcr) { parameter port_num = 8; }
+    }
+    if ($num_ports > 8 && (($ports_impl & (0x1 << 9)) != 0)) {
+        group p9pcr is (ahci_pcr) { parameter port_num = 9; }
+    }
+    if ($num_ports > 9 && (($ports_impl & (0x1 << 10)) != 0)) {
+        group p10pcr is (ahci_pcr) { parameter port_num = 10; }
+    }
+    if ($num_ports > 10 && (($ports_impl & (0x1 << 11)) != 0)) {
+        group p11pcr is (ahci_pcr) { parameter port_num = 11; }
+    }
+    if ($num_ports > 11 && (($ports_impl & (0x1 << 12)) != 0)) {
+        group p12pcr is (ahci_pcr) { parameter port_num = 12; }
+    }
+    if ($num_ports > 12 && (($ports_impl & (0x1 << 13)) != 0)) {
+        group p13pcr is (ahci_pcr) { parameter port_num = 13; }
+    }
+    if ($num_ports > 13 && (($ports_impl & (0x1 << 14)) != 0)) {
+        group p14pcr is (ahci_pcr) { parameter port_num = 14; }
+    }
+    if ($num_ports > 14 && (($ports_impl & (0x1 << 15)) != 0)) {
+        group p15pcr is (ahci_pcr) { parameter port_num = 15; }
+    }
+    if ($num_ports > 15 && (($ports_impl & (0x1 << 16)) != 0)) {
+        group p16pcr is (ahci_pcr) { parameter port_num = 16; }
+    }
+    if ($num_ports > 16 && (($ports_impl & (0x1 << 17)) != 0)) {
+        group p17pcr is (ahci_pcr) { parameter port_num = 17; }
+    }
+    if ($num_ports > 17 && (($ports_impl & (0x1 << 18)) != 0)) {
+        group p18pcr is (ahci_pcr) { parameter port_num = 18; }
+    }
+    if ($num_ports > 18 && (($ports_impl & (0x1 << 19)) != 0)) {
+        group p19pcr is (ahci_pcr) { parameter port_num = 19; }
+    }
+    if ($num_ports > 19 && (($ports_impl & (0x1 << 20)) != 0)) {
+        group p20pcr is (ahci_pcr) { parameter port_num = 20; }
+    }
+    if ($num_ports > 20 && (($ports_impl & (0x1 << 21)) != 0)) {
+        group p21pcr is (ahci_pcr) { parameter port_num = 21; }
+    }
+    if ($num_ports > 21 && (($ports_impl & (0x1 << 22)) != 0)) {
+        group p22pcr is (ahci_pcr) { parameter port_num = 22; }
+    }
+    if ($num_ports > 22 && (($ports_impl & (0x1 << 23)) != 0)) {
+        group p23pcr is (ahci_pcr) { parameter port_num = 23; }
+    }
+    if ($num_ports > 23 && (($ports_impl & (0x1 << 24)) != 0)) {
+        group p24pcr is (ahci_pcr) { parameter port_num = 24; }
+    }
+    if ($num_ports > 24 && (($ports_impl & (0x1 << 25)) != 0)) {
+        group p25pcr is (ahci_pcr) { parameter port_num = 25; }
+    }
+    if ($num_ports > 25 && (($ports_impl & (0x1 << 26)) != 0)) {
+        group p26pcr is (ahci_pcr) { parameter port_num = 26; }
+    }
+    if ($num_ports > 26 && (($ports_impl & (0x1 << 27)) != 0)) {
+        group p27pcr is (ahci_pcr) { parameter port_num = 27; }
+    }
+    if ($num_ports > 27 && (($ports_impl & (0x1 << 28)) != 0)) {
+        group p28pcr is (ahci_pcr) { parameter port_num = 28; }
+    }
+    if ($num_ports > 28 && (($ports_impl & (0x1 << 29)) != 0)) {
+        group p29pcr is (ahci_pcr) { parameter port_num = 29; }
+    }
+    if ($num_ports > 29 && (($ports_impl & (0x1 << 30)) != 0)) {
+        group p30pcr is (ahci_pcr) { parameter port_num = 30; }
+    }
+    if ($num_ports > 30 && (($ports_impl & (0x1 << 31)) != 0)) {
+        group p31pcr is (ahci_pcr) { parameter port_num = 31; }
+    }
+
+    method init_ports() {
+        call $p0pcr.p_init();
+        if ($num_ports > 0 && (($ports_impl & (0x1 << 1)) != 0)) {
+            call $p1pcr.p_init();
+        }
+        if ($num_ports > 1 && (($ports_impl & (0x1 << 2)) != 0)) {
+            call $p2pcr.p_init();
+        }
+        if ($num_ports > 2 && (($ports_impl & (0x1 << 3)) != 0)) {
+            call $p3pcr.p_init();
+        }
+        if ($num_ports > 3 && (($ports_impl & (0x1 << 4)) != 0)) {
+            call $p4pcr.p_init();
+        }
+        if ($num_ports > 4 && (($ports_impl & (0x1 << 5)) != 0)) {
+            call $p5pcr.p_init();
+        }
+        if ($num_ports > 5 && (($ports_impl & (0x1 << 6)) != 0)) {
+            call $p6pcr.p_init();
+        }
+        if ($num_ports > 6 && (($ports_impl & (0x1 << 7)) != 0)) {
+            call $p7pcr.p_init();
+        }
+        if ($num_ports > 7 && (($ports_impl & (0x1 << 8)) != 0)) {
+            call $p8pcr.p_init();
+        }
+        if ($num_ports > 8 && (($ports_impl & (0x1 << 9)) != 0)) {
+            call $p9pcr.p_init();
+        }
+        if ($num_ports > 9 && (($ports_impl & (0x1 << 10)) != 0)) {
+            call $p10pcr.p_init();
+        }
+        if ($num_ports > 10 && (($ports_impl & (0x1 << 11)) != 0)) {
+            call $p11pcr.p_init();
+        }
+        if ($num_ports > 11 && (($ports_impl & (0x1 << 12)) != 0)) {
+            call $p12pcr.p_init();
+        }
+        if ($num_ports > 12 && (($ports_impl & (0x1 << 13)) != 0)) {
+            call $p13pcr.p_init();
+        }
+        if ($num_ports > 13 && (($ports_impl & (0x1 << 14)) != 0)) {
+            call $p14pcr.p_init();
+        }
+        if ($num_ports > 14 && (($ports_impl & (0x1 << 15)) != 0)) {
+            call $p15pcr.p_init();
+        }
+        if ($num_ports > 15 && (($ports_impl & (0x1 << 16)) != 0)) {
+            call $p16pcr.p_init();
+        }
+        if ($num_ports > 16 && (($ports_impl & (0x1 << 17)) != 0)) {
+            call $p17pcr.p_init();
+        }
+        if ($num_ports > 17 && (($ports_impl & (0x1 << 18)) != 0)) {
+            call $p18pcr.p_init();
+        }
+        if ($num_ports > 18 && (($ports_impl & (0x1 << 19)) != 0)) {
+            call $p19pcr.p_init();
+        }
+        if ($num_ports > 19 && (($ports_impl & (0x1 << 20)) != 0)) {
+            call $p20pcr.p_init();
+        }
+        if ($num_ports > 20 && (($ports_impl & (0x1 << 21)) != 0)) {
+            call $p21pcr.p_init();
+        }
+        if ($num_ports > 21 && (($ports_impl & (0x1 << 22)) != 0)) {
+            call $p22pcr.p_init();
+        }
+        if ($num_ports > 22 && (($ports_impl & (0x1 << 23)) != 0)) {
+            call $p23pcr.p_init();
+        }
+        if ($num_ports > 23 && (($ports_impl & (0x1 << 24)) != 0)) {
+            call $p24pcr.p_init();
+        }
+        if ($num_ports > 24 && (($ports_impl & (0x1 << 25)) != 0)) {
+            call $p25pcr.p_init();
+        }
+        if ($num_ports > 25 && (($ports_impl & (0x1 << 26)) != 0)) {
+            call $p26pcr.p_init();
+        }
+        if ($num_ports > 26 && (($ports_impl & (0x1 << 27)) != 0)) {
+            call $p27pcr.p_init();
+        }
+        if ($num_ports > 27 && (($ports_impl & (0x1 << 28)) != 0)) {
+            call $p28pcr.p_init();
+        }
+        if ($num_ports > 28 && (($ports_impl & (0x1 << 29)) != 0)) {
+            call $p29pcr.p_init();
+        }
+        if ($num_ports > 29 && (($ports_impl & (0x1 << 30)) != 0)) {
+            call $p30pcr.p_init();
+        }
+        if ($num_ports > 30 && (($ports_impl & (0x1 << 31)) != 0)) {
+            call $p31pcr.p_init();
+        }
+    }
+
+    method scan_isr_ports() {
+        call $p0pcr.isr.update_interrupts();
+        if ($num_ports > 0 && (($ports_impl & (0x1 << 1)) != 0)) {
+            call $p1pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 1 && (($ports_impl & (0x1 << 2)) != 0)) {
+            call $p2pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 2 && (($ports_impl & (0x1 << 3)) != 0)) {
+            call $p3pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 3 && (($ports_impl & (0x1 << 4)) != 0)) {
+            call $p4pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 4 && (($ports_impl & (0x1 << 5)) != 0)) {
+            call $p5pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 5 && (($ports_impl & (0x1 << 6)) != 0)) {
+            call $p6pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 6 && (($ports_impl & (0x1 << 7)) != 0)) {
+            call $p7pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 7 && (($ports_impl & (0x1 << 8)) != 0)) {
+            call $p8pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 8 && (($ports_impl & (0x1 << 9)) != 0)) {
+            call $p9pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 9 && (($ports_impl & (0x1 << 10)) != 0)) {
+            call $p10pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 10 && (($ports_impl & (0x1 << 11)) != 0)) {
+            call $p11pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 11 && (($ports_impl & (0x1 << 12)) != 0)) {
+            call $p12pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 12 && (($ports_impl & (0x1 << 13)) != 0)) {
+            call $p13pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 13 && (($ports_impl & (0x1 << 14)) != 0)) {
+            call $p14pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 14 && (($ports_impl & (0x1 << 15)) != 0)) {
+            call $p15pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 15 && (($ports_impl & (0x1 << 16)) != 0)) {
+            call $p16pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 16 && (($ports_impl & (0x1 << 17)) != 0)) {
+            call $p17pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 17 && (($ports_impl & (0x1 << 18)) != 0)) {
+            call $p18pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 18 && (($ports_impl & (0x1 << 19)) != 0)) {
+            call $p19pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 19 && (($ports_impl & (0x1 << 20)) != 0)) {
+            call $p20pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 20 && (($ports_impl & (0x1 << 21)) != 0)) {
+            call $p21pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 21 && (($ports_impl & (0x1 << 22)) != 0)) {
+            call $p22pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 22 && (($ports_impl & (0x1 << 23)) != 0)) {
+            call $p23pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 23 && (($ports_impl & (0x1 << 24)) != 0)) {
+            call $p24pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 24 && (($ports_impl & (0x1 << 25)) != 0)) {
+            call $p25pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 25 && (($ports_impl & (0x1 << 26)) != 0)) {
+            call $p26pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 26 && (($ports_impl & (0x1 << 27)) != 0)) {
+            call $p27pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 27 && (($ports_impl & (0x1 << 28)) != 0)) {
+            call $p28pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 28 && (($ports_impl & (0x1 << 29)) != 0)) {
+            call $p29pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 29 && (($ports_impl & (0x1 << 30)) != 0)) {
+            call $p30pcr.isr.update_interrupts();
+        }
+        if ($num_ports > 30 && (($ports_impl & (0x1 << 31)) != 0)) {
+            call $p31pcr.isr.update_interrupts();
+        }
+    }        
+}
+
+port sata_ctr_p0 is (sata_port) { parameter port_group = $ahci.p0pcr; }
+if ($num_ports > 0 && (($ports_impl & (0x1 << 1)) != 0)) {
+    port sata_ctr_p1 is (sata_port) { parameter port_group = $ahci.p1pcr; }
+}
+if ($num_ports > 1 && (($ports_impl & (0x1 << 2)) != 0)) {
+    port sata_ctr_p2 is (sata_port) { parameter port_group = $ahci.p2pcr; }
+}
+if ($num_ports > 2 && (($ports_impl & (0x1 << 3)) != 0)) {
+    port sata_ctr_p3 is (sata_port) { parameter port_group = $ahci.p3pcr; }
+}
+if ($num_ports > 3 && (($ports_impl & (0x1 << 4)) != 0)) {
+    port sata_ctr_p4 is (sata_port) { parameter port_group = $ahci.p4pcr; }
+}
+if ($num_ports > 4 && (($ports_impl & (0x1 << 5)) != 0)) {
+    port sata_ctr_p5 is (sata_port) { parameter port_group = $ahci.p5pcr; }
+}
+if ($num_ports > 5 && (($ports_impl & (0x1 << 6)) != 0)) {
+    port sata_ctr_p6 is (sata_port) { parameter port_group = $ahci.p6pcr; }
+}
+if ($num_ports > 6 && (($ports_impl & (0x1 << 7)) != 0)) {
+    port sata_ctr_p7 is (sata_port) { parameter port_group = $ahci.p7pcr; }
+}
+if ($num_ports > 7 && (($ports_impl & (0x1 << 8)) != 0)) {
+    port sata_ctr_p8 is (sata_port) { parameter port_group = $ahci.p8pcr; }
+}
+if ($num_ports > 8 && (($ports_impl & (0x1 << 9)) != 0)) {
+    port sata_ctr_p9 is (sata_port) { parameter port_group = $ahci.p9pcr; }
+}
+if ($num_ports > 9 && (($ports_impl & (0x1 << 10)) != 0)) {
+    port sata_ctr_p10 is (sata_port) { parameter port_group = $ahci.p10pcr; }
+}
+if ($num_ports > 10 && (($ports_impl & (0x1 << 11)) != 0)) {
+    port sata_ctr_p11 is (sata_port) { parameter port_group = $ahci.p11pcr; }
+}
+if ($num_ports > 11 && (($ports_impl & (0x1 << 12)) != 0)) {
+    port sata_ctr_p12 is (sata_port) { parameter port_group = $ahci.p12pcr; }
+}
+if ($num_ports > 12 && (($ports_impl & (0x1 << 13)) != 0)) {
+    port sata_ctr_p13 is (sata_port) { parameter port_group = $ahci.p13pcr; }
+}
+if ($num_ports > 13 && (($ports_impl & (0x1 << 14)) != 0)) {
+    port sata_ctr_p14 is (sata_port) { parameter port_group = $ahci.p14pcr; }
+}
+if ($num_ports > 14 && (($ports_impl & (0x1 << 15)) != 0)) {
+    port sata_ctr_p15 is (sata_port) { parameter port_group = $ahci.p15pcr; }
+}
+if ($num_ports > 15 && (($ports_impl & (0x1 << 16)) != 0)) {
+    port sata_ctr_p16 is (sata_port) { parameter port_group = $ahci.p16pcr; }
+}
+if ($num_ports > 16 && (($ports_impl & (0x1 << 17)) != 0)) {
+    port sata_ctr_p17 is (sata_port) { parameter port_group = $ahci.p17pcr; }
+}
+if ($num_ports > 17 && (($ports_impl & (0x1 << 18)) != 0)) {
+    port sata_ctr_p18 is (sata_port) { parameter port_group = $ahci.p18pcr; }
+}
+if ($num_ports > 18 && (($ports_impl & (0x1 << 19)) != 0)) {
+    port sata_ctr_p19 is (sata_port) { parameter port_group = $ahci.p19pcr; }
+}
+if ($num_ports > 19 && (($ports_impl & (0x1 << 20)) != 0)) {
+    port sata_ctr_p20 is (sata_port) { parameter port_group = $ahci.p20pcr; }
+}
+if ($num_ports > 20 && (($ports_impl & (0x1 << 21)) != 0)) {
+    port sata_ctr_p21 is (sata_port) { parameter port_group = $ahci.p21pcr; }
+}
+if ($num_ports > 21 && (($ports_impl & (0x1 << 22)) != 0)) {
+    port sata_ctr_p22 is (sata_port) { parameter port_group = $ahci.p22pcr; }
+}
+if ($num_ports > 22 && (($ports_impl & (0x1 << 23)) != 0)) {
+    port sata_ctr_p23 is (sata_port) { parameter port_group = $ahci.p23pcr; }
+}
+if ($num_ports > 23 && (($ports_impl & (0x1 << 24)) != 0)) {
+    port sata_ctr_p24 is (sata_port) { parameter port_group = $ahci.p24pcr; }
+}
+if ($num_ports > 24 && (($ports_impl & (0x1 << 25)) != 0)) {
+    port sata_ctr_p25 is (sata_port) { parameter port_group = $ahci.p25pcr; }
+}
+if ($num_ports > 25 && (($ports_impl & (0x1 << 26)) != 0)) {
+    port sata_ctr_p26 is (sata_port) { parameter port_group = $ahci.p26pcr; }
+}
+if ($num_ports > 26 && (($ports_impl & (0x1 << 27)) != 0)) {
+    port sata_ctr_p27 is (sata_port) { parameter port_group = $ahci.p27pcr; }
+}
+if ($num_ports > 27 && (($ports_impl & (0x1 << 28)) != 0)) {
+    port sata_ctr_p28 is (sata_port) { parameter port_group = $ahci.p28pcr; }
+}
+if ($num_ports > 28 && (($ports_impl & (0x1 << 29)) != 0)) {
+    port sata_ctr_p29 is (sata_port) { parameter port_group = $ahci.p29pcr; }
+}
+if ($num_ports > 29 && (($ports_impl & (0x1 << 30)) != 0)) {
+    port sata_ctr_p30 is (sata_port) { parameter port_group = $ahci.p30pcr; }
+}
+if ($num_ports > 30 && (($ports_impl & (0x1 << 31)) != 0)) {
+    port sata_ctr_p31 is (sata_port) { parameter port_group = $ahci.p31pcr; }
+}

@@ -1,0 +1,1095 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "pci/common.dml";
+import "simics/devs/memory-space.dml";
+
+loggroup PCI_bridge;
+
+// Different mappings
+constant DOWNSTREAM_CONF = 0;
+constant DOWNSTREAM_IO   = 1;
+constant DOWNSTREAM_MEM  = 2;
+constant DOWNSTREAM_PREF = 3;
+
+constant UPSTREAM_IO_1   = 4;
+constant UPSTREAM_IO_2   = 5;
+
+constant UPSTREAM_MEM_1  = 6;
+constant UPSTREAM_MEM_2  = 7;
+constant UPSTREAM_MEM_3  = 8;
+
+constant DOWNSTREAM_MEM_VGA =  9;
+constant DOWNSTREAM_IO_VGA  = 10;
+
+// typical PCI stuff that used to be defined by importing pci-common.dml
+is pci_common;
+
+connect secondary_bus {
+    is pci_bus_connect;
+    parameter configuration = "required";
+    parameter documentation = "Secondary bus";
+}
+
+struct pci_bus_mem_space_t {
+    conf_object_t *cfg;
+    conf_object_t *io;
+    conf_object_t *mem;
+}
+
+data pci_bus_mem_space_t pci_bus_spc;
+data pci_bus_mem_space_t secondary_bus_spc;
+
+struct map_info_data_t {
+    int priority;
+    int align_size;
+    int endian;
+}
+
+data map_info_data_t io_down;
+data map_info_data_t mem_down;
+data map_info_data_t pref_down;
+data map_info_data_t io_up;
+data map_info_data_t mem_up;
+
+attribute mapping_setup {
+    parameter type = "[i{15}]";
+    parameter configuration = "optional";
+    parameter documentation = "Attributes for the different bridge mappings:"
+        + " io-memory up/down, memory up/down, prefetchable memory down:"
+        + " (<i>io_down.priority</i>, <i>io_down.align_size</i>,"
+        + " <i>io_down.endian</i>,"
+        + " <i>mem_down.priority</i>, <i>mem_down.align_size</i>,"
+        + " <i>mem_down.endian</i>,"
+        + " <i>pref_down.priority</i>, <i>pref_down.align_size</i>, "
+        + " <i>pref_down.endian</i>,"
+        + " <i>io_up.priority</i>, <i>io_up.align_size</i>,"
+        + " <i>io_up.endian</i>,"
+        + " <i>mem_up.priority</i>, <i>mem_up.align_size</i>,"
+        + " <i>mem_up.endian</i>)";
+
+    method get() -> (attr_value_t val) {
+        val = SIM_make_attr_list(
+            15,
+            SIM_make_attr_uint64($io_down.priority),
+            SIM_make_attr_uint64($io_down.align_size),
+            SIM_make_attr_uint64($io_down.endian),
+
+            SIM_make_attr_uint64($mem_down.priority),
+            SIM_make_attr_uint64($mem_down.align_size),
+            SIM_make_attr_uint64($mem_down.endian),
+
+            SIM_make_attr_uint64($pref_down.priority),
+            SIM_make_attr_uint64($pref_down.align_size),
+            SIM_make_attr_uint64($pref_down.endian),
+
+            SIM_make_attr_uint64($io_up.priority),
+            SIM_make_attr_uint64($io_up.align_size),
+            SIM_make_attr_uint64($io_up.endian),
+
+            SIM_make_attr_uint64($mem_up.priority),
+            SIM_make_attr_uint64($mem_up.align_size),
+            SIM_make_attr_uint64($mem_up.endian));
+    }
+
+    method set(attr_value_t val) {
+        $io_down.priority     = SIM_attr_integer(SIM_attr_list_item(val, 0));
+        $io_down.align_size   = SIM_attr_integer(SIM_attr_list_item(val, 1));
+        $io_down.endian       = SIM_attr_integer(SIM_attr_list_item(val, 2));
+        $mem_down.priority    = SIM_attr_integer(SIM_attr_list_item(val, 3));
+        $mem_down.align_size  = SIM_attr_integer(SIM_attr_list_item(val, 4));
+        $mem_down.endian      = SIM_attr_integer(SIM_attr_list_item(val, 5));
+        $pref_down.priority   = SIM_attr_integer(SIM_attr_list_item(val, 6));
+        $pref_down.align_size = SIM_attr_integer(SIM_attr_list_item(val, 7));
+        $pref_down.endian     = SIM_attr_integer(SIM_attr_list_item(val, 8));
+        $io_up.priority       = SIM_attr_integer(SIM_attr_list_item(val, 9));
+        $io_up.align_size     = SIM_attr_integer(SIM_attr_list_item(val, 10));
+        $io_up.endian         = SIM_attr_integer(SIM_attr_list_item(val, 11));
+        $mem_up.priority      = SIM_attr_integer(SIM_attr_list_item(val, 12));
+        $mem_up.align_size    = SIM_attr_integer(SIM_attr_list_item(val, 13));
+        $mem_up.endian        = SIM_attr_integer(SIM_attr_list_item(val, 14));
+    }
+}
+
+// Bridge capabilities downstream
+// NOTE: upstream transactions use ranges not claimed for downstream
+parameter forward_io default false;
+parameter forward_io32 default false;
+parameter forward_mem default false;
+parameter forward_prefetchable default false;
+parameter forward_prefetchable64 default false;
+
+// Set for PCI-PCI or PCIe-PCI bridges
+parameter secondary_side_is_pci default true;
+
+// Accept to forward all transactions to the secondary bus number itself even
+// if no subordinate bus number has been set
+parameter always_accept_secondary_bus_number default false;
+
+/* Type 1 Configuration */
+bank pci_config {
+    is pci_config_type_1;
+
+    register command {
+        method after_write(mop) {
+            if ($forward_io)
+                call $remap_io();
+            call $remap_memory();
+        }
+    }
+
+    register secondary_bus_number {
+        method after_write(mop) {
+            call $remap_secondary_config();
+        }
+    }
+    register subordinate_bus_number {
+        method after_write(mop) {
+            call $remap_secondary_config();
+        }
+    }
+    register io_base {
+        field type {
+            parameter value = ($forward_io32 ? 1 : 0);
+        }
+        field addr  is (read_write) {
+            method write(value) {
+                if ($io_capable)
+                    $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($forward_io)
+                call $remap_io();
+        }
+    }
+    register io_limit {
+        field type {
+            parameter value = ($forward_io32 ? 1 : 0);
+        }
+        field addr is (read_write) {
+            method write(value) {
+                if ($io_capable)
+                    $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($forward_io)
+                call $remap_io();
+        }
+    }
+
+    register memory_base {
+        field addr is (read_write) {
+            method write(value) {
+                if ($mem_capable)
+                    $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($forward_mem)
+                call $remap_memory();
+        }
+    }
+    register memory_limit {
+        field addr is (read_write) {
+            method write(value) {
+                if ($mem_capable)
+                    $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($forward_mem)
+                call $remap_memory();
+        }
+    }
+
+    register prefetchable_base {
+        field sf {
+            parameter value = ($forward_prefetchable64 ? 1 : 0);
+        }
+        field addr is (read_write);
+        method after_write(mop) {
+            if ($forward_prefetchable)
+                call $remap_memory();
+        }
+    }
+    register prefetchable_limit {
+        field sf {
+            parameter value = ($forward_prefetchable64 ? 1 : 0);
+        }
+        field addr is (read_write);
+        method after_write(mop) {
+            if ($forward_prefetchable)
+                call $remap_memory();
+        }
+    }
+
+    register prefetchable_base_upper {
+        method write(value) {
+            if ($forward_prefetchable64) {
+                $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($forward_prefetchable64)
+                call $remap_memory();
+        }
+    }
+    register prefetchable_limit_upper {
+        method write(value) {
+            if ($forward_prefetchable64) {
+                $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($forward_prefetchable64)
+                call $remap_memory();
+        }
+    }
+
+    register io_base_upper {
+        method write(value) {
+            if ($io_capable && $forward_io32) {
+                $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($io_capable && $forward_io32)
+                call $remap_io();
+        }
+    }
+    register io_limit_upper {
+        method write(value) {
+            if ($io_capable && $forward_io32) {
+                $this = value;
+            }
+        }
+        method after_write(mop) {
+            if ($io_capable && $forward_io32)
+                call $remap_io();
+        }
+    }
+
+    register bridge_control {
+        field sbr {
+            method write(value) {
+                $this = value;
+                if (value == 1) {
+                    $secondary_status.mhz = 0;
+                    $secondary_status.fbb = 0;
+                    $secondary_status.pe  = 0;
+                    $secondary_status.ds  = 0;
+                    $secondary_status.sta = 0;
+                    $secondary_status.rta = 0;
+                    $secondary_status.rma = 0;
+                    $secondary_status.ssa = 0;
+                    $secondary_status.dpe = 0;
+
+                    $secondary_bus.pci_bus.bus_reset();
+                }
+            }
+        }
+        method after_write(mop) {
+            call $remap_io();
+            call $remap_memory();
+        }
+    }
+
+    method secondary_bus_reset() {
+        $secondary_bus.pci_bus.bus_reset();
+    }
+    
+    // default access_not_taken()
+    method access_not_taken(conf_object_t *src_space, conf_object_t *dst_space,
+                            exception_type_t ex, generic_transaction_t *mem_op,
+                            map_info_t mapinfo) 
+        -> (exception_type_t e) default {
+
+        local uint32 i;
+
+        if ($bridge_control.mam == 1) {
+            // TODO: signal target-abort instead of master-abort!
+        }
+
+        /* set received master-abort flag */
+        $secondary_status.rma = 1;
+
+        /* return all 1s */
+        if (SIM_mem_op_is_read(mem_op)) {
+            for (i = 0; i < SIM_get_mem_op_size(mem_op); i++)
+                mem_op->real_address[i] = 0xff;
+        }
+        e = Sim_PE_No_Exception;
+    }
+
+    // default system_error()
+    method system_error() default {
+        /* set received system-error flag */
+        $secondary_status.ssa = 1;
+
+        /* send the system error on the primary bus if SERR# Enable set */
+        if ($bridge_control.serr == 1 && $command.se == 1)
+            call $pci_system_error();
+    }
+
+    // default interrupt_raised(), similar to pci_raise_interrupt_pin() but
+    // does not check interrupt disable bit or set the interrupt status bit.
+    // It must also count interrupts in order to support interrupt sharing,
+    // as well as take the internal interrupt state into account so the interrupt
+    // is not raised twice for the same pin
+    method interrupt_raised(conf_object_t *irq_obj, int dev, int pin) default {
+        assert 0 <= pin && pin < 4;
+        pin = (pin + dev) % 4; // rotate interrupts
+        $pci_config.irq_pin_count[pin] += 1;
+        if ($pci_config.irq_pin_count[pin] == 1
+            && $pci_config.interrupts[pin] == 0) {
+            if ($pci_bus.obj == NULL) {
+                log info, 2, PCI_config: "Attempt to raise interrupt"
+                    + " with the PCI bus disconnected";
+            } else {
+                log info, 4, PCI_IRQ: "Raising interrupt pin %d (%s)",
+                    pin, irq_pin_name[pin];
+                $pci_bus.pci_bus.raise_interrupt($dev.obj, pin);
+            }
+        } else {
+            log info, 4, PCI_IRQ: "Interrupt already raised for pin %d (%s)",
+                pin, irq_pin_name[pin];
+        }
+    }
+
+    // default interrupt_lowered(), similar to pci_lower_interrupt_pin() but
+    // does not update the interrupt status bit.
+    // It must also count interrupts in order to support interrupt sharing,
+    // as well as take the internal interrupt state into account so the interrupt
+    // is not lowered prematurely
+    method interrupt_lowered(conf_object_t *irq_obj, int dev, int pin) default {
+        assert 0 <= pin && pin < 4;
+        pin = (pin + dev) % 4; // rotate interrupts
+        if ($pci_config.irq_pin_count[pin] == 0) {
+            log info, 4, PCI_IRQ: "Lowering interrupt on pin %d (%s) when"
+                + " already lowered, ignored", pin, irq_pin_name[pin];
+            return;
+        }
+        $pci_config.irq_pin_count[pin] -= 1;
+        if ($pci_config.irq_pin_count[pin] == 0) {
+            if ($pci_config.interrupts[pin] == 0) {
+                if ($pci_bus.obj == NULL) {
+                    log info, 2, PCI_config: "Attempt to raise interrupt"
+                        + " with the PCI bus disconnected";
+                } else {
+                    log info, 4, PCI_IRQ: "Lowering interrupt pin %d (%s)",
+                        pin, irq_pin_name[pin];
+                    $pci_bus.pci_bus.lower_interrupt($dev.obj, pin);
+                }
+            } else {
+                log info, 4, PCI_IRQ: "Internal interrupt still active,"
+                    + " interrupt pin %d (%s) not lowered",
+                    pin, irq_pin_name[pin];
+            }
+        } else {
+            log info, 4, PCI_IRQ: "Interrupts still pending, "
+                + " interrupt pin %d (%s) not lowered", pin, irq_pin_name[pin];
+        }
+    }
+}
+
+implement pci_bridge {
+    method system_error() {
+        inline $pci_config.system_error();
+    }
+    method raise_interrupt(conf_object_t *irq_obj, int device, int pin) {
+        inline $pci_config.interrupt_raised(irq_obj, device, pin);
+    }
+    method lower_interrupt(conf_object_t *irq_obj, int device, int pin) {
+        inline $pci_config.interrupt_lowered(irq_obj, device, pin);
+    }
+}
+
+implement bridge {
+    method not_taken(conf_object_t *src_space, conf_object_t *dst_space,
+                     exception_type_t ex, generic_transaction_t *mem_op,
+                     map_info_t mapinfo) -> (exception_type_t e) {
+        call $pci_config.access_not_taken(src_space, dst_space,
+                                          ex, mem_op, mapinfo) -> (e);
+    }
+}
+
+method pci_bus_connected() {
+    if (SIM_object_is_configured($dev.obj))
+        call $get_bus_info();
+}
+
+method get_bus_info() {
+    /* lookup config, io and memory spaces for our pci busses */
+    if ($pci_bus.obj) {
+        $pci_bus_spc.cfg = $pci_bus.pci_bus.configuration_space();
+        $pci_bus_spc.mem = $pci_bus.pci_bus.memory_space();
+        $pci_bus_spc.io  = $pci_bus.pci_bus.io_space();
+    } else {
+        $pci_bus_spc.cfg = NULL;
+        $pci_bus_spc.mem = NULL;
+        $pci_bus_spc.io = NULL;
+    }
+
+
+    if ($secondary_bus.obj) {
+        $secondary_bus_spc.cfg
+            = $secondary_bus.pci_bus.configuration_space();
+        $secondary_bus_spc.mem
+            = $secondary_bus.pci_bus.memory_space();
+        $secondary_bus_spc.io
+            = $secondary_bus.pci_bus.io_space();
+    } else {
+        $secondary_bus_spc.cfg = NULL;
+        $secondary_bus_spc.mem = NULL;
+        $secondary_bus_spc.io  = NULL;
+    }
+}
+
+/* Can be overridden in bridge implementation to perform post-init stuff */
+method bridge_post_init() default {}
+
+method post_init() {
+    call $get_bus_info();
+    call $bridge_post_init();
+}
+
+method remove_secondary_config() {
+    if ($pci_bus.obj == NULL) {
+        log info, 2, PCI_config: "Attempt to remove downstream mapping"
+            + " with the PCI bus disconnected";
+    } else {
+        $pci_bus.pci_bus.remove_map(
+            $dev.obj, Sim_Addr_Space_Conf, DOWNSTREAM_CONF);
+    }
+}
+
+method remap_secondary_config() {
+    local map_info_t map;
+    local int sec;
+    local int sub;
+
+    inline $remove_secondary_config();
+
+    sec = $pci_config.secondary_bus_number;
+    sub = $pci_config.subordinate_bus_number;
+
+    if (sec <= $pci_config.primary_bus_number)
+        return;
+
+    if (sub < sec) {
+        if ($always_accept_secondary_bus_number) {
+            // map as if sub == sec
+            sub = sec;
+        }
+        else {
+            // do not map anything
+            return;
+        }
+    }
+
+    /* tell secondary bus about new number */
+    $secondary_bus.pci_bus.set_bus_number(sec);
+
+    memset(&map, 0, sizeof(map));
+
+    inline $compute_conf_space_window(&map, sec, sub);
+    map.function = DOWNSTREAM_CONF;
+
+    if ($pci_bus.obj == NULL) {
+        log info, 2, PCI_config: "Attempt to remap downstream mapping"
+            + " with the PCI bus disconnected";
+    } else {
+        $pci_bus.pci_bus.add_map($dev.obj, Sim_Addr_Space_Conf,
+                                 $secondary_bus_spc.cfg, map);
+    }
+}
+
+method map_downstream(addr_space_t space, uint64 base, uint64 length, 
+                      int function) {
+    local conf_object_t *tgt;
+    local map_info_t info;
+
+    memset(&info, 0, sizeoftype(map_info_t));
+    info.base = base;
+    info.start = base;
+    info.length = length;
+    info.function = function;
+    switch (function) {
+    case DOWNSTREAM_IO:
+        info.priority = $io_down.priority;
+        info.align_size = $io_down.align_size;
+        info.reverse_endian = cast($io_down.endian, swap_mode_t);
+        break;
+    case DOWNSTREAM_MEM:
+        info.priority = $mem_down.priority;
+        info.align_size = $mem_down.align_size;
+        info.reverse_endian = cast($mem_down.endian, swap_mode_t);
+        break;
+    case DOWNSTREAM_PREF:
+        info.priority = $pref_down.priority;
+        info.align_size = $pref_down.align_size;
+        info.reverse_endian = cast($pref_down.endian, swap_mode_t);
+        break;
+    case DOWNSTREAM_IO_VGA:
+        info.priority = $io_down.priority;
+        info.align_size = $io_down.align_size;
+        info.reverse_endian = cast($io_down.endian, swap_mode_t);
+        break;
+    case DOWNSTREAM_MEM_VGA:
+        info.priority = $mem_down.priority;
+        info.align_size = $mem_down.align_size;
+        info.reverse_endian = cast($mem_down.endian, swap_mode_t);
+        break;
+    default:
+        log error, 1, PCI_bridge: 
+            "Unknown function in pci-bridge::map_downstream()";
+        return;
+    }
+
+    if (space == Sim_Addr_Space_IO)
+        tgt = $secondary_bus_spc.io;
+    else
+        tgt = $secondary_bus_spc.mem;
+
+    if ($pci_bus.obj == NULL) {
+        log info, 2, PCI_config: "Attempt to add downstream mapping"
+            + " with the PCI bus disconnected";
+        return;
+    }
+    $pci_bus.pci_bus.add_map($dev.obj, space, tgt, info);
+    log info, 3, PCI_bridge:
+        "New downstream %s space mapping (function %d): base = 0x%x, length = 0x%x",
+        space == Sim_Addr_Space_IO ? "I/O" : "memory",                     
+        info.function, 
+        cast(info.start, uint32), 
+        cast(info.length, uint32);
+}
+
+method map_upstream(addr_space_t space, uint64 base, uint64 length, 
+                    int function) default {
+    local conf_object_t *tgt;
+    local map_info_t info;
+
+    memset(&info, 0, sizeoftype(map_info_t));
+    info.base = base;
+    info.start = base;
+    info.length = length;
+    info.function = function;
+
+    switch (function) {
+    case UPSTREAM_IO_1:
+    case UPSTREAM_IO_2:
+        info.priority = $io_up.priority;
+        info.align_size = $io_up.align_size;
+        info.reverse_endian = cast($io_up.endian, swap_mode_t);
+        break;
+    case UPSTREAM_MEM_1:
+    case UPSTREAM_MEM_2:
+    case UPSTREAM_MEM_3:
+        info.priority = $mem_up.priority;
+        info.align_size = $mem_up.align_size;
+        info.reverse_endian = cast($mem_up.endian, swap_mode_t);
+        break;
+    default:
+        log error, 1, PCI_bridge:
+            "Unknown function in pci-bridge::map_downstream()";
+        return;
+    }
+
+    if (space == Sim_Addr_Space_IO)
+        tgt = $pci_bus_spc.io;
+    else
+        tgt = $pci_bus_spc.mem;
+
+    $secondary_bus.pci_bus.add_map($dev.obj, space, tgt, info);
+
+    log info, 3, PCI_bridge:
+        "New upstream %s space mapping (function %d): base = 0x%llx, length = 0x%llx",
+        space == Sim_Addr_Space_IO ? "I/O" : "memory",
+        function, 
+        base, 
+        length;
+}
+
+method remove_io() {
+    if ($pci_bus.obj == NULL) {
+        log info, 2, PCI_config: "Attempt to remove downstream IO mappings"
+            + " with the PCI bus disconnected";
+        return;
+    }
+    $pci_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_IO, DOWNSTREAM_IO);
+    $pci_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_IO, DOWNSTREAM_IO_VGA);
+    $secondary_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_IO, UPSTREAM_IO_1);
+    $secondary_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_IO, UPSTREAM_IO_2);
+}
+
+
+method remap_io() default {
+    local uint32 base;
+    local uint32 limit;
+    local uint64 highest = $forward_io32 ? 0xffffffff : 0xffff;
+    local bool upstream = true;
+
+    if (!$forward_io) return;
+
+    inline $remove_io();  // also verifies that both busses are connected
+
+    /* check if I/O mappings are enabled */
+    if ($pci_config.command.io == 0)
+        return;
+
+    base  = $pci_config.io_base.addr << 12;
+    limit = ($pci_config.io_limit.addr << 12) | 0xfff;
+
+    if ($forward_io32) {
+        base  |= $pci_config.io_base_upper << 16;
+        limit |= $pci_config.io_limit_upper << 16;
+    }
+
+    /* only upstream if master enable set */
+    if ($pci_config.command.m == 0)
+        upstream = false;
+
+    if (limit < base) {
+
+        /* no downstream forwarding */
+        if (!upstream)
+            return;
+        call $map_upstream(Sim_Addr_Space_IO, 0, highest + 1, UPSTREAM_IO_1);
+
+    } else {
+        
+        if ($pci_config.bridge_control.isae == 1) {
+
+            local uint32 base_map;
+            for (base_map = base; base_map < limit; base_map += 1024) {
+                call $map_downstream(Sim_Addr_Space_IO,
+                                     base_map, 256,
+                                     DOWNSTREAM_IO);
+            }
+        } else {
+            call $map_downstream(Sim_Addr_Space_IO,
+                                 base, limit - base + 1, 
+                                 DOWNSTREAM_IO);
+        }
+
+        if ($pci_config.bridge_control.vgae == 1) {
+
+            local uint32 base_k;
+            for (base_k = 0; base_k < 64; base_k++) {
+
+                local uint32 start_1 = 1024 * base_k + 0x3b0;
+                local uint32 end_1 = 1024 * base_k + 0x3bb;
+                local uint32 start_2 = 1024 * base_k + 0x3c0;
+                local uint32 end_2 = 1024 * base_k + 0x3df;
+
+                if (   $pci_config.bridge_control.isae ==  1 
+                    || start_1 < base 
+                    || start_1 > limit) {
+                    call $map_downstream(Sim_Addr_Space_IO, start_1, 
+                                         end_1 - start_1 + 1, 
+                                         DOWNSTREAM_IO_VGA);
+                    call $map_downstream(Sim_Addr_Space_IO, start_2, 
+                                         end_2 - start_2 + 1, 
+                                         DOWNSTREAM_IO_VGA);
+                }
+            }
+        }
+
+        if (!upstream)
+            return;
+
+        /* First upstream from 0 to base - 1.
+           Be careful to avoid VGA mappings. */
+        if ($pci_config.bridge_control.vgae == 1) {
+            local uint32 base_map;
+            local bool prev_merge_valid = false;
+            for (base_map = 0; base_map < base; base_map += 1024) {
+                if (prev_merge_valid) {
+                    call $map_upstream(Sim_Addr_Space_IO,
+                                       base_map - 1024 + 0x3df + 1,
+                                       1024 - 0x3df - 1 + 0x3b0,
+                                       UPSTREAM_IO_1);
+                } else {
+                    call $map_upstream(Sim_Addr_Space_IO,
+                                       base_map, 0x3b0,
+                                       UPSTREAM_IO_1);
+                }
+                call $map_upstream(Sim_Addr_Space_IO,
+                                   base_map + 0x3bb + 1, 0x3c0 - 0x3bb - 1,
+                                   UPSTREAM_IO_1);
+                prev_merge_valid = true;
+            }
+            if (prev_merge_valid) {
+                call $map_upstream(Sim_Addr_Space_IO,
+                                   base_map - 1024 + 0x3df + 1, 
+                                   1024 - 0x3df - 1,
+                                   UPSTREAM_IO_1);
+            }
+        } else if (base > 0) {
+            call $map_upstream(Sim_Addr_Space_IO,
+                               0, base - 1,
+                               UPSTREAM_IO_1);
+        }
+
+        /* Upstream map parts not send downstream when ISA decoding enabled. */
+        if ($pci_config.bridge_control.isae == 1) {
+            local uint32 base_map;
+            for (base_map = base; base_map < limit; base_map += 1024) {
+                call $map_upstream(Sim_Addr_Space_IO,
+                                   base_map + 256, 1024 - 256,
+                                   UPSTREAM_IO_1);
+            }
+        }
+
+        /* Second upstream from limit to highest address.
+           Remember to avoid VGA mappings. */
+        if ($pci_config.bridge_control.vgae == 1) {
+            local uint32 base_map;
+            local bool prev_merge_valid = false;
+            for (base_map = limit + 1; base_map < highest; base_map += 1024) {
+                if (prev_merge_valid) {
+                    call $map_upstream(Sim_Addr_Space_IO,
+                                       base_map - 1024 + 0x3df + 1,
+                                       1024 - 0x3df - 1 + 0x3b0,
+                                       UPSTREAM_IO_2);
+                } else {
+                    call $map_upstream(Sim_Addr_Space_IO,
+                                       base_map, 0x3b0,
+                                       UPSTREAM_IO_2);
+                }
+                call $map_upstream(Sim_Addr_Space_IO,
+                                   base_map + 0x3bb + 1, 0x3c0 - 0x3bb - 1,
+                                   UPSTREAM_IO_2);
+                prev_merge_valid = true;
+            }
+            if (prev_merge_valid) {
+                call $map_upstream(Sim_Addr_Space_IO,
+                                   base_map - 1024 + 0x3df + 1, 
+                                   1024 - 0x3df - 1,
+                                   UPSTREAM_IO_2);
+            }
+        } else if (limit < highest) {
+            call $map_upstream(Sim_Addr_Space_IO,
+                               limit + 1, highest - limit,
+                               UPSTREAM_IO_2);
+        }
+    }
+}
+
+struct map_pair_t {
+        uint64 base;
+        uint64 limit;
+}
+
+method swap_map_pair(map_pair_t *a, map_pair_t *b) {
+    local map_pair_t tmp_val;
+
+    tmp_val.base = a->base;
+    tmp_val.limit = a->limit;
+    a->base = b->base;
+    a->limit = b->limit;
+    b->base = tmp_val.base;
+    b->limit = tmp_val.limit;
+}
+
+method remove_memory() {
+    if ($pci_bus.obj == NULL) {
+        log info, 2, PCI_config: "Attempt to remove downstream mem mappings"
+            + " with the PCI bus disconnected";
+        return;
+    }
+    $pci_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_Memory, DOWNSTREAM_PREF);
+    $pci_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_Memory, DOWNSTREAM_MEM);
+    $pci_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_Memory, DOWNSTREAM_MEM_VGA);
+    $secondary_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_Memory, UPSTREAM_MEM_1);
+    $secondary_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_Memory, UPSTREAM_MEM_2);
+    $secondary_bus.pci_bus.remove_map(
+        $dev.obj, Sim_Addr_Space_Memory, UPSTREAM_MEM_3);
+}
+
+method remap_memory() default {
+    local uint64 mem_base;
+    local uint64 mem_limit;
+    local uint64 pref_base;
+    local uint64 pref_limit;
+    local uint64 highest;
+    local uint64 highest32 = 0xffffffff;
+    local map_pair_t map_pair[3];
+    local int num_mappings = 0;
+
+    local int i;
+    local uint64 prev_end = 0;
+
+    if (!$forward_mem) return;
+
+    highest = $forward_prefetchable64 ? 0xffffffffffffffff : 0xffffffff;
+
+    inline $remove_memory();  // also verifies that both busses are connected
+
+    /* check if memory mappings are enabled */
+    if ($pci_config.command.mem == 0)
+        return;
+
+    mem_base  = $pci_config.memory_base.addr << 20;
+    mem_limit = ($pci_config.memory_limit.addr << 20) | 0xFFFFF;
+
+    pref_base  = $pci_config.prefetchable_base.addr << 20;
+    pref_limit = ($pci_config.prefetchable_limit.addr << 20) | 0xFFFFF;
+
+    if ($forward_prefetchable64) {
+        pref_base  |= cast($pci_config.prefetchable_base_upper,  uint64) << 32;
+        pref_limit |= cast($pci_config.prefetchable_limit_upper, uint64) << 32;
+    }
+
+    if ((mem_limit >= mem_base) && $forward_mem) {
+
+        call $map_downstream(Sim_Addr_Space_Memory,
+                             mem_base, mem_limit - mem_base + 1,
+                             DOWNSTREAM_MEM);
+
+        map_pair[num_mappings].base = mem_base;
+        map_pair[num_mappings].limit = mem_limit;
+        num_mappings++;
+    }
+
+    if ((pref_limit >= pref_base) && $forward_prefetchable) {
+
+        call $map_downstream(Sim_Addr_Space_Memory,
+                             pref_base, pref_limit - pref_base + 1,
+                             DOWNSTREAM_PREF);
+
+        map_pair[num_mappings].base = pref_base;
+        map_pair[num_mappings].limit = pref_limit;
+        num_mappings++;
+    }
+
+    if ($pci_config.bridge_control.vgae == 1) {
+        call $map_downstream(Sim_Addr_Space_Memory, 0xa0000, 
+                             0xbffff - 0xa0000 + 1, DOWNSTREAM_MEM_VGA);
+        map_pair[num_mappings].base = 0xa0000;
+        map_pair[num_mappings].limit = 0xbffff;
+        num_mappings++;
+    }
+
+    if (num_mappings == 0) {
+        /* fake mapping since we can't map one 64-bit length */
+        map_pair[num_mappings].base = highest32 + 1;
+        map_pair[num_mappings].limit = highest32;
+        num_mappings++;
+    }
+
+    assert num_mappings <= 3;
+
+    if (!$forward_prefetchable && !$forward_mem)
+        return;
+        
+    /* now create upstream mappings in the holes */
+
+    /* only upstream if master enable set */
+    if ($pci_config.command.m == 0)
+        return;
+
+    // sort the mappings by base
+    if (num_mappings > 1) {
+        if (map_pair[0].base > map_pair[1].base)
+            inline $swap_map_pair(&map_pair[0], &map_pair[1]);
+        if (num_mappings > 2) {
+            if (map_pair[1].base > map_pair[2].base) {
+                inline $swap_map_pair(&map_pair[1], &map_pair[2]);
+                if (map_pair[0].base > map_pair[1].base)
+                    inline $swap_map_pair(&map_pair[0], &map_pair[1]);
+            }
+        }
+    }
+
+    for (i = 0; i < num_mappings; i++) {
+        if (prev_end < map_pair[i].base)
+            call $map_upstream(Sim_Addr_Space_Memory,
+                               prev_end, map_pair[i].base - prev_end,
+                               UPSTREAM_MEM_1);
+        prev_end = map_pair[i].limit + 1;
+    }
+    if (prev_end < highest) {
+        call $map_upstream(Sim_Addr_Space_Memory,
+                           prev_end, highest - prev_end + 1,
+                           UPSTREAM_MEM_2);
+    }
+}
+
+
+method is_upstream_memory_addr(physical_address_t addr) -> (bool ret) default {
+    local uint64 mem_base;
+    local uint64 mem_limit;
+    local uint64 pref_base;
+    local uint64 pref_limit;
+
+    if ($pci_config.bridge_control.vgae == 1 
+        && addr >= 0xa0000 && addr < 0xbffff) {
+        ret = false;
+        return;
+    }
+
+    mem_base  = $pci_config.memory_base.addr << 20;
+    mem_limit = ($pci_config.memory_limit.addr << 20) | 0xFFFFF;
+
+    pref_base  = $pci_config.prefetchable_base.addr << 20;
+    pref_limit = ($pci_config.prefetchable_limit.addr << 20) | 0xFFFFF;
+
+    if ($forward_prefetchable64) {
+        pref_base  |= cast($pci_config.prefetchable_base_upper,  uint64) << 32;
+        pref_limit |= cast($pci_config.prefetchable_limit_upper, uint64) << 32;
+    }
+
+    ret = !(($forward_prefetchable && addr >= pref_base && addr <= pref_limit)
+            || (addr >= mem_base && addr <= mem_limit));
+}
+
+method is_upstream_io_addr(physical_address_t addr) -> (bool ret) default {
+    local uint64 base;
+    local uint64 limit;
+    
+    base  = $pci_config.io_base.addr << 12;
+    limit = ($pci_config.io_limit.addr << 12) | 0xfff;
+
+    if ($forward_io32) {
+        base  |= $pci_config.io_base_upper << 16;
+        limit |= $pci_config.io_limit_upper << 16;
+    }
+
+    ret = !(addr >= base && addr <= limit);
+
+    // ISA (top 768 bytes of each 1K block should go upstream)
+    if (!ret && $pci_config.bridge_control.isae == 1 && addr <= 0xffff)
+        ret = (addr[9:8] != 0);
+
+    // VGA
+    // NOTE: this code has not been tested, see bug 19774 for details
+    if ($pci_config.bridge_control.vgae && addr <= 0xffff) {
+        if (!$pci_config.bridge_control.vga16d || addr[15:10] == 0) {
+            local uint16 port = addr[9:0];
+            if ((port >= 0x3b0 && port <= 0x3bb)
+                || (port >= 0x3c0 && port <= 0x3df)) {
+                ret = false;
+            }
+        }
+    }
+}
+
+method upstream_access_not_taken(generic_transaction_t *mop, 
+                                 exception_type_t ex) 
+                -> (exception_type_t ret_ex) {
+    if (ex == Sim_PE_IO_Not_Taken) {
+        // Master Abort (Unsupported Access)
+        $pci_config.status.rma = 1;
+        if ($secondary_side_is_pci) {
+            // convert to Target Abort
+            $pci_config.status.sta = 1;
+            ex = Sim_PE_IO_Error;
+        }
+    } else if (ex == Sim_PE_IO_Error) {
+        // Target Abort (Completer Abort)
+        $pci_config.status.rta = 1;
+        // Signaled Target Abort
+        $pci_config.status.sta = 1;
+    }
+
+    ret_ex = ex;
+}
+
+
+connect upstream_target {
+    interface pci_upstream;
+}
+
+connect secondary_bus {
+    interface pci_downstream;
+}
+
+implement pci_upstream {
+    method operation(generic_transaction_t *mop, addr_space_t space)
+        -> (exception_type_t ex) default {
+    
+        // Forward transaction upstream or back downstream (peer-to-peer)
+        local bool send_upstream;
+        local uint64 addr = SIM_get_mem_op_physical_address(mop);
+        if ($secondary_side_is_pci) {
+            // PCI: peer-to-peer accesses do not cross the bridge
+            if (space == Sim_Addr_Space_Memory) {
+                // upstream is enabled for all ranges where downstream is not
+                if ($forward_mem)
+                    inline $is_upstream_memory_addr(addr) -> (send_upstream);
+                else
+                    send_upstream = true;
+            } else if (space == Sim_Addr_Space_IO) {
+                // upstream is enabled for all ranges where downstream is not
+                if ($forward_io)
+                    inline $is_upstream_io_addr(addr) -> (send_upstream);
+                else
+                    send_upstream = true;
+            } else if (space == Sim_Addr_Space_Conf) {
+                log info, 4, PCI_bridge: "Bridge does not support forwarding"
+                    + " of transactions targeting configuration space upstream"
+                    + " across the bridge";
+                ex = Sim_PE_IO_Not_Taken;
+                return;
+            } else {
+                assert false; // invalid use of interface, space value unknown
+            }
+        } else {
+            // PCIe: send everything upstream (point-to-point link)
+            send_upstream = true;
+        }
+        
+        if (send_upstream) {
+            if (!$pci_config.command.m) {
+                log info, 4, PCI_bridge: "Bridge is not allowed as"
+                    + " bus-master on primary bus, so it cannot claim the"
+                    + " transaction on the secondary bus";
+                ex = Sim_PE_IO_Not_Taken;
+                return;
+            }
+
+            if ($upstream_target.obj != NULL) {
+                ex = $upstream_target.pci_upstream.operation(mop, space);
+            } else {
+                log info, 2, PCI_bridge:
+                    "Unable to forward transaction upstream across the bridge,"
+                    + " as bridge is not connected to an upstream target";
+                ex = Sim_PE_IO_Not_Taken;
+                return;
+            }
+        } else {
+            // peer-to-peer, return transaction to the _secondary_ bus
+            ex = $secondary_bus.pci_downstream.operation(mop, space);
+        }
+
+        // Handle errors gracefully for upstream 
+        if (send_upstream && ex != Sim_PE_No_Exception)
+            call $upstream_access_not_taken(mop, ex) -> (ex);
+    }
+}
+

@@ -1,0 +1,238 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device sample_firewire_device;
+bitorder be;
+
+import "utility.dml";
+import "firewire-device.dml";
+parameter desc = "simple FireWire device";
+parameter documentation = "A simple firewire device which only implements the"
+    + " required firewire registers. It can't take on the cycle-master,"
+    + " isochronous resource manager or bus manager roles.";
+
+typedef layout "big-endian" {
+    uint16 destination_id;
+    bitfields 16 {
+        uint6 label @ [0:5];
+        uint2 rt @ [6:7];
+        uint4 tcode @ [8:11];
+        uint4 res @ [12:15];
+    } h;
+    uint16 source_id;
+    bitfields 16 {
+        uint4 rcode @ [0:3];
+        uint12 res @ [4:15];
+    } addrh;
+    uint32 addrl;
+    uint32 quadlet;
+    uint32 crc;
+} response_t;
+
+parameter response_delay = 0.00001;
+parameter firewire_phy = $PHY;
+
+bank PHY is (PHY_1394a) {
+    /*
+      Set an offset outside the addressable range since this bank isn't
+      available using asynchronous transactions
+    */
+    parameter offset = 0xffffffffffffffff;
+    parameter size = 0;
+    parameter link_power_status = 0;
+}
+
+/*
+ * Define the minimal set of registers for a transaction capable node.
+ */
+bank firewire_config_registers is (firewire_config_registers);
+
+/*
+ * Use the short config ROM which only contains a single vendor id.
+ */
+bank config_rom {
+    parameter register_size = 4;
+    parameter byte_order = "big-endian";
+    parameter offset = 0xfffff0000400;
+    parameter size = 0x800;
+
+    register vendor_id @ 0x0;
+}
+
+method firewire_handle_packet(dbuffer_t *packet, int crc_calculated)
+    -> (firewire_ack_code_t ack) {
+    ack = Firewire_Ack_No_Ack; /* Make the compiler happy */
+    /* If the transfer wasn't destined for this node ignore it */
+    if (is_fw_packet_potentially_valid(packet) == 0) {
+        log info: "dropping invalid packet";
+        return;
+    }
+    local uint16 my_id;
+    inline $firewire_config_registers.node_ids.get_node_id -> (my_id);
+    local uint16 destination_id = fw_extract_destination_id(packet);
+    if ((destination_id != my_id) && (destination_id != 0xffff)) {
+        ack = Firewire_Ack_No_Ack;
+        return;
+    }
+
+    switch (fw_extract_tcode(packet)) {
+    case Firewire_Write_Block:
+    case Firewire_Read_Block:
+    case Firewire_Lock:
+    case Firewire_Write_Response:
+    case Firewire_Read_Block_Response:
+    case Firewire_Read_Quadlet_Response:
+    case Firewire_Lock_Response:
+        /*
+         * This device doesn't support block and lock transfers and
+         * shouldn't receive responses since it doesn't send any requests.
+         */
+        ack = Firewire_Ack_Type_Error;
+        return;
+    case Firewire_Streaming:
+    case Firewire_Cycle_Start:
+        ack = Firewire_Ack_No_Ack;
+        return;
+    case Firewire_Read_Quadlet:
+        call $read_quadlet(packet) -> (ack);
+        return;
+    case Firewire_Write_Quadlet:
+        call $write_quadlet(packet) -> (ack);
+        return;
+    }
+}
+
+method read_from_banks(address) -> (success, value) {
+    success = false;
+    value = 0;
+    local generic_transaction_t mop;
+    memset(&mop, 0, sizeof(mop));
+    SIM_set_mem_op_type(&mop, Sim_Trans_Load);
+    foreach bnk in ($dev.banks) {
+        if ((address >= bnk.offset)
+            && (address <= (bnk.offset + bnk.size - 4))) {
+            call bnk.read_access(&mop, address - bnk.offset, 4)
+                -> (success, value);
+            return;
+        }
+    }
+}
+
+method read_quadlet(dbuffer_t *packet)
+    -> (firewire_ack_code_t ack) {
+    if (is_fw_packet_size_correct(packet) == 0) {
+        log info: "packet has the wrong size";
+        ack = Firewire_Ack_Busy_X;
+        return;
+    }
+    local uint64 address = fw_extract_address(packet);
+    log info: "read quadlet at 0x%x", address;
+    local bool success = false;
+    local uint64 value = 0;
+
+    inline $read_from_banks(address) -> (success, value);
+    if (!success) {
+        log info, 2: "failed reading quadlet - no register found at 0x%x",
+            address;
+        ack = Firewire_Ack_Address_Error;
+        return;
+    }
+    /*
+     * Reads are acked with ack_pending since you need a full response
+     * packet to send back the read value.
+     * Post an event to handle the response.
+     */
+    local dbuffer_t *buf = new_dbuffer();
+    local uint8 *p = dbuffer_append(buf, sizeoftype(response_t));
+    local response_t *response = cast(p, response_t *);
+    response->h = 0;
+    response->addrh = 0;
+    response->addrl = 0;
+    response->crc = 0;
+    response->h.tcode = Firewire_Read_Quadlet_Response;
+    response->addrh.rcode = Firewire_Response_Complete;
+    response->h.label = fw_extract_label(packet);
+    inline $firewire_config_registers.node_ids.get_node_id ->
+        (response->source_id);
+    response->destination_id = fw_extract_source_id(packet);
+    response->quadlet = value;
+    inline $firewire_bus.transfer_after_delay($response_delay, buf);
+    ack = Firewire_Ack_Pending;
+}
+
+method write_to_banks(address, value) -> (success) {
+    success = false;
+    local generic_transaction_t mop;
+    memset(&mop, 0, sizeof(mop));
+    SIM_set_mem_op_type(&mop, Sim_Trans_Load);
+    foreach bnk in ($dev.banks) {
+        if ((address >= bnk.offset)
+            && (address <= (bnk.offset + bnk.size - 4))) {
+            call bnk.write_access(&mop, address - bnk.offset, 4, value)
+                -> (success);
+            return;
+        }
+    }
+}
+
+method write_quadlet(dbuffer_t *packet)
+    -> (firewire_ack_code_t ack) {
+    if (is_fw_packet_size_correct(packet) == 0) {
+        log info: "packet has the wrong size";
+        ack = Firewire_Ack_Busy_X;
+        return;
+    }
+    local uint64 address = fw_extract_address(packet);
+    local uint32 quadlet = fw_extract_quadlet(packet, 3);
+    log info: "write quadlet at 0x%x <- 0x%x", address, quadlet;
+    local bool success = false;
+    inline $write_to_banks(address, quadlet)
+        -> (success);
+    if (!success) {
+        ack = Firewire_Ack_Address_Error;
+        return;
+    }
+    /*
+     * Writes are acked with ack_complete which means that you shouldn't send
+     * a separate response packet.
+     */
+    ack = Firewire_Ack_Complete;
+}
+
+method firewire_handle_bus_reset(uint16 new_id, uint8 root_id,
+                                 uint32_array_t self_ids) {
+    log info: "bus reset, my new ID is %d", new_id;
+    $firewire_config_registers.node_ids.offset_id = new_id;
+    $firewire_config_registers.state.gone = 1;
+    /*
+     * Clean up the pending response transmits since they aren't valid
+     * after a bus reset.
+     */
+    call $firewire_delayed_transfer_event.remove(NULL);
+}
+
+method command_reset {
+    $firewire_config_registers.state.gone = 1;
+}
+
+bank config_rom {
+    register vendor_id {
+        field tag[0:7] is (read_only) {
+            parameter hard_reset_value = 0x1;
+        }
+        field vendor_id[8:31] is (read_only) {
+            parameter hard_reset_value = 0xbeeeef;
+        }
+    }
+}

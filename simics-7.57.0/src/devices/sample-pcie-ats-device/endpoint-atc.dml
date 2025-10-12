@@ -1,0 +1,386 @@
+/*
+  endpoint-atc.dml
+
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+//:: pre base {{
+dml 1.4;
+
+device sample_pcie_ats_endpoint;
+param classname = "sample-pcie-ats-endpoint";
+param desc = "sample PCIe Endpoint with an ATS Cache";
+
+param pcie_version = 6.0;
+
+import "simics/util/interval-set.dml";
+import "pcie/common.dml";
+
+is pcie_endpoint;
+
+attribute PASID is (uint64_attr);
+
+method umax(uint64 a, uint64 b) -> (uint64) {
+    return a > b ? a : b;
+}
+
+bank pcie_config {
+    register capabilities_ptr {
+        param init_val = 0x40;
+    }
+    is defining_pm_capability;
+    param pm_offset = capabilities_ptr.init_val;
+    param pm_next_ptr = pm_offset + 0x10;
+
+    is defining_exp_capability;
+    param exp_offset = pm_next_ptr;
+    param exp_next_ptr = 0x0;
+    param exp_dp_type = PCIE_DP_Type_EP;
+
+    is defining_ats_capability;
+    param ats_offset = 0x100;
+    param ats_next_ptr = ats_offset + 0x100;
+    group ats {
+        // Method called by PCIe library when an invalidation request message
+        // is received for Translation Agent.
+        method invalidate_received(transaction_t *t,
+                                   uint64 dev_addr) -> (bool) {
+            local pcie_ats_invalidate_request_payload_t payload;
+            payload.u64 = SIM_get_transaction_value_le(t);
+
+            local uint8 itag = ATOM_get_transaction_pcie_ats_invalidate_request_itag(t);
+            local uint16 requester_id =
+                ATOM_get_transaction_pcie_requester_id(t);
+
+            local (uint64 addr, uint64 size) = this.get_invalidation_range(payload);
+            cache.evict(addr, size);
+
+            // Must inform Simics core the translation has been revoked.
+            // Look at documentation for SIM_translation_changed
+            // for more details.
+            SIM_translation_changed(device_memory_request.obj);
+            after: this.respond(requester_id, 1 << itag);
+            return true;
+        }
+        method respond(uint16 requester_id, uint32 itag_vector) {
+            // Calls helper method in PCIe lib to send Invalidation Completion
+            // message to Translation Agent.
+            local pcie_error_t ret = this.invalidate_complete(requester_id, itag_vector);
+            if (ret != PCIE_Error_No_Error) {
+                log error: "%s failed: %s",
+                    pcie_message_type_name(PCIE_ATS_Invalidate_Completion),
+                    pcie_error_name(ret);
+            }
+        }
+    }
+    is defining_pasid_capability;
+    param pasid_offset = ats_next_ptr;
+    param pasid_next_ptr = 0;
+    group pasid {
+        register capability {
+            field eps { param init_val = 1; }
+            field pms { param init_val = 1; }
+            field trwps { param init_val = 1; }
+            // pasid in range 0 - 0xffff
+            field mpw { param init_val = 0x10; }
+        }
+    }
+}
+
+// The endpoint device uses this port to handle untranslated memory requests
+// which the ATC tries to convert to a translated memory request
+// before forwarding the transaction upstream.
+port device_memory_request {
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *prev,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) {
+            local translation_t txl;
+
+            local bool hit;
+            local (uint64 base, uint64 start, uint64 size);
+            local pcie_ats_translation_completion_entry_t te;
+
+            (hit, base, start, size, te) = lookup_address(addr, prev, access);
+            txl.base = base;
+            txl.start = start;
+            txl.size = size;
+            if (!hit) {
+                assert(txl.base == txl.start);
+                log info, 4:
+                    "Missed translation in range 0x%08X-0x%08X access=0x%x",
+                    txl.base, txl.base + txl.size - 1, access;
+                return callback(txl, prev, cbdata);
+            }
+
+            local transaction_t t;
+
+            local bool add_pasid;
+            local pcie_pasid_info_t pasid;
+            // AT translated requests are only allowed if field trwpe is set
+            // Untranslated does not require that bit
+            if (pcie_config.pasid.control.pe.val == 1 &&
+                (te.field.u == 1 || pcie_config.pasid.control.trwpe.val == 1)) {
+                add_pasid = true;
+                pasid.field.pasid = PASID.val;
+                pasid.field.exe = (access & Sim_Access_Execute) != 0 ? 1 : 0;
+            }
+
+            local atom_t atoms[5] = {
+                ATOM_pcie_type(PCIE_Type_Mem),
+                ATOM_pcie_requester_id(pcie_config.get_device_id()),
+                ATOM_pcie_at(te.field.u == 1 ? PCIE_AT_Untranslated : PCIE_AT_Translated),
+                add_pasid ? ATOM_pcie_pasid(pasid.u32) : ATOM_list_end(0),
+                ATOM_list_end(0),
+            };
+
+            t.prev = prev;
+            t.atoms = atoms;
+            txl.target = upstream_target.map_target;
+
+            log info, 3: "Translating range 0x%08X-0x%08X to 0x%08X-0x%08X",
+                txl.base, txl.base + txl.size - 1,
+                txl.start, txl.start + txl.size - 1;
+            return callback(txl, &t, cbdata);
+        }
+    }
+}
+
+
+attribute extra_atom_in_translation is (bool_attr);
+// Sends ATS request to Translation Agent.
+// Utilizes several helper methods defined in the ATS capability template.
+method do_ats_request(uint64 addr,
+                      uint64 size,
+                      access_t access) -> (exception_type_t) {
+    local uint64 atc_size = size + addr[11:0];
+    local int nbr_entries =
+        pcie_config.ats.translation_size_to_entries(atc_size);
+    local pcie_ats_translation_completion_entry_t entries[nbr_entries];
+
+    local bool no_write = (access & Sim_Access_Write) == 0;
+
+    local pcie_error_t ret;
+    local int valid_entries;
+    local int stu_lsb = pcie_config.ats.control.stu.lsbit();
+    local uint64 base_addr = addr[63:stu_lsb] << stu_lsb;
+
+    local bool add_pasid;
+    local pcie_pasid_info_t pasid;
+
+    if (pcie_config.pasid.control.pe.val) {
+        add_pasid = true;
+        pasid.field.pasid = PASID.val;
+        if (pcie_config.pasid.control.epe.val)
+            pasid.field.exe = (access & Sim_Access_Execute) != 0 ? 1 : 0;
+    }
+    if (extra_atom_in_translation.val) {
+        local atom_t extra_atoms[2] = {
+            ATOM_pcie_ecs(PCIE_ECS_SIG_OS),
+            ATOM_list_end(0)
+        };
+        (ret, valid_entries) = pcie_config.ats.translation_request_custom(
+            base_addr, entries, nbr_entries, add_pasid ? &pasid : NULL,
+            no_write, false, extra_atoms);
+    } else {
+        (ret, valid_entries) = pcie_config.ats.translation_request(base_addr,
+                                                                entries,
+                                                                nbr_entries,
+                                                                add_pasid ? &pasid : NULL,
+                                                                no_write,
+                                                                false);
+    }
+    switch(ret) {
+    case PCIE_Error_No_Error:
+        for (local int i = 0; i < valid_entries; i++) {
+            local (uint64 start, uint64 txl_size) =
+                pcie_config.ats.get_translation_range(entries[i]);
+
+            cache.insert(base_addr, txl_size, entries[i]);
+            base_addr += txl_size;
+        }
+        return Sim_PE_No_Exception;
+    case PCIE_Error_Unsupported_Request:
+        log info, 1:
+            "%s ATS request denied %s",
+            this.qname, pcie_error_name(ret);
+        return Sim_PE_IO_Not_Taken;
+    default:
+        log error:
+            "%s error in ATS translation request %s",
+            this.qname, pcie_error_name(ret);
+        return Sim_PE_IO_Not_Taken;
+    }
+}
+
+// Check internal AT Cache for translation, otherwise
+// it tries to do an ATS request followed by a second cache lookup.
+method lookup_address(uint64 addr, transaction_t *t, access_t access) ->
+                       (
+                       bool,    // Hit
+                       uint64,  // Base
+                       uint64,  // Translated address
+                       uint64,  // size
+                       pcie_ats_translation_completion_entry_t // TA completion entry
+                       ) {
+    local uint64 lookup_size = umax(SIM_transaction_size(t),
+                                    pcie_config.ats.control.stu.size());
+    local (bool hit,
+           uint64 base,
+           uint64 start,
+           uint64 size,
+           pcie_ats_translation_completion_entry_t te) = cache.lookup(addr, access);
+
+    if (!hit) { // Try do an AT request
+        if (SIM_transaction_is_inquiry(t))
+            return (false, base, start, size, te);
+
+        local exception_type_t v = do_ats_request(addr, lookup_size, access);
+        if (v != Sim_PE_No_Exception)
+            return (false, base, start, size, te);
+
+        (hit, base, start, size, te) = cache.lookup(addr, access);
+        assert(hit);
+    }
+    return (true, base, start, size, te);
+}
+
+// Sample cache to showcase basics for implementing ATS with the PCIe library.
+// Utilizes the interval library in Simics core.
+group cache is (init) {
+    session interval_set_t map;
+
+    method init() {
+        init_interval(&map, 1);
+    }
+    attribute storage {
+        param documentation = "Attribute to support checkpointing of the AT Cache";
+        param type = "[[iii]*]";
+        param internal = true;
+        method set(attr_value_t value) throws {
+            for (local int i = 0; i < SIM_attr_list_size(value); ++i) {
+                local attr_value_t it = SIM_attr_list_item(value, i);
+
+                local uint64 start = SIM_attr_integer(SIM_attr_list_item(it, 0));
+                local uint64 end = SIM_attr_integer(SIM_attr_list_item(it, 1));
+                local pcie_ats_translation_completion_entry_t e = {
+                    .u64 = SIM_attr_integer(SIM_attr_list_item(it, 2)),
+                    ...
+                };
+                insert_interval(&map, start, end, cast(e.u64, void *));
+            }
+        }
+        method get() -> (attr_value_t) {
+            local attr_value_t map_list = SIM_alloc_attr_list(0);
+
+            for_all_intervals(&map, &collect_map_item, &map_list);
+            return map_list;
+        }
+        independent method collect_map_item(uint64 start,
+                                            uint64 end,
+                                            void *ptr,
+                                            void *data) {
+            local attr_value_t *map_list = data;
+
+            local pcie_ats_translation_completion_entry_t e = {
+                .u64 = cast(ptr, uintptr_t),
+                ...
+            };
+
+            local attr_value_t m = SIM_make_attr_list(
+                3,
+                SIM_make_attr_uint64(start),
+                SIM_make_attr_uint64(end),
+                SIM_make_attr_uint64(e.u64)
+            );
+
+
+            local int old_size = SIM_attr_list_size(*map_list);
+            SIM_attr_list_resize(map_list, old_size + 1);
+            SIM_attr_list_set_item(map_list, old_size, m);
+        }
+    }
+
+    method lookup(uint64 addr,
+                  access_t access)
+                               -> (bool,    // Hit
+                                   uint64,  // Base address
+                                   uint64,  // Translated Address
+                                   uint64,  // size
+                                   pcie_ats_translation_completion_entry_t
+                                   ) {
+        local uint64 base;
+        local uint64 base_end;
+        local range_node_t *match_list;
+        local int match_count = get_interval_vector_and_range(&map,
+                                                              addr,
+                                                              &match_list,
+                                                              &base,
+                                                              &base_end);
+        log info, 4: "lookup addr: 0x%x, base=0x%x, end=0x%x, mc=%d",
+            addr, base, base_end, match_count;
+
+        local pcie_ats_translation_completion_entry_t dummy;
+
+        local uint64 base_size = base_end - base + 1;
+        if (match_count == 1) {
+            local pcie_ats_translation_completion_entry_t e = {
+                .u64 = cast(match_list[0].ptr, uintptr_t),
+                ...
+            };
+            if (((access & Sim_Access_Read) != 0) && e.field.r == 0) {
+                return (false, base, base, base_size, dummy);
+            }
+            if (((access & Sim_Access_Write) != 0) && e.field.w == 0) {
+                return (false, base, base, base_size, dummy);
+            }
+            if (((access & Sim_Access_Execute) != 0) && e.field.exe == 0) {
+                return (false, base, base, base_size, dummy);
+            }
+
+            local (uint64 start, uint64 txl_size) =
+                pcie_config.ats.get_translation_range(e);
+
+            assert(base_size == txl_size);
+            return (true, base, start, base_size, e);
+        } else {
+            return (false, base, base, base_size, dummy);
+        }
+    }
+    method insert(uint64 addr,
+                  uint64 size,
+                  pcie_ats_translation_completion_entry_t t_entry) {
+        insert_interval(&map, addr,
+                        addr + size - 1, cast(t_entry.u64, void *));
+    }
+    method evict(uint64 evict_addr, uint64 size) {
+        local uint64 base;
+        local uint64 base_end;
+        local range_node_t *match_list;
+        local int match_count = get_interval_vector_and_range(&map,
+                                                              evict_addr,
+                                                              &match_list,
+                                                              &base,
+                                                              &base_end);
+        for (local int i = 0; i < match_count; i++)
+            remove_interval(&map, evict_addr,
+                            evict_addr + size - 1, match_list[i].ptr);
+    }
+}
+method destroy() {
+    free_interval(&cache.map);
+}
+// }}

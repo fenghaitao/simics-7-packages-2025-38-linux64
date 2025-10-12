@@ -1,0 +1,230 @@
+/*
+  © 2013 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+provisional explicit_param_decls;
+device i210_v2;
+
+param desc = "model of Intel® i210 Gb Ethernet controller";
+param documentation = "Intel® i210 PCIe Gigabit Ethernet Controller.";
+
+param I210_ETHERNET_LAN = true;
+param TCPIP_TX_CONTEXT = false;
+param NUM_TRANSMIT_QUEUES = 4;
+param NUM_RECEIVE_QUEUES = 4;
+param VLAN_PACKET_FILTER = true;
+param HAS_EEPROM = true;
+param HAS_ACK_ACCELERATION = false;
+param HAS_RSS = true;
+param HAS_RSS_CPU_SELECTION = false;
+param HAS_SMALL_PACKET_DETECTION = false;
+param HAS_MTDq1 = true;
+param HAS_TIMESYNC = true;
+param HAS_EXTENDED_INTERRUPTS = true;
+param HAS_L2_ETHTYPE_FILTERS = true;
+
+/* This is wrong, but the Linux drivers still access those registers */
+param HAS_INTERRUPT_STATISTICS = true;
+
+import "utility.dml";
+import "pcie/common.dml";
+import "simics/devs/interrupt.dml";
+
+import "i210-mac.dml";
+
+param limitations = e1000_limitations
+    + "<li>MSI-X is unimplemented.</li>"
+    + "<li>Rx replication is not implemented</li>"
+    + "<li>Low Latency Interrupt filter and rate limiting is not implemented</li>"
+    + "<li>Qav mode is not implemented</li>"
+    + "<li>IEEE1588 timestamp is not implemented in L2 EthType filter</li>"
+    + "</ul>";
+
+connect flash {
+    param documentation = "Connection to the SPI interface in the i210";
+    param configuration = "required";
+}
+
+is pcie_endpoint;
+
+param pcie_version = 2.1;
+
+bank pcie_config {
+    /* --------------------------------------------------------------
+       BASE PCI CONFIGURATION SPACE REGISTERS
+       -------------------------------------------------------------- */
+
+    register vendor_id  { param init_val = 0x8086; }
+    register device_id { param init_val = 0x1533; }
+
+    register revision_id { param init_val = 0x00; }
+    register class_code { param init_val = 0x020000; }
+
+    register header_type {
+        field type { param init_val = 0; }
+        field mf { param init_val = 1; }
+    }
+
+    register membar @ 0x10 is (memory_base_address_32) {
+        param desc = "Memory BAR Base Address";
+        param size_bits = 17;
+        param map_obj = csr.obj;
+    }
+
+    register flashbar @ 0x14 is (memory_base_address_32) {
+        param desc = "Memory Base Address B";
+        param size_bits = 12;
+        param map_obj = flash.obj;
+    }
+
+    register iobar @ 0x18 is (io_base_address) {
+        param desc = "IO BAR Base Address";
+        param size_bits = 5;
+        param map_obj = io_mapped.obj;
+    }
+
+    register subsystem_vendor_id { param init_val = 0x8086; }
+    register subsystem_id { param init_val = 0x0000; }
+    register interrupt_pin { param init_val = 0x01; }
+
+    is defining_expansion_rom;
+    register expansion_rom_base {
+        // i210 supports flash device sizes up to 8 MB
+        // (data sheet revision 3.7, section 1.4.5 Serial Flash Interface)
+        param size_bits = 23;
+    }
+
+    register capabilities_ptr { param init_val = 0x40; }
+
+    /* --------------------------------------------------------------
+       PCI POWER MANAGEMENT REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+
+    is defining_pm_capability;
+    param pm_offset     = 0x40;
+    param pm_next_ptr   = 0x50;
+
+    group pm {
+        register capability {
+            field dsi { param init_val = 0b1; }
+        }
+    }
+
+    /* --------------------------------------------------------------
+       MESSAGE SIGNALED INTERRUPT (MSI) CONFIGURATION REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+
+    is defining_msi_capability;
+    param msi_offset    = 0x50;
+    param msi_next_ptr  = 0x70;
+    param msi_num_vectors = 1;
+    param msi_64bit_capable = true;
+    param msi_pvm_capable = true;
+    param msi_emd_capable = false; // data sheet: reserved bit read as 0
+
+    /* --------------------------------------------------------------
+       PCIE CONFIGURATION REGISTERS (CAPABILITY)
+       -------------------------------------------------------------- */
+    is defining_exp_capability;
+    param exp_offset = 0xa0;
+    param exp_next_ptr = 0x0;
+    param exp_dp_type = PCIE_DP_Type_EP;
+
+    group exp {
+        param has_links = true;
+        group device {
+            register cap {
+                field mpss {
+                    param init_val = 0b010;
+                }
+                field el0al {
+                    // NOTE: changed from i210 to match data sheet
+                    param init_val = 0b11;
+                }
+                field el1al {
+                    param init_val = 0b110;
+                }
+            }
+            register control {
+                field ero {
+                    param init_val = 0b1;
+                }
+                field ens {
+                    param init_val = 0b1;
+                }
+                field mrrs {
+                    param init_val = 0b010;
+                }
+            }
+        }
+        group link {
+            param max_link_speed = PCIE_Link_Speed_2_5;
+            // NOTE: changed from i210 to match data sheet
+            param max_link_width = PCIE_Link_Width_x1;
+            register cap {
+                field mls {
+                    param init_val = 0b0001;
+                }
+                field aspms {
+                    param init_val = 0b11;
+                }
+                field l0el {
+                    param init_val = 0b001;
+                }
+                field l1el {
+                    param init_val = 0b110;
+                }
+            }
+            register status {
+                field ls {
+                    param init_val = 0b0001;
+                }
+                field nlw {
+                    param init_val = 0b000100;
+                }
+                field scc {
+                    param init_val = 0b1;
+                }
+            }
+        }
+    }
+
+    /* --------------------------------------------------------------
+       PCIE EXTENDED CONFIGURATION SPACE
+       ADVANCED ERROR REPORTING CAPABILITY
+       -------------------------------------------------------------- */
+    is defining_aer_capability;
+    param aer_offset = 0x100;
+    param aer_next_ptr = 0x140;
+
+    group aer {
+        param tlp_prefix_log_or_header_log_ctd_len = 0;
+    }
+
+    /* --------------------------------------------------------------
+       DEVICE SERIAL NUMBER CAPABILITY
+       -------------------------------------------------------------- */
+    is defining_dsn_capability;
+    param dsn_offset = 0x140;
+    param dsn_next_ptr = 0x0;
+    // dsn_serial_number (low and high) are based on the MAC address and are loaded from EEPROM
+
+    is soft_reset;
+    method soft_reset() {
+        // PCI config space is not affected by software reset
+    }
+}
+
+method init() {
+    tx_init();
+}

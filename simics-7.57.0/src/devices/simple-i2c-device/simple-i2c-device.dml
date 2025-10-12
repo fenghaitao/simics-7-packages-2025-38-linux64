@@ -1,0 +1,86 @@
+/*
+  simple-i2c-device.dml - A simple I2C slave device that can be used for
+  testing.
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device simple_i2c_device;
+parameter desc = "simple I2C device";
+parameter documentation = "Simple I2C slave device implementing both i2c_bus"
+    + " and i2c_slave_v2 interfaces. It can be used for testing.";
+
+import "simics/devs/i2c.dml";
+import "simple-i2c-slave.dml";
+
+loggroup lg_common;
+
+connect i2c_bus {
+    interface i2c_bus;
+}
+
+attribute address {
+    parameter documentation = "Address on the i2c bus.";
+    parameter configuration = "required";
+    parameter allocate_type = "uint8";
+}
+
+attribute read_value {
+    parameter documentation = "Value to return on reads.";
+    parameter allocate_type = "uint8";
+}
+
+attribute written_value {
+    parameter documentation = "Last byte written to this device.";
+    parameter allocate_type = "uint8";
+}
+
+is simple_i2c_slave;
+// I2C methods for i2c_link_v2
+method i2c_start_request_read() -> (i2c_status_t ack) {
+    log info, 4: "transmit request received";
+    ack = 0;
+}
+
+method i2c_start_request_write() -> (i2c_status_t ack) {
+    log info, 4: "receive request received";
+    ack = 0;
+}
+
+method i2c_read_request() -> (uint8 value) {
+    value = $read_value;
+}
+
+method i2c_write_request(uint8 value) -> (i2c_status_t ack) {
+    $written_value = value;
+    ack = 0;
+}
+
+method get_slave_address() -> (bool enable, uint8 addr) {
+    enable = true;
+    addr = $address;
+}
+
+method post_init() {
+    local int res;
+    if ($i2c_bus.obj) {
+        res = $i2c_bus.i2c_bus.register_device($dev.obj, $address, 0xff,
+                                               I2C_flag_exclusive);
+        if (res != 0)
+            log error, 1, lg_common: "could not connect I2C device to I2C bus";
+    } else {
+        log error, 1, lg_common: "did not connect to any I2C bus as i2c_bus"
+            + " attribute not set";
+    }
+}

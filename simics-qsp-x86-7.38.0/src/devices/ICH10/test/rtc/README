@@ -1,0 +1,18 @@
+ICH10 RTC Test Description
+==========================
+
+Included Cases
+--------------
+The ICH10 RTC test totally includes 6 cases:
+(1) s-rtc-reset.py: tests default states of RTC after RESET
+(2) s-rtc-timing.py: tests the timing function of RTC
+(3) s-rtc-alarming.py: tests the alarming function of RTC
+(4) s-rtc-periodic.py: tests the periodic interrupt function of RTC
+(5) s-rtc-bcd.py: tests the BCD and binary format to get/set date or time
+(6) s-rtc-24h.py: tests the 24-hour or 12-hour format of time
+
+
+
+Not Tested Features
+-------------------
+None

@@ -1,0 +1,77 @@
+/*
+  simple-broken-device-valgrind.dml - sample broken DML code for the
+  Valgrind debugging example
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+//:: pre simple-broken-device-valgrind.dml {{
+dml 1.2;
+
+device simple_broken_device_valgrind;
+
+// short, one-line description
+parameter desc = "sample broken device for Valgrind example";
+
+// long description
+parameter documentation = "This is a very broken device for use with the Valgrind debugging example";
+
+import "io-memory.dml";
+
+extern void *malloc(size_t);
+extern int  free(void *);
+extern char *strcpy(char *, const char *);
+
+method init {
+    // Memory allocated by "new" expression will be initialized to 0's
+    // automatically
+    $too_few = new uint8[100];
+}
+
+data uint8 *too_few;
+
+bank regs {
+    parameter function = 0;
+    parameter register_size = 1;
+
+    // Accesses between 0-99 are okay
+    // Accesses above 99 are outside of malloc:ed memory
+    register u[0x100] @ 0x0000 + $i {
+        method read() -> (value) {
+            log info: "read from u[%d]", $i;
+            value = $too_few[$i];
+        }
+    }
+
+    // Will use uninitialized malloc memory
+    register m @ 0x0100 {
+        method read() -> (value) {
+            log info: "read from m";
+            local char *s = malloc(10);
+            log info, 1: "String=%s", s;
+            value = 0;
+            free(s);
+        }
+    }
+
+    // Accessing released memory
+    register r @ 0x0200 {
+        method read() -> (value) {
+            log info: "read from r";
+            local char *s = new char[10];
+            strcpy(s, "foo");
+            delete s;
+            value = s[0];
+        }
+    }
+}
+// }}

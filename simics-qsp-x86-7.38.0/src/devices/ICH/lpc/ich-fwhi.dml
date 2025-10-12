@@ -1,0 +1,218 @@
+/*
+  ich-fwhi.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "io-memory.dml";
+import "utility.dml";
+import "simics/devs/map-demap.dml";
+import "simics/model-iface/image.dml";
+
+constant MAX_FWH_DEVICE  = 12;
+constant FUNCTION_NUMBER = 0;
+
+attribute fwh_device[MAX_FWH_DEVICE] {
+    parameter documentation = "Devices connected to the Firmware Hub."
+        + " Each device is either [object, target, image] (as returned by"
+        + " flash_create_memory_anon) or Nil."
+        + " The <b>image</b> object must implement the <b>image</b>"
+        + " interface."
+        + " See <b>memory_space.map</b> attribute for requirements on"
+        + " <b>object</b> and <b>target</b>";
+    parameter type = "[oo|no]|n";
+    data conf_object_t *obj;
+    data conf_object_t *tar;
+    data conf_object_t *img;
+    data image_interface_t *ifc; 
+
+    method get()->(attr_value_t val) {
+        if ($obj == NULL) {
+            val = SIM_make_attr_nil();
+        } else {
+            val = SIM_make_attr_list(3, 
+                    SIM_make_attr_object($obj),
+                    ($tar == NULL) ? SIM_make_attr_nil() :
+                                     SIM_make_attr_object($tar),
+                    SIM_make_attr_object($img));
+        }
+    }
+
+    method size()->(uint64 val) {
+        val = $ifc->size($img);
+    }
+
+    method set(attr_value_t val) {
+        local conf_object_t *obj;
+        local conf_object_t *tar;
+        local conf_object_t *img;
+        local image_interface_t *ifc;
+
+        if (SIM_attr_is_list(val)) {
+            obj = SIM_attr_object(SIM_attr_list_item(val, 0));
+            tar = SIM_attr_object_or_nil(SIM_attr_list_item(val, 1));
+            img = SIM_attr_object(SIM_attr_list_item(val, 2));
+
+            local map_target_t *tar_mt = NULL;
+            if (tar) {
+                tar_mt = SIM_new_map_target(tar, NULL, NULL);
+                if (SIM_clear_exception() != SimExc_No_Exception) {
+                    log "error", 1:
+                        "The %s object does not implement any of the required"
+                        + " interfaces", SIM_object_name(tar);
+                    throw;
+                }
+            }
+            local map_target_t *mt = SIM_new_map_target(obj, NULL, tar_mt);
+            SIM_free_map_target(tar_mt);
+            if (SIM_clear_exception() != SimExc_No_Exception) {
+                log "error", 1:
+                    "The %s object does not implement any of the required"
+                    + " interfaces", SIM_object_name(obj);
+                throw;
+            }
+            SIM_free_map_target(mt);
+
+            ifc = cast(SIM_c_get_interface(img, "image"), image_interface_t*);
+            if (!ifc) {
+                log "error", 1: "The %s does not implement the required %s",
+                    SIM_object_name(img), "image interface";
+                throw;
+            }
+        } else if (SIM_attr_is_nil(val)) {
+            obj  = NULL;
+            tar  = NULL;
+            img  = NULL;
+            ifc  = NULL;
+        } 
+        
+        if (SIM_object_is_configured($dev.obj))
+            call $del_fwh_map();
+        $obj = obj;
+        $tar = tar;
+        $img = img;
+        $ifc = ifc;
+        if (SIM_object_is_configured($dev.obj))
+            call $add_fwh_map();
+    }
+}
+
+method del_fwh_map() {
+    local conf_object_t *objptr = NULL;
+    local uint32 i;
+    for (i = 0; i < MAX_FWH_DEVICE; i++) {
+        if ($fwh_device[i].obj != NULL) {
+            objptr = $fwh_device[i].obj;
+            $pci_bus.pci_bus.remove_map(
+                objptr, Sim_Addr_Space_IO, FUNCTION_NUMBER);
+        }
+    }
+
+}
+
+method add_fwh_map() {
+    local conf_object_t *objptr = NULL;
+    local conf_object_t *tarptr = NULL;
+    local map_info_t map_info;
+
+    local uint32 space_1M   = 0x100000;
+    local uint32 space_512K = 0x80000;
+    local uint32 space_64K  = 0x10000;
+
+    // The LPC Firmware Memory Cycle has 28 address bits
+    local uint32 ADDR_MASK  = 0xFFFFFFF;
+
+    memset(&map_info, 0, sizeoftype(map_info_t));
+    map_info.function = FUNCTION_NUMBER;
+    map_info.priority = 0;
+
+    local uint32 i;
+    local uint32 dev_index;
+    local uint64 size;
+
+    map_info.start = 0;
+    for (i = 0; i < 16; i++) {
+        call $get_dev_index(i) -> (dev_index);
+        if (($pci_config.fwh_dev_en & (1 << i)) == 0 ||
+             $fwh_device[dev_index].obj == NULL )
+            continue;
+        objptr = $fwh_device[dev_index].obj;
+        tarptr = $fwh_device[dev_index].tar;
+        call $fwh_device[dev_index].size()->(size);
+        if (i < 4) { // 1M mappings FF0 to FF8
+            map_info.length = space_1M;
+            map_info.base = 0xFF000000 + 0x100000 * i;
+            map_info.start = (map_info.base & ADDR_MASK) % size;
+            $pci_bus.pci_bus.add_map(objptr, Sim_Addr_Space_IO, tarptr, map_info);
+            map_info.base += 0x400000;
+            map_info.start = (map_info.base & ADDR_MASK) % size;
+            $pci_bus.pci_bus.add_map(objptr, Sim_Addr_Space_IO, tarptr, map_info);
+        } else if (i > 7) { // 512k mappings FF8 to FFF
+            map_info.length = space_512K;
+            map_info.base = 0xFF800000 + 0x80000 * (i - 8);
+            map_info.start = (map_info.base & ADDR_MASK) % size;
+            $pci_bus.pci_bus.add_map(objptr, Sim_Addr_Space_IO, tarptr, map_info);
+            map_info.base += 0x400000;
+            map_info.start = (map_info.base & ADDR_MASK) % size;
+            $pci_bus.pci_bus.add_map(objptr, Sim_Addr_Space_IO, tarptr, map_info);
+        } else if (i == 6) { // 64k Legacy E mapping
+            map_info.length = space_64K;
+            map_info.base = 0xE0000;
+            map_info.start = size - space_64K * 2;
+            $pci_bus.pci_bus.add_map(objptr, Sim_Addr_Space_IO, tarptr, map_info);
+        } else if (i == 7) { // 64k Legacy F mapping
+            map_info.length = space_64K;
+            map_info.base = 0xF0000;
+            map_info.start = size - space_64K;
+            $pci_bus.pci_bus.add_map(objptr, Sim_Addr_Space_IO, tarptr, map_info);
+        } // 4 and 5 are reserved.
+    }
+}
+
+method get_dev_index(uint32 i) -> (uint32 index) {
+    local uint32 reg;
+    reg = (i > 3) ? $pci_config.fwh_sel1 : $pci_config.fwh_sel2;
+    if (i > 7)
+        i -= 8;
+    index = (reg >> (i << 2)) & 0xF;
+}
+
+bank pci_config {
+    register fwh_sel1   @ 0xD0 "Firmware Hub Select 1 Register";
+    register fwh_sel2   @ 0xD4 "Firmware Hub Select 2 Register";
+    register fwh_dev_en @ 0xD8 "Firmware Hub Decode Enable Register";
+
+    register fwh_sel1 {
+        is fwh_reg;
+        parameter size = 4;
+        parameter hard_reset_value = 0x00112233;
+    }
+    register fwh_sel2 {
+        is fwh_reg;
+        parameter size = 2;
+        parameter hard_reset_value = 0x4567;
+    }
+    register fwh_dev_en {
+        is fwh_reg;
+        parameter size = 2;
+        parameter hard_reset_value = 0xFFCF;
+    }
+}
+
+template fwh_reg {
+    method after_write(memop) {
+        call $del_fwh_map();
+        call $add_fwh_map();
+    }
+}

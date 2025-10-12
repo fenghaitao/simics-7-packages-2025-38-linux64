@@ -1,0 +1,1044 @@
+/*
+  ich-spi.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "io-memory.dml";
+import "utility.dml";
+import "simics/devs/serial-peripheral-interface.dml";
+import "simics/devs/memory-space.dml";
+import "reset-ports.dml";
+
+header %{
+    #include <simics/util/swabber.h>
+%}
+
+//flash command:
+constant F_CMD_WR_STS   = 0x1;
+constant F_CMD_WRITE    = 0x2;
+constant F_CMD_READ     = 0x3;
+constant F_CMD_RD_STS   = 0x5;
+constant F_CMD_WREN     = 0x6;
+constant F_CMD_FREAD    = 0xb;
+constant F_CMD_RDID     = 0x9f;
+constant F_CMD_BE       = 0xc7;  //bulk erase
+constant F_CMD_SE       = 0xd8;  //sector erase;
+
+//state-machine status:
+constant S_IDLE             = 0x0;
+constant S_INIT_LOAD        = 0x1;
+constant S_HW_READ          = 0x2;
+constant S_HW_WRITE         = 0x3;
+constant S_HW_ERASE         = 0x4;
+constant S_WRITE_EN         = 0x5;
+constant S_WRITE_STS        = 0x6;
+constant S_SW_READ          = 0x7;
+constant S_SW_WRITE         = 0x8;   //include 'erase' case
+constant S_OBSERVED_READ    = 0x9;
+constant S_MAPPED_ACCESS    = 0xA;
+
+constant SIZE_DESC          = 0x1000; //bytes
+constant MAX_CACHE_LINE     = 0xFF;
+
+constant FDBAR              = 0x00000000;
+
+typedef layout "little-endian" {
+    uint32  flvalsig;
+    bitfields 32 {
+        uint3   nr      @[26:24];   //number of regions
+        uint8   frba    @[23:16];   //flash region base address
+        uint3   nc      @[10:8];    //number of component
+        uint8   fcba    @[7:0];     //flash component base address
+    } flmap0;
+    bitfields 32 {
+        uint8   isl     @[31:24];   //ICH strap length
+        uint8   fisba   @[23:16];   //ICH strap base address
+        uint3   nm      @[10:8];    //number of master
+        uint8   fmba    @[7:0];     //flash master base address
+    } flmap1;
+    bitfields 32 {
+        uint8   msl     @[15:8];    //MCH strap length
+        uint8   fmsba   @[7:0];     //MCH strap base address
+    } flmap2;
+} flash_descriptor_t;
+
+
+typedef layout "big-endian" {
+    uint8   rsvd;
+    uint24  addr;
+} spi_address_t;
+
+typedef layout "little-endian" {
+    uint8   opcode;
+    bitfields 8 {
+        uint2 type @[1:0];
+    } optype;
+} opcode_property_t;
+
+
+attribute desc_buffer {
+    parameter documentation = "Buffer for holding page program data";
+    parameter buffer_size = SIZE_DESC;
+
+    is set_get_data_buf;
+}
+
+attribute mapped_access_buf {
+    parameter documentation = "Buffer for direct memory access";
+    parameter buffer_size = MAX_CACHE_LINE;
+
+    is set_get_data_buf;
+}
+
+attribute x_state {
+    parameter documentation = "Status of inner state-machine";
+    parameter allocate_type = "int32";
+    is read_only_attr;
+}
+
+attribute cur_master_idx {
+    parameter documentation = "Current master that using SPI bus lines";
+    parameter allocate_type = "int32";
+    is read_only_attr;
+}
+
+connect spi_slave {
+    parameter documentation = "Connect to a SPI slave device";
+    parameter configuration = "required";
+
+    interface  serial_peripheral_interface_slave;
+
+    method call_spi_request(uint32 master_idx,
+                int first, int last, int bits, dbuffer_t *payload) {
+        $cur_master_idx = master_idx;
+        $serial_peripheral_interface_slave.spi_request(
+            first, last, bits, payload);
+    }
+}
+
+implement serial_peripheral_interface_master {
+    method spi_response(int bits, dbuffer_t* payload) {
+        select ibank in ($bank_arr)
+            where (ibank.master_idx == $cur_master_idx) {
+                call ibank.spi_response_handle(bits, payload);
+        } else {
+            log "spec_violation", 1 :
+                "no master selected or master have not initialized!";
+        }
+    }
+}
+
+port mem_gbe {
+    is io_memory_inf_imp;
+    parameter infoStr       = "gbe mapping at";
+    parameter master_index  = 3;
+}
+
+port mem_bios {
+    is io_memory_inf_imp;
+    parameter infoStr       = "bios mapping at";
+    parameter master_index  = 1;
+}
+
+
+parameter bank_arr = [$spi_regs, $gbe_regs];
+
+
+bank spi_regs {
+    is regs_common_decl;
+
+    parameter function      = 0;
+
+    register bfpr  @ 0x0  "BIOS Flash Primary Region";
+    register bbar  @ 0xA0 "BIOS Base Address Configuration";
+    register fdoc  @ 0xB0 "Flash Descriptor Observability Control";
+    register fdod  @ 0xB4 "Flash Descriptor Observability Data";
+    register afc   @ 0xC0 "Additional Flash Control";
+    register lvscc @ 0xC4 "Host Low Vendor Specific Component Capabilities";
+    register uvscc @ 0xC8 "Host Upper Vendor Specific Component Capabilities";
+    register fpb   @ 0xD0 "Flash Partition Boundary";
+
+    register fdod is (read_only);
+    register bfpr is (read_only);
+}
+
+bank spi_regs {
+    is regs_common_imp;
+
+    parameter master_idx    = 1;
+    parameter prot_rgn_num  = 5;
+    parameter rgn_num       = 5;
+    parameter shift_reg_num = 16;
+
+    register fdoc {
+        field fdss [14:12]  "flash descriptor section select";
+        field fdsi [11:2]   "flash descriptor section index";
+    }
+
+    register fdod {
+        method read() ->(value) {
+            local uint32 offset = 0;
+            local uint32 descBase = FDBAR;
+
+            local uint8*  pBuf = &$desc_buffer.buf[0];
+            local flash_descriptor_t* pStruct;
+            pStruct = cast(pBuf, flash_descriptor_t*);
+
+            switch ($fdoc.fdss) {
+            case 0x0:
+                offset = descBase + $fdoc.fdsi;
+                break;
+            case 0x1:
+                offset = (pStruct->flmap0.fcba << 4) + $fdoc.fdsi;
+                break;
+            case 0x2:
+                offset = (pStruct->flmap0.frba << 4) + $fdoc.fdsi;
+                break;
+            case 0x3:
+                offset = (pStruct->flmap1.fmba << 4) + $fdoc.fdsi;
+                break;
+            default:
+                break;
+            }
+
+            local uint8 cmd[4];
+            local int d_len = 4;   //byte uint
+            local int c_len = 4;        //cmd length
+            inline $set_cmdpkg_addr(&cmd[0], offset);
+            cmd[0] = F_CMD_READ;
+
+            $x_state = S_OBSERVED_READ;
+            $ssfsts.scip = 1;
+            call $spi_send(cmd, c_len, NULL, d_len);
+            log "info", 4: "observation @0x%x done", offset;
+        }
+    }
+
+    method handle_observed_read(int bits, dbuffer_t* payload) {
+        local uint8         i;
+        local uint32        temp = 0;
+        local const uint8*  data = dbuffer_read_all(payload);
+
+        data += 4; //skip cmd and addr;
+        for(i = 0; i < 4; i++) {
+            temp |= (reverse_bits8(*(data + i)) << (i * 8));
+        }
+        $fdod = temp;
+    }
+
+
+    method handle_init_load(int bits, dbuffer_t* payload) {
+        local int           i;
+        local uint32        offset;
+        local uint32        data_len = (bits / 8) - 4;
+        local const uint8*  data     = dbuffer_read_all(payload);
+        local uint8*        pBuf     = &$desc_buffer.buf[0];
+        local flash_descriptor_t* pStruct = cast(pBuf, flash_descriptor_t*);
+
+        log "info", 4 :
+            "handle response for loading descriptor(total 0x%x bits)", bits;
+
+        data += 4; //skip dummy bits;
+
+        for (i = 0; i < data_len; i++) {
+            $desc_buffer.buf[i] = reverse_bits8(*(data + i));
+        }
+
+        if (pStruct->flvalsig != 0x0FF0A55A) {
+            $spi_regs.hsfsts.fdv = 0;
+            $gbe_regs.hsfsts.fdv = 0;
+            log "info", 3 :
+                "flvalsig=0x%x, this flash only work under non-descript mode",
+                pStruct->flvalsig;
+        } else {
+            offset = pStruct->flmap0.fcba << 4;
+            log "info", 4: "component port's offset is:0x%x", offset;
+
+            offset = pStruct->flmap0.frba << 4;
+            log "info", 4: "region port's offset is:0x%x", offset;
+            call $init_register_freg(pBuf + offset);
+
+            offset = pStruct->flmap1.fmba << 4;
+            log "info", 4: "master port's offset is:0x%x", offset;
+
+            $spi_regs.hsfsts.fdv = 1;
+            $gbe_regs.hsfsts.fdv = 1;
+            log "info", 3 :
+                "this flash can work under descriptor mode!";
+        }
+    }
+
+    method load_flash_descriptor() {
+        local int   d_len = SIZE_DESC;  //in byte unit
+        local int   c_len = 4;
+        local uint8 cmd[10];
+
+        inline $set_cmdpkg_addr(&cmd[0], FDBAR);
+        cmd[0]      = F_CMD_READ;
+        $x_state    = S_INIT_LOAD;
+        log "info", 4 : "do spi request for loading descriptor";
+        call $spi_send(cmd, c_len, NULL, d_len);
+    }
+}
+
+bank gbe_regs {
+    is regs_common_decl;
+    register glfpr @ 0x0 is (read_only) {
+        parameter desc = "Gigabit LAN Flash Primary Region";
+    }
+}
+
+bank gbe_regs {
+    is regs_common_imp;
+
+    parameter function      = 1;
+    parameter master_idx    = 3;
+    parameter prot_rgn_num  = 2;
+    parameter rgn_num       = 4;
+    parameter shift_reg_num = 1;
+}
+
+template regs_common_decl {
+    parameter master_idx    default undefined;
+    parameter prot_rgn_num  default undefined;
+    parameter rgn_num       default undefined;
+    parameter shift_reg_num default undefined;
+    parameter overlapping   = true;
+    parameter partial       = true;
+
+    parameter register_size = 4;
+
+    register hsfsts size 2 @ 0x4 "Hardware Sequencing Flash Status";
+    register hsfctl size 2 @ 0x6 "Hardware Sequencing Flash Control";
+    register faddr         @ 0x8 "Flash address";
+    register fdata [$shift_reg_num] @ 0x10 + $i*4 {
+        parameter desc = "Shift In/out Data";
+    }
+    register fracc         @ 0x50 "Flash Regions Access Permissions" {
+        parameter hard_reset_value = 0x00000202;
+    }
+    register freg[$rgn_num]@ 0x54 + $i*4 is (read_only) {
+        parameter desc = "One of Flash Region(Total Five) ";
+    }
+    register pr [$prot_rgn_num] @ 0x74 + $i*4 {
+        parameter desc = "Protect Ranges";
+    }
+    register ssfsts size 1 @ 0x90 "Software Sequencing Flash Status";
+    register ssfctl size 3 @ 0x91 "Software Sequencing Flash Control";
+    register preop  size 2 @ 0x94 "Prefix Opcode Configuration";
+    register optype size 2 @ 0x96 "Opcode Type Configuration";
+    register opmenu size 8 @ 0x98 "Opcode Menu Configuration";
+}
+
+template regs_common_imp {
+    register hsfctl_backup size 2 is (unmapped) {
+        parameter desc = "Hardware Sequencing Flash Control Backup";
+        is hsfctl_fields;
+    }
+
+    register expect_bits   is (unmapped) "Expected SPI-response Bits";
+    register read_bytes    is (unmapped) "Received Data Num ";
+    register to_reads      is (unmapped) "How Many Need To Read Yet";
+    register pkg_head_size is (unmapped) "Opcode Plus Address Length In Bytes";
+    register read_buf      is (unmapped) "Recv Buffer";
+
+    register hsfsts {
+        field flockdn[15]                     "Flash Configure Lock-down";
+        field fdv    [14] is (read_only)      "Flash Descriptor Valid";
+        field fdopss [13] is (read_only)      
+                "Flash Descriptor Override Pin-strap Status";
+        field scip   [5]  is (read_only)      "SPI Cycle In Process";
+        field berase [4:3]is (read_only)      "Block/Sector Erase Size";
+        field ael    [2]                      "Access Error Log";
+        field fcerr  [1]  is (write_1_clears) "Flash Cycle Error";
+        field fdone  [0]  is (write_1_clears) "Flash Cycle Done";
+
+        field flockdn {
+            method write(value) {
+                if ($this == 0)
+                    $this = value;
+            }
+        }
+    }
+
+    register hsfctl {
+        is hsfctl_fields;
+        field fgo {
+            method read() -> (value) {
+                value = 0;
+            }
+        }
+
+        method before_write(memop, msb1, lsb, value) {
+            local uint32  old_val;
+            inline $get() -> (old_val);
+            inline $hsfctl_backup.set(old_val);
+        }
+
+        method after_write(memop) {
+            local uint32  old_val;
+            inline $hsfctl_backup.get() -> (old_val);
+
+            if ($hsfsts.fdv == 0) {
+                log "info", 3 :
+                    "not in descriptor mode, %s ",
+                    "can not write hardware sequence flash control register";
+                inline $set(old_val); //restore to previous value
+                return;
+            }
+
+            if (($hsfctl_backup.fgo == 1) && ($hsfsts.fdone == 0)) {
+                log "info", 3 : "violate rules when flash cycle is going";
+                inline $set(old_val);
+                return;
+            }
+
+            if ($this.fgo == 1) {
+                switch ($fcycle) {
+                case 0x0:
+                    //read...
+                    call $hw_send_rw_opcode(false);
+                    break;
+                case 0x1:
+                    //reserved...
+                    break;
+                case 0x2:
+                    //write...
+                    call $hw_send_rw_opcode(true);
+                    break;
+                case 0x3:
+                    call $hw_send_erase_op();
+                    break;
+                default:
+                    assert false;
+                }
+                $fgo = 0;
+            }
+        }
+    }
+
+    register ssfsts {
+        field ael   [4] is (read_only)      "Access Error Log";
+        field fcerr [3] is (write_1_clears) "Flash Cycle Error";
+        field fdone [2] is (write_1_clears) "Cycle Done";
+        field scip  [0] is (read_only)      "SPI Cycle In Process";
+
+        field fcerr {
+            method read() -> (value) {
+                value = $hsfsts.fcerr;
+            }
+        }
+    }
+
+    register ssfctl {
+        field scf   [18:16] "SPI Cycle Frequency";
+        field sme   [15]    "SPI SMI# Enable";
+        field ds    [14]    "Data Cycle";
+        field dbc   [13:8]  "Data Byte Count";
+        field cop   [6:4]   "Cycle Opcode Pointer";
+        field spop  [3]     "Sequence Pre-opcode Pointer";
+        field acs   [2]     "Atomic Cycle Sequence";
+        field scgo  [1]     "SPI Cycle Go";
+
+        method after_write(memop) {
+            if (($master_idx == 3) && ($dbc >= 4)) { //master is GbE
+                log "info", 3 :
+                    "data byte count too large and 3 is adopted";
+                $dbc = 3;
+            }
+
+            if ($this.scgo == 1) {
+                //...check valid address first before send pre-opcode
+                local bool  is_need_addr;
+                local bool  is_read;
+                local uint8 type_val;
+                local bool  addr_ok;
+
+                type_val     = ($optype >> ($cop * 2)) & 0x3;
+                is_need_addr = (type_val & 0x2) == 0x2;
+                is_read      = (type_val & 0x1) == 0x0;
+                call $is_address_valid(!is_read) -> (addr_ok);
+                if (!addr_ok) {
+                    log "info", 4 :
+                        "software sequencing address invalid";
+                    $ssfsts.fcerr = 1;
+                    return;
+                }
+
+                log "info", 4: "start SPI software sequence cycle!";
+                call $sw_send_preop();
+                call $sw_send_primary_op(!is_read, is_need_addr);
+            }
+        }
+    }
+
+    register pr [$prot_rgn_num] {
+        field wp_en [31]    is (flockdn_write) "write protection enable";
+        field limit [28:16] is (flockdn_write) "protect range limit";
+        field rp_en [15]    is (flockdn_write) "read protection enable";
+        field base  [12:0]  is (flockdn_write) "protect range base";
+    }
+
+    register freg[$rgn_num] {
+        field region_limit  [28:16] "region base";
+        field region_base   [12:0]  "region base";
+    }
+
+    register preop is (flockdn_write);
+    register optype is (flockdn_write);
+    register opmenu is (flockdn_write);
+
+    method handle_sw_read(int bits, dbuffer_t* payload) {
+        local const uint8*  data = dbuffer_read_all(payload);
+        local uint8 i;
+        local uint32 len = (bits / 8);
+        local uint32 temp;
+        local uint8  index;
+
+        if ($to_reads < len) {
+            log  "info", 1 : "transaction messed";
+            len = $to_reads;
+        }
+
+        for(i = 0; i < len; i++) {
+            temp = reverse_bits8(*(data + i));
+            temp = temp << (($read_bytes % 4) * 8);
+            $read_buf |= temp;
+            $read_bytes++;
+            $to_reads--;
+
+            if ($read_bytes == $pkg_head_size) {
+                $read_buf       = 0; //discard opcode/address dummy dword
+                $read_bytes     = 0; //reset count
+                $pkg_head_size  = 0;
+                continue;
+            }
+
+            if (($read_bytes % 4) == 0) {
+                //at least one DWORD is there
+                //index as zero base:
+                index = ($read_bytes / 4) - 1;
+                if (index < $shift_reg_num) {
+                    $fdata[index] = $read_buf;
+                } else {
+                    log "info", 1 :
+                        "error in transfer bits flow";
+                }
+                $read_buf = 0;
+            }
+        }
+
+        if ($to_reads == 0) {
+            log "info", 4 :
+                "received all 0x%x bytes data", $read_bytes;
+
+            if (($read_bytes % 4) != 0) {
+                //handle rest (N%4) non-dword aligned data
+                //maybe $read_bytes < 4, so index =0;
+                //for example handle flash Read-Status command who return 1 byte
+                index = $read_bytes / 4;
+                if (index < $shift_reg_num) {
+                    $fdata[index] = $read_buf;
+                } else {
+                    log "info", 1 :
+                        "error in transfer bits flow";
+                }
+                $read_buf = 0;
+            }
+
+            //reset state:
+            $read_bytes     = 0;
+            $ssfsts.fdone   = 1;
+            $ssfsts.scip    = 0;
+            $x_state        = S_IDLE;
+        }
+    }
+
+    method sw_send_preop() {
+        if ($ssfctl.acs == 1) {
+            local uint8 pre_opcode[1];
+            pre_opcode[0] = ($preop >> ($ssfctl.spop * 8)) & 0xFF;
+
+            log "info", 4: "send pre-opcode:0x%x", pre_opcode[0];
+            //pre-opcode need no address!
+            call $spi_send(pre_opcode, 1, NULL, 0);
+        }
+    }
+
+    method sw_send_primary_op(bool bWrite, bool bSendAddr) {
+        local int d_len = ($ssfctl.ds == 1) ? ($ssfctl.dbc + 1) : 0;
+        local int c_len = 1;        //cmd length
+        local uint8 cmd[4];
+
+        cmd[0] = ($opmenu >> ($ssfctl.cop * 8)) & 0xFF;
+        if (bSendAddr) {
+            inline $set_cmdpkg_addr(&cmd[0], $faddr);
+            c_len = 4;
+        }
+
+        $ssfsts.scip = 1;
+        if (bWrite)
+            $x_state = S_SW_WRITE;
+        else
+            $x_state = S_SW_READ;
+
+        local dbuffer_t* payload = new_dbuffer();
+        dbuffer_append(payload, c_len + d_len);
+
+        local int i;
+        local uint8 w_data;
+        local uint8 *data;
+        for (i = 0; i < c_len; i++) {
+            data  = dbuffer_update(payload, i, 1);
+            *data = reverse_bits8(cmd[i]);
+        }
+
+        //Note: if it is erase, then it is user/software's duty
+        // to set DS/DBC filed properly to let ( d_len .eq. 0 )
+        for (i = 0; i < d_len; i++) {
+            if (bWrite) {
+                w_data = ($fdata[(i / 4)] >> ((i % 4) * 8)) & 0xFF;
+            } else {
+                w_data = 0x0; //dummy data;
+            }
+
+            data  = dbuffer_update(payload, i + c_len, 1);
+            *data = reverse_bits8(w_data);
+        }
+
+        $pkg_head_size  = c_len;
+        $to_reads       = c_len + d_len;
+        $expect_bits    = $to_reads * 8;
+
+        //initial... data ...
+        call $spi_slave.call_spi_request($master_idx, 1, 0, $expect_bits,
+                payload);
+
+        // notify "END":
+        call $spi_slave.call_spi_request($master_idx, 0, 1, 0, payload);
+        dbuffer_free(payload);
+    }
+
+    method handle_read_to_fdata(int bits, dbuffer_t* payload) {
+
+        local const uint8*  data = dbuffer_read_all(payload);
+        local uint32        data_len   = (bits / 8) - 4;
+        local uint32        i;
+        local uint32        tmp;
+
+        data += 4; //skip cmd and addr;
+        for (i = 0; i < data_len; i++) {
+            if ((i % 4) == 0) {
+                tmp = 0;
+            }
+            //LSB(Byte) of uint32 received first!
+            tmp |= (reverse_bits8(data[i]) << ((i % 4) * 8));
+            $fdata[(i / 4)] = tmp;
+        }
+    }
+
+    method hw_send_erase_op() {
+        local uint8   cmd_buf[4];
+
+        //first send WrEn command:
+        cmd_buf[0] = F_CMD_WREN;
+        call $spi_send(cmd_buf, 1, NULL, 0);
+
+        //second, send Erase command:
+        cmd_buf[0] = F_CMD_BE;
+
+        $hsfsts.scip    = 1;
+        $x_state        = S_HW_ERASE;
+        call $spi_send(cmd_buf, 1, NULL, 0);
+    }
+
+    //send read/write(exclude erase) opcode for hardware sequencing
+    method hw_send_rw_opcode(bool bWrite) {
+        local bool addr_ok;
+
+        call $is_address_valid(bWrite) -> (addr_ok);
+        if (!addr_ok) {
+            $hsfsts.fcerr = 1;
+            log "info", 4 : "hardware sequencing address invalid";
+            return;
+        }
+
+        if (bWrite) {
+            //first send WrEn command:
+            local uint8   cmd_wren[1];
+            log "info", 4 : "send WrEn command";
+            cmd_wren[0]     = F_CMD_WREN;
+            call $spi_send(cmd_wren, 1, NULL, 0);
+
+            //second, send Write command and data:
+            $hsfsts.scip    = 1;
+            $x_state        = S_HW_WRITE;
+        } else {
+            $hsfsts.scip    = 1;
+            $x_state        = S_HW_READ;
+        }
+
+        local int   d_len = $hsfctl.fdbc + 1;
+        local int   c_len = 4;
+        local uint8 cmd[4];
+
+        inline $set_cmdpkg_addr(&cmd[0], $faddr);
+        if (bWrite)
+            cmd[0] = F_CMD_WRITE;
+        else
+            cmd[0] = F_CMD_READ;
+
+        if (bWrite) {
+            local uint32    i;
+            local uint8     data_buf[64];
+            for (i = 0; i < d_len; i++) {
+                //least significant byte first, msb(byte) last:
+                data_buf[i] = ($fdata[(i/4)] >> ((i % 4) * 8)) & 0xFF;
+            }
+            call $spi_send(cmd, c_len, &data_buf[0], d_len);
+        } else {
+            call $spi_send(cmd, c_len, NULL, d_len);
+        }
+    }
+
+    method is_address_valid(bool bWrite) -> (bool bOk) {
+        local uint32 i;
+        local uint32 cmp_addr = ($faddr & 0x00FFFFFF) >> 12;
+
+        bOk = true;
+        if (($master_idx == 1) && (cmp_addr < ($bbar & 0x00FFFF00))) {
+            //Only BIOS has this verify:
+            bOk = false;
+            return;
+        }
+
+        for (i = 0; i < $prot_rgn_num; i++) {
+            if ((bWrite ? $pr[i].wp_en == 1 : $pr[i].rp_en == 1) &&
+                ((cmp_addr > $pr[i].limit) || (cmp_addr < $pr[i].base))) {
+                bOk = false;
+                break;
+            }
+        }
+    }
+
+    method do_mapped_access(uint32 address, uint32 bytes) {
+        local uint8 cmd[10];
+        local int   d_len = SIZE_DESC;
+        local int   c_len = 4;
+        log "info", 4 : "do spi request with address=0x%x, length=0x%x",
+            address, bytes;
+
+        cmd[0] = F_CMD_READ;
+        inline $set_cmdpkg_addr(&cmd[0], address);
+
+        $x_state = S_MAPPED_ACCESS;
+        call $spi_send(cmd, c_len, NULL, bytes);
+    }
+
+    method handle_mapped_access(int bits, dbuffer_t* payload) {
+        local const uint8*  data = dbuffer_read_all(payload);
+        local int           i;
+        local uint32        data_len = (bits / 8) - 4;
+        log "info", 4 : "handle response that is 0x%x bits length", bits;
+
+        //skip dummy bits:
+        data += 4;
+
+        for (i = 0; i < data_len; i++) {
+            $mapped_access_buf.buf[i] = reverse_bits8(*(data + i));
+        }
+    }
+
+    method set_cmdpkg_addr(uint8* dest, uint32 from) {
+        local spi_address_t*  _to = cast(dest, spi_address_t*);
+        _to->addr = from & 0x00FFFFFF;
+    }
+
+    method init_register_freg(uint8* data) {
+        local uint8 i;
+        for (i = 0; i < $spi_regs.rgn_num; i++) {
+            inline $spi_regs.freg[i].set(
+                    UNALIGNED_LOAD_LE32(data + i * 4));
+        }
+
+        for (i = 0; i < $gbe_regs.rgn_num; i++) {
+            inline $gbe_regs.freg[i].set(
+                    UNALIGNED_LOAD_LE32(data + i * 4));
+        }
+        inline $gbe_regs.freg[3].get() -> ($gbe_regs.glfpr);
+    }
+
+    // Both BIOS and GbE support mem-operation()
+    method operation(generic_transaction_t *mem_op,
+        map_info_t map_info) -> (exception_type_t ex) {
+        local attr_value_t  retVal;
+        local uint32        base;
+        local uint32        limit;
+        local uint32        flash_offset;
+        local uint32        size   = SIM_get_mem_op_size(mem_op);
+        local uint32        offset = SIM_get_mem_op_physical_address(mem_op) -
+            map_info.base + map_info.start;
+
+        log "info", 4 :
+            "memory access on %s: phymem=0x%x,size=0x%x,base=0x%x,start=0x%x",
+            $name,
+            SIM_get_mem_op_physical_address(mem_op),
+            size, map_info.base, map_info.start;
+
+        // calculate MAPPED address:
+        ex      = Sim_PE_No_Exception;
+        base    = $freg[$master_idx].region_base;
+        limit   = $freg[$master_idx].region_limit;
+        if ((base == 0x1FFF) && (limit == 0x0)) {
+            log "info", 1 : "failed! region is disabled!";
+            return;
+        }
+
+        if (size > MAX_CACHE_LINE) {
+            log "info", 1 : "size too large! Max cache line is: 0x%x",
+                MAX_CACHE_LINE;
+            return;
+        }
+
+        base    = (base << 12);
+        limit   = (limit << 12);
+        if (limit < offset) {
+            log "info", 1:
+                "offset 0x%x out of region range: [0x%x, 0x%x]",
+                offset, base, limit;
+            return;
+        }
+
+        // !SHOULD use MAPPED ( from RAM to FLASH_ROM ) address to
+        flash_offset = base + offset;
+        call $do_mapped_access(flash_offset, size);
+
+        retVal = SIM_make_attr_data(size, &$mapped_access_buf.buf[0]);
+        SIM_set_mem_op_value_buf(mem_op, retVal);
+    }
+
+    method reset_state_on_err() {
+        $x_state        = S_IDLE;
+        $hsfsts.fdone   = 1;
+        $hsfsts.scip    = 0;
+        $ssfsts.fdone   = 1;
+        $ssfsts.scip    = 0;
+        $expect_bits    = 0;
+    }
+
+    method spi_response_handle(int bits, dbuffer_t* payload) {
+        log "info", 4:
+            "got response from slave with bits=0x%x when x_state=%d",
+             bits, $x_state;
+
+        if (($x_state != S_IDLE) && (bits != $expect_bits)) {
+            log "spec_violation", 1:
+                "receive data bits: %d doesn't match required: %d",
+                bits, $expect_bits;
+            inline $reset_state_on_err();
+            return;
+        }
+
+        switch ($x_state) {
+        case S_INIT_LOAD:
+            if ($master_idx == 1) { //Only BIOS can do this
+                call $handle_init_load(bits, payload);
+                $x_state  = S_IDLE;
+            } else {
+                assert false;
+            }
+            break;
+        case S_MAPPED_ACCESS:  //Both BIOS and GbE support direct access
+            call $handle_mapped_access(bits, payload);
+            $x_state      = S_IDLE;
+            break;
+        case S_HW_WRITE:
+            $hsfsts.fdone = 1;
+            $hsfsts.scip  = 0;
+            $x_state      = S_IDLE;
+            break;
+        case S_HW_READ:
+            $hsfsts.fdone = 1;
+            $hsfsts.scip  = 0;
+            call $handle_read_to_fdata(bits, payload);
+            $x_state      = S_IDLE;
+            break;
+        case S_HW_ERASE:
+            $x_state      = S_IDLE;
+            $hsfsts.fdone = 1;
+            $hsfsts.scip  = 0;
+            break;
+        case S_SW_WRITE:
+            $ssfsts.fdone = 1;
+            $ssfsts.scip  = 0;
+            $to_reads     = 0;
+            $read_bytes   = 0;
+            $x_state      = S_IDLE;
+            break;
+        case S_SW_READ:
+            call $handle_sw_read(bits, payload);
+            break;
+        case S_OBSERVED_READ:
+            if ($master_idx == 1) { //BIOS
+                $ssfsts.fdone = 1;
+                $ssfsts.scip = 0;
+                call $handle_observed_read(bits, payload);
+                $x_state = S_IDLE;
+            } else {  //GbE has no such action!
+                assert false;
+            }
+            break;
+        case S_IDLE:
+            //ignore dummy. such as WR_EN, ...
+            log "info", 4 :
+                "when IDLE, got spi-response with dummy data";
+            break;
+        default:
+            log "info", 1 : "error when x_state=0x%x", $x_state;
+            $x_state = S_IDLE;
+            assert false;
+            break;
+        }
+    }
+
+    // when issue 'read' command, 'd_buf' can be null,
+    // but 'd_len' is data length to be read.
+    //
+    // Note: address is include in c_buf if need;
+    // For 'WriteEnable' command, there is no address just one CMD byte.
+    method spi_send(uint8* c_buf, int c_len, uint8* d_buf, int d_len) {
+        local int           i;
+        local uint8*        data;
+        local dbuffer_t*    payload = new_dbuffer();
+
+        dbuffer_append(payload, c_len);
+        for (i = 0; i < c_len; i++) {
+            data  = dbuffer_update(payload, i, 1);
+            *data = reverse_bits8(c_buf[i]);
+        }
+
+        if (d_buf != NULL) {
+            log "info", 4: "update payload...";
+            dbuffer_append(payload, d_len);
+            for (i = 0; i < d_len; i++) {
+                data  = dbuffer_update(payload, i + c_len, 1);
+                *data = reverse_bits8(d_buf[i]);
+            }
+        } else {
+            dbuffer_append_value(payload, 0x0, d_len);
+        }
+
+        $expect_bits = (d_len + c_len) * 8;
+        call $spi_slave.call_spi_request($master_idx, 1, 0,
+            (d_len + c_len) * 8, payload);
+
+        // notify "END":
+        call $spi_slave.call_spi_request($master_idx, 0, 1, 0, payload);
+        dbuffer_free(payload);
+    }
+}
+
+
+template read_only_attr {
+    method set(val) {
+        if (!SIM_is_restoring_state($dev.obj)
+                && $this != SIM_attr_integer(val)) {
+            log "spec_violation", 1 :
+                "%s is internal attribute, can't be set at runtime",
+                $name;
+        } else {
+            $this = SIM_attr_integer(val);
+        }
+    }
+}
+
+template set_get_data_buf {
+    parameter type = "d";
+    parameter buffer_size default undefined;
+
+    data uint8 buf[$buffer_size];
+
+    method set(attr_value_t val) {
+        if (SIM_attr_data_size(val) == $buffer_size) {
+            memcpy(&$buf[0], SIM_attr_data(val), $buffer_size);
+        } else
+            throw;
+    }
+    method get() -> (attr_value_t val) {
+        val = SIM_make_attr_data($buffer_size, &$buf[0]);
+    }
+}
+
+template io_memory_inf_imp {
+    parameter infoStr default "mem mapping at";
+    parameter master_index default undefined;
+
+    implement io_memory {
+        method operation(generic_transaction_t *mem_op,
+            map_info_t map_info) -> (exception_type_t ex) {
+
+            select ibank in ($bank_arr)
+                where (ibank.master_idx == $master_index) {
+                    call ibank.operation(mem_op, map_info) -> (ex);
+            } else {
+                assert false;
+            }
+        }
+    }
+}
+
+template flockdn_write {
+    method write(value) {
+        if ($hsfsts.flockdn == 0) {
+            $this = value;
+        }
+    }
+}
+
+template hsfctl_fields {
+        field fsmie     [15]   "Flash SPI SMI# Enable";
+        if ($master_idx == 1) {
+            field fdbc  [13:8] "Flash Data Byte Count";
+        } else {
+            field fdbc  [9:8]  "Flash Data Byte Count";
+        }
+        field fcycle    [2:1]  "Flash Cycle";
+        field fgo       [0]    "Flash Cycle Go";
+}
+
+method reset_helper() {
+    call $spi_regs.load_flash_descriptor();
+}
+
+method after_hard_reset() {
+    inline $reset_helper();
+}
+
+method after_soft_reset() {
+    inline $reset_helper();
+}
+
+method init() {
+    log "info", 4 : "do init operation init on %s device", $name;
+    $x_state = S_IDLE;
+}
+
+method post_init() {
+    log "info", 4 : "do post init operation on %s device", $name;
+    SIM_require_object($spi_slave.obj);
+    if (!SIM_is_restoring_state($dev.obj)) {
+        inline $reset_helper();
+    }
+}

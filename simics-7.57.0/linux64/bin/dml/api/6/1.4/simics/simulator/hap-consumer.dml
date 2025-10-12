@@ -1,0 +1,35 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/simulator/hap-consumer.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/base/attr-value.dml";
+
+extern attr_value_t SIM_get_all_hap_types(void);
+extern hap_handle_t SIM_hap_add_callback(char const *hap, obj_hap_func_t func, lang_void *data);
+extern hap_handle_t SIM_hap_add_callback_index(char const *hap, obj_hap_func_t func, lang_void *data, int64 index);
+extern hap_handle_t SIM_hap_add_callback_obj(char const *hap, conf_object_t *obj, int flags, obj_hap_func_t func, lang_void *data);
+extern hap_handle_t SIM_hap_add_callback_obj_index(char const *hap, conf_object_t *obj, int flags, obj_hap_func_t func, lang_void *data, int64 index);
+extern hap_handle_t SIM_hap_add_callback_obj_range(char const *hap, conf_object_t *obj, int flags, obj_hap_func_t func, lang_void *data, int64 start, int64 end);
+extern hap_handle_t SIM_hap_add_callback_range(char const *hap, obj_hap_func_t func, lang_void *data, int64 start, int64 end);
+extern void SIM_hap_delete_callback(char const *hap, obj_hap_func_t func, lang_void *data);
+extern void SIM_hap_delete_callback_id(char const *hap, hap_handle_t handle);
+extern void SIM_hap_delete_callback_obj(char const *hap, conf_object_t *obj, obj_hap_func_t func, lang_void *data);
+extern void SIM_hap_delete_callback_obj_id(char const *hap, conf_object_t *obj, hap_handle_t handle);
+extern typedef int hap_handle_t;
+extern typedef void (*obj_hap_func_t)(void);

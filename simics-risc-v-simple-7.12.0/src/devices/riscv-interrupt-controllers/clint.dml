@@ -1,0 +1,323 @@
+/*
+  © 2019 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device riscv_clint;
+param classname = "riscv-clint";
+
+import "utility.dml";
+import "riscv-interrupts-common.dml";
+import "simics/model-iface/step.dml";
+
+param desc = "model of RISC-V CLINT block";
+param documentation = "RISC-V Core-Level Interrupt Block";
+param limitations = "Timer interrupts are not correctly modeled if mtime"
+    + " overflows, for a 1GHz timer this happens approximately after 585 years"
+    + " of virtual time. It is assumed that the timer will be have been reset"
+    + " before that";
+
+param register_size = 8;
+param MAX_HARTS = 64; // memory-map allows up to 4095
+param frequency = freq_mhz.val * 1e6;
+
+constant TIME_CSR_NUM = 0xc01;
+constant SECONDS_IN_A_WEEK = 604800;
+
+is hreset_mark;
+is poreset;
+
+attribute freq_mhz is (double_attr) "Frequency in Mega-Hertz of mtime" {
+    param configuration = "required";
+}
+
+attribute last_update is (double_attr) "Time of last mtime-update" {
+    param internal = true;
+}
+
+attribute mtime_read_cycles is (uint64_attr)
+    "Number of cycles to stall when reading mtime";
+
+attribute error_on_incorrect_sized_access is (bool_attr)
+    "Return Sim_PE_IO_Error if size of access does not match register size";
+
+bank regs is checking_offset {
+    register msip[i < MAX_HARTS]     @ 0x0000 + i * 4 "Software Interrupt";
+    register mtimecmp[i < MAX_HARTS] @ 0x4000 + i * 8 "Time Compare Value";
+    register mtime                   @ 0xbff8         "Time Value";
+
+    register mtip[i < MAX_HARTS] is (unmapped, no_reset);
+
+    param use_io_memory = false;
+    method transaction_access(transaction_t *t, uint64 offset,
+                              void *aux) -> (exception_type_t) {
+        if (error_on_incorrect_sized_access.val) {
+            local int size = SIM_transaction_size(t);
+            local bool ok = true;
+            if (offset < 0x4000) {
+                ok = size == 4;
+            } else {
+                ok = size == 8;
+            }
+
+            if (!ok) {
+                log info, 2: "Access has incorrect size, returning io_error";
+                local riscv_io_error_ret_t *eret = ATOM_get_transaction_riscv_io_error_ret(t);
+                if (eret) {
+                    eret->val = 0x10; // Riscv_Clint_Wrong_Sized_Access;
+                }
+                return Sim_PE_IO_Error;
+            }
+        }
+
+        return default(t, offset, SIM_transaction_initiator(t));
+    }
+
+    method is_disabled() -> (bool) {
+        return dev.CLOCK_DISABLE.signal.high ||
+            dev.HRESET.signal.high;
+    }
+
+    method check_offset(uint64 offset) throws {
+        // fail if HART is not connected or out of range
+        local int h = 0;
+        if (offset < 0x4000)
+            h = offset / 4;
+        else if (offset < 0xbff8)
+            h = (offset - 0x4000) / 8;
+
+        if (h >= MAX_HARTS || !dev.msip[h].obj)
+            throw;
+    }
+
+    register msip[i < MAX_HARTS] size 4 is (write) {
+        method write(uint64 val) {
+            if (this.val != val) {
+                if (val[0])
+                    dev.msip[i].raise();
+                else
+                    dev.msip[i].lower();
+            }
+        }
+
+        method hard_reset() {
+            dev.msip[i].lower();
+        }
+    }
+
+    register mtimecmp[i < MAX_HARTS] is (write, no_reset) {
+        method write(uint64 val) {
+            default(val);
+            timeout[i].check(mtime._read());
+        }
+    }
+
+    register mtime is write {
+        method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+            if (mtime_read_cycles.val > 0 && aux
+                && SIM_c_get_interface(aux, "cycle")
+                && SIM_c_get_interface(aux, "stall")) {
+                log info, 3: "stalling '%s' %d cycles",
+                    SIM_object_name(aux), mtime_read_cycles.val;
+                SIM_stall_cycle(aux, mtime_read_cycles.val);
+            }
+            return _read();
+        }
+        method _read() -> (uint64) {
+            local uint64 count = (SIM_time(obj) - last_update.val) * frequency;
+            log info, 3: "mtime = val:0x%x + ((now:%f - last:%f) * freq:%f)"
+                + " = 0x%x", this.val, SIM_time(obj), last_update.val,
+                frequency, count + this.val;
+            return this.val + count;
+        }
+
+        method write(uint64 val) {
+            this.val = val;
+            last_update.val = SIM_time(obj);
+            local uint64 count = regs.mtime._read();
+            for (local int i = 0; i < MAX_HARTS; i++)
+                if (dev.mtip[i].obj)
+                    timeout[i].check(count);
+        }
+
+        method hard_reset() {
+            write(0);
+        }
+    }
+}
+
+implement riscv_coprocessor {
+    method read_register(uint64 number) -> (uint64) {
+        if (number == TIME_CSR_NUM) {
+            return regs.mtime._read();
+        } else {
+            log error: "unknown CSR 0x%x", number;
+            return 0;
+        }
+    }
+    method write_register(uint64 number, uint64 value) {
+        if (number == TIME_CSR_NUM)
+            log spec_viol: "The 'time' CSR is read-only";
+        else
+            log error: "unknown CSR 0x%x", number;
+    }
+}
+
+event timeout[i < MAX_HARTS] is (simple_time_event) {
+    method event() {
+        check(regs.mtime._read());
+    }
+
+    method check(uint64 count) {
+        remove();
+        if (count >= regs.mtimecmp[i].val) {
+            log info, 3: "mtimecmp%d pending now (0x%x >= 0x%x)",
+                i, count, regs.mtimecmp[i].val;
+            dev.mtip[i].raise();
+        } else {
+            dev.mtip[i].lower();
+            local uint64 ticks = regs.mtimecmp[i].val - count;
+            local double seconds = ticks / frequency;
+            // Make sure the event isn't posted too far ahead
+            if (seconds > SECONDS_IN_A_WEEK)
+                seconds = SECONDS_IN_A_WEEK;
+            log info, 3: "mtimecmp%d pending in 0x%x ticks, %fs",
+                i, ticks, seconds;
+            post(seconds);
+            log info, 3: "event posted in %fs", seconds;
+        }
+    }
+}
+
+method hard_reset() {
+    // mtime is cleared to zero on reset, mtimecmp is not.
+    // high signals will probably go low, low signals stay low
+    // if CLOCK_DISABLE is high, HRESET is delayed or ignored
+    // depending on if CLOCK_DISABLE is lowered before HRESET or not
+    if (!CLOCK_DISABLE.signal.high) {
+        default();
+        local uint64 count = regs.mtime._read();
+        for (local int i = 0; i < MAX_HARTS; i++) {
+            if (regs.mtip[i].val[0])
+                timeout[i].check(count);
+        }
+    }
+}
+
+method power_on_reset() {
+    // Like a hard_reset except that mtimecmp is also cleared to zero so
+    // mtime == mtimecmp, i.e. interrupts pending
+    _default_hard_reset();
+    for (local int i = 0; i < MAX_HARTS; i++) {
+        regs.mtimecmp[i].init();
+        if (!dev.mtip[i].obj)
+            break;
+        dev.mtip[i].raise();
+    }
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state(obj))
+        power_on_reset();
+}
+
+connect msip[i < MAX_HARTS] is (sig) "The MSIP signal targets" {
+    method raise() {
+        default();
+        regs.msip[i].val[0] = 1;
+    }
+    method lower() {
+        default();
+        regs.msip[i].val[0] = 0;
+    }
+}
+
+connect mtip[i < MAX_HARTS] is (sig) "The MTIP signal targets" {
+    method raise() {
+        default();
+        regs.mtip[i].val[0] = 1;
+    }
+    method lower() {
+        default();
+        regs.mtip[i].val[0] = 0;
+    }
+}
+
+attribute hart "HARTs or CLICs connected to this CLINT" {
+    // pseudo-attribute to set both msip and mtip with variable size
+    param type = "[o*]";
+    param configuration = "pseudo";
+
+    method get() -> (attr_value_t) {
+        local attr_value_t val = SIM_alloc_attr_list(MAX_HARTS);
+        for (local int i = 0; i < MAX_HARTS; i++) {
+            if (!dev.msip[i].obj) {
+                SIM_attr_list_resize(&val, i);
+                break;
+            }
+            local conf_object_t *hobj = SIM_port_object_parent(dev.msip[i].obj);
+            if (hobj == NULL) // not a port-object, old-style obj:port
+                hobj = dev.msip[i].obj;
+
+            SIM_attr_list_set_item(&val, i, SIM_make_attr_object(hobj));
+        }
+        return val;
+    }
+
+    method set(attr_value_t val) throws {
+        if (SIM_attr_list_size(val) > MAX_HARTS) {
+            SIM_c_attribute_error("too many values, max is %lld", MAX_HARTS);
+            throw;
+        }
+        for (local int i = 0; i < SIM_attr_list_size(val); i++) {
+            local attr_value_t hart = SIM_attr_list_item(val, i);
+            local attr_value_t msip_attr = port_attr(hart, "MSIP");
+            local attr_value_t mtip_attr = port_attr(hart, "MTIP");
+
+            if (dev.msip[i].set_attribute(msip_attr) != Sim_Set_Ok)
+                throw;
+            if (dev.mtip[i].set_attribute(mtip_attr) != Sim_Set_Ok)
+                throw;
+        }
+    }
+}
+
+port CLOCK_DISABLE is signal_port {
+    param documentation = "When the CLOCK_DISABLE signal is raised mtime will"
+        + " not advance and no new timer interrupts will be triggered";
+
+    method remove_all_timers() {
+        for (local int i = 0; i < timeout.len; i++)
+            timeout[i].remove();
+    }
+
+    implement signal {
+        method signal_raise() {
+            local uint64 now = regs.mtime._read();
+            log info, 3: "signal raised";
+            default();
+            regs.mtime.val = now;
+            remove_all_timers();
+        }
+        method signal_lower() {
+            log info, 3: "signal lowered";
+            local uint64 now = regs.mtime.val;
+            default();
+            if (dev.HRESET.signal.high) {
+                dev.hard_reset();
+            } else {
+                regs.mtime.write(now);
+            }
+        }
+    }
+}

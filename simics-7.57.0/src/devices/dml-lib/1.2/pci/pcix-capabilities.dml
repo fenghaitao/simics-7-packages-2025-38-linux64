@@ -1,0 +1,80 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+// PCI-X (PCIX) Capability
+template defining_pci_pcix_capability {
+    parameter pcix_offset   default undefined;
+    parameter pcix_next_ptr default undefined;
+
+    register pcix_capability_header size 2 @ ($pcix_offset + 0x0) {
+        parameter documentation = "Capability Header";
+    }
+    register pcix_command           size 2 @ ($pcix_offset + 0x2) {
+        parameter documentation = "PCI-X Command Register";
+    }
+    register pcix_status            size 4 @ ($pcix_offset + 0x4) {
+        parameter documentation = "PCI-X Status Register";
+    }
+    register pcix_ecc_control_status size 4 @ ($pcix_offset + 0x8) {
+        parameter documentation = "ECC Control and Status Register";
+    }
+    register pcix_ecc_first_address  size 4 @ ($pcix_offset + 0xc) {
+        parameter documentation = "ECC First 32 Bits of Address ";
+    }
+    register pcix_ecc_second_address size 4 @ ($pcix_offset + 0x10) {
+        parameter documentation = "ECC Second 32 Bits of Address ";
+    }
+    register pcix_ecc_attribute      size 4 @ ($pcix_offset + 0x14) {
+        parameter documentation = "ECC Attribute Register";
+    }
+
+    register pcix_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter value = 0x7;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Pointer" {
+            parameter hard_reset_value = $pcix_next_ptr;
+        }
+    }
+    register pcix_command {
+        // TODO(ah): rename field if we can maintain backwards compatibility
+        field upere [0:0]   is (read_write) "Data Parity Error Recovery Enable";
+        field ero   [1:1]   is (read_write) "Enable Relaxed Ordering";
+        field mmrbc [3:2]   is (read_write) "Maximum Memory Read Byte Count";
+        field most  [6:4]   is (read_write) "Maximum Outstanding Split Transactions";
+        // TODO(ah): rename field if we can maintain backwards compatibility
+        field cltv  [13:12] is (ignore_write) "PCI-X Capabilities Version";
+    }
+    register pcix_status {
+        field fn     [2:0]   is (ignore_write) "Function Number";
+        field dn     [7:3]   is (ignore_write) "Device Number";
+        field bn     [15:8]  is (ignore_write) "Bus Number";
+        field d64    [16:16] is (ignore_write) "64-bit Device";
+        field mhc133 [17:17] is (ignore_write) "133 MHz Capable";
+        field scd    [18:18] is (write_1_clears) "Split Completion Discarded";
+        field usc    [19:19] is (write_1_clears) "Unexpected Split Completion";
+        field dc     [20:20] is (ignore_write) "Device Complexity";
+        field dmmrbc [22:21] is (ignore_write) "Designed Maximum Memory Read Byte Count";
+        field dmost  [25:23] is (ignore_write) "Designed Maximum Outstanding Split Transactions";
+        field dmcrs  [28:26] is (ignore_write) "Designed Maximum Cumulative Read Size";
+        field rscem  [29:29] is (write_1_clears) "Received Split Completion Error Message";
+        field c266   [30:30] is (ignore_write) "PCI-X 266 Capable";
+        field c533   [31:31] is (ignore_write) "PCI-X 533 Capable";
+    }
+    register pcix_ecc_control_status is (read_write);
+    register pcix_ecc_first_address is (read_write);
+    register pcix_ecc_second_address is (read_write);
+    register pcix_ecc_attribute is (read_write);
+}

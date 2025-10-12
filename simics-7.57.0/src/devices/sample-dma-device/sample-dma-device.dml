@@ -1,0 +1,312 @@
+/*
+  sample-dma-device.dml - sample DML code for a Simics device
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_dma_device;
+
+
+//:: pre file {{
+param desc = "example DMA device";
+
+param documentation =
+    "Example of a DMA device supporting contiguous memory or scatter-gather "
+    + "lists. The device has a controllable throughput (words per second) "
+    + "and supports either polling mode or interrupt based signalling upon "
+    + "DMA completion.";
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+
+typedef layout "big-endian" {
+    uint32 addr;
+    uint16 len;
+    uint16 reserved;
+} sg_list_head_t;
+
+typedef layout "big-endian" {
+    uint32 addr;
+    uint16 len;
+    uint8 offset;
+    bitfields 8 {
+        uint1 ext @ [0:0];
+    } flags;
+} sg_list_block_row_t;
+
+param byte_order = "big-endian";
+
+// Memory connection for DMA work
+connect target_mem is map_target {
+    param documentation =
+        "The memory on which the DMA engine operates. Data will be "
+        + "read from and copied to the memory associated with this memory.";
+    param configuration = "required";
+}
+
+// CPU connection for interrupting
+connect intr_target {
+    param documentation =
+        "Interrupt target port to signal on DMA interrupts.";
+    param configuration = "required";
+    interface signal;
+}
+
+// Timing parameter
+attribute throttle is double_attr {
+    is init;
+    method init() {
+        val = 1e-6;
+    }
+    param documentation =
+        "Delay in seconds per 32-bit word of memory copied, default is 1μs.";
+    param configuration = "optional";
+}
+
+bank regs {
+    param register_size = 4;
+    register DMA_control @ 0x00 "Control register";
+    register DMA_source  @ 0x04 "Source address";
+    register DMA_dest    @ 0x08 "Destination address";
+}
+
+// Tracks if interrupts are posted
+saved bool DMA_interrupt_posted;
+
+// Read len bytes of target memory from the address src in the memory
+// target_mem. The result is put in memory pointed to by dst,
+// which must be large enough to hold at least len bytes. If a memory
+// access error occurs, this method will print an error message and
+// throw an exception.
+method read_mem(void *dst,
+                physical_address_t src,
+                physical_address_t len) throws {
+    local exception_type_t exc;
+    local buffer_t buf = { .data = dst, .len = len };
+    exc = SIM_issue_read_transaction(target_mem.map_target,
+                                     src,
+                                     buf,
+                                     false,
+                                     dev.obj);
+
+    if (exc != Sim_PE_No_Exception) {
+        log error: "an error occurred when reading target memory";
+        throw;
+    }
+}
+
+// Write len bytes to target memory from the memory pointed to by
+// src. The data is written to the memory space target_mem at
+// address dst. If a memory access error occurs this method will
+// print an error message and throw an exception.
+method write_mem(physical_address_t dst,
+                 const void *src,
+                 physical_address_t len) throws {
+    local exception_type_t exc;
+    local bytes_t buf = { .data = src, .len = len };
+    exc = SIM_issue_write_transaction(target_mem.map_target,
+                                     dst,
+                                     buf,
+                                     false,
+                                     dev.obj);
+    if (exc != Sim_PE_No_Exception) {
+        log error: "an error occurred when writing to target memory";
+        throw;
+    }
+}
+
+bank regs {
+    register DMA_control {
+        field EN   @ [31] "Enable DMA";
+        field SWT  @ [30] "Software Transfer Trigger";
+        field ECI  @ [29] "Enable Completion Interrupt";
+        field TC   @ [28] "Transfer complete" {
+            // Set to 1 when transfer completed by device itself.
+            // Clear by writing a zero.
+            // If interrupts are enabled and interrupt status is one
+            // also clear the interrupt in the processor.
+            is write;
+            method write(uint64 value) {
+                if (value != 0) {
+                    log spec_viol: "write one to TC - ignored";
+                    return;
+                }
+
+                if (this.val == 0) // Already cleared
+                    return;
+
+                log info, 3: "write zero to TC - clearing TC";
+                this.val = 0;
+
+                if (!DMA_interrupt_posted)
+                    return;
+
+                log info, 3: "also clearing interrupt on CPU";
+                DMA_interrupt_posted = false; // remember cleared
+                intr_target.signal.signal_lower();
+            }
+        }
+        field SG   @ [27]   "Scatter-gather list input";
+        field ERR  @ [26]   "DMA transfer error";
+        field TS   @ [15:0] "Transfer size (32-bit words)";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            do_dma_transfer();
+        }
+    }
+
+    method do_dma_transfer() {
+        if (DMA_control.SWT.val == 0)
+            return; // No need to do anything if we are not asked by software
+
+        // Software asked us to initiate a DMA transfer
+        if(DMA_control.EN.val == 0) {
+            // enable bit not set, so we cannot transfer
+            log info, 2: "EN bit not set, SWT = 1 has no effect";
+            return;
+        }
+
+        log info, 3: "EN bit set, SWT written, initiating DMA";
+        log info, 3: "Transferring %d 32-bit words from 0x%x to 0x%x",
+            DMA_control.TS.val, DMA_source.val, DMA_dest.val;
+
+        local uint18 count = DMA_control.TS.val * 4;
+        try {
+            if (DMA_control.SG.val != 0) {
+                log info, 4: "Scatter Gather Transfer";
+                count = copy_scatter_gather(DMA_dest.val, DMA_source.val);
+            } else {
+                log info, 4: "Contiguous Transfer";
+                copy_contiguous(DMA_dest.val, DMA_source.val, count);
+            }
+        } catch {
+            log error: "DMA memory access failed";
+            return;
+        }
+
+        after throttle.val * count / 4.0 s: complete_dma();
+    }
+
+    method copy_contiguous(physical_address_t dst,
+                          physical_address_t src,
+                          uint18 count) throws {
+        local uint8 buf[count];
+        read_mem(buf, src, count);
+        write_mem(dst, buf, count);
+    }
+
+    // next_row - Returns the address to next row to be processed.
+    // end_addr is the address after the end of the block, if this address
+    // is reached the transaction should have finished
+    method next_row(physical_address_t addr, physical_address_t end_addr)
+        -> (physical_address_t, physical_address_t,
+            bool) throws /* next_addr, next_end_addr, finished */ {
+        local physical_address_t next_addr;
+        local physical_address_t next_end_addr;
+        local bool finished;
+        local sg_list_block_row_t block_row;
+        read_mem(&block_row, addr, sizeof block_row);
+        if (block_row.flags.ext) {
+            next_addr = block_row.addr + block_row.offset;
+            next_end_addr = next_addr + block_row.len;
+        } else {
+            next_addr = addr + sizeof block_row;
+            next_end_addr = end_addr;
+        }
+        finished = next_addr == end_addr;
+        return (next_addr, next_end_addr, finished);
+    }
+
+    // Copy Scatter Gathered data.
+    method copy_scatter_gather(physical_address_t dst, physical_address_t src)
+        -> (uint18) throws {
+        local uint18 copied_bytes;
+        // Get the header data
+        local sg_list_head_t head;
+        read_mem(&head, src, sizeof head);
+        copied_bytes = 0;
+
+        local physical_address_t addr = head.addr;
+        local physical_address_t end_addr = head.addr + head.len;
+        local physical_address_t hare_addr = addr;
+        local physical_address_t hare_end_addr = end_addr;
+
+        // Continue running through the lists until the end is reached
+        // or an error has been detected
+        local sg_list_block_row_t row;
+        local bool finished = false;
+        local bool hare_finished = false;
+        while (!finished && DMA_control.ERR.val == 0) {
+            read_mem(&row, addr, sizeof row);
+
+            if (!row.flags.ext) { // Data block
+                log info, 4: "Data block of length %d at 0x%x with offset %d",
+                    row.len, row.addr, row.offset;
+                // Copy a block of data
+                copy_contiguous(dst, row.addr + row.offset, row.len);
+                dst += row.len;
+                copied_bytes += row.len;
+            } else
+                log info, 4:
+                "Extension block of length %d at 0x%x with offset %d",
+                    row.len, row.addr, row.offset;
+
+            (addr, end_addr, finished) = next_row(addr, end_addr);
+
+            // Check for loops.
+            if (!hare_finished) {
+                local int8 i;
+                // Hare moves through lists at double the speed of addr.
+                // If the hare ends up at the same address as addr, a loop has
+                // been detected, if the hare reaches the end there is no loop.
+                for (i = 0; i < 2; i++) {
+                    (hare_addr, hare_end_addr, hare_finished) = next_row(hare_addr, hare_end_addr);
+                    if (hare_finished) {
+                        log info, 4: "Loop checker finished, no loops";
+                        break;
+                    }
+                }
+                if (hare_addr == addr) {
+                    log spec_viol: "Stuck in a loop.";
+                    DMA_control.ERR.val = 1;
+                }
+            }
+        }
+        return copied_bytes;
+    }
+
+    method complete_dma() {
+        // Log that completion is done
+        log info, 2: "DMA transfer completed";
+
+        // clear SWT bit, update TS
+        DMA_control.SWT.val = 0;
+        DMA_control.TS.val = 0;
+        DMA_control.TC.val = 1;
+
+        // raise interrupt towards CPU
+        if(DMA_control.ECI.val == 0) {
+            log info, 3: "ECI is zero, no interrupt raised";
+            return;
+        }
+
+        log info, 3: "raising interrupt signal";
+        intr_target.signal.signal_raise();
+
+        // remember that we raised it
+        DMA_interrupt_posted = true;
+    }
+}
+// }}

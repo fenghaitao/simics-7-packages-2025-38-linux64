@@ -1,0 +1,87 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+subdevice f0 {
+    subdevice PF {
+        bank pcie_config is physical_function {
+            param function = 0;
+            param msix_data_bank = msix_data;
+            param sriov_virtual_functions = (each vf_type_0_bank in (f0));
+
+
+            register base_address_01 {
+                param map_obj = bar01.obj;
+            }
+            register base_address_45 {
+                param map_obj = bar45.obj;
+            }
+
+            group ari {
+                register capability {
+                    field nfn {
+                        param init_val = 5;
+                    }
+                }
+            }
+
+            group sriov {
+                register vf_bar_01 {
+                    method get_vf_bar_map(uint64 vf_number) -> (conf_object_t *) throws {
+                        if ((vf_number == 0) || (vf_number > VF.len))
+                            throw;
+                        return VF[vf_number - 1].bar01.obj;
+                    }
+                }
+                register vf_bar_45 {
+                    method get_vf_bar_map(uint64 vf_number) -> (conf_object_t *) throws {
+                        if ((vf_number == 0) || (vf_number > VF.len))
+                            throw;
+                        return VF[vf_number - 1].bar45.obj;
+                    }
+                }
+            }
+        }
+
+        bank msix_data is msix_table {
+            param msix_bank = pcie_config;
+        }
+
+        bank bar01 {
+            register foo size 4 @ 0x10 {
+                param init_val = 0x4711;
+            }
+        }
+
+        bank bar45 {
+            register bar size 4 @ 0x20 {
+                param init_val = 0x1337;
+            }
+        }
+    }
+
+    subdevice VF[i < TOTAL_VFS] {
+        bank pcie_config is virtual_function {
+            param vf_number = i + 1;
+            param msix_data_bank = msix_data;
+        }
+
+        bank msix_data is msix_table {
+            param msix_bank = pcie_config;
+        }
+
+        bank bar01;
+        bank bar45;
+    }
+}

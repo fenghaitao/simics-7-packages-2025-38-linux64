@@ -1,0 +1,62 @@
+/*
+* i82574-mac-intr.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+constant ITR_UNIT = 2.56e-7; /* 256 ns */
+
+parameter EITR_CNT = 5;
+
+constant INTR_TXDW    = 1 << 0;	// Transmit Descriptor Written Back
+constant INTR_TXQE    = 1 << 1;	// Transmit Queue Empty
+constant INTR_LSC     = 1 << 2;	// Link Status Change
+constant INTR_RXDMT0  = 1 << 4;	// Receive Descriptor Minimum Threshold Hit
+constant INTR_RXO     = 1 << 6;	// Receive Overrun
+constant INTR_RXT0    = 1 << 7;	// Receive Timer Interrupt
+constant INTR_MDAC    = 1 << 9;	// MDI/O Access Complete
+constant INTR_TXD_LOW = 1 << 15; // Transmit Descriptor Low Threshold Hit
+constant INTR_SRPD    = 1 << 16; // Small Receive Packet Detected
+constant INTR_ACK     = 1 << 17; // Receive ACK Frame Detected
+constant INTR_MNG     = 1 << 18; // Management Event Detected
+constant INTR_RXQ0    = 1 << 20; // Receive Queue 0 Interrupt
+constant INTR_RXQ1    = 1 << 21; // Receive Queue 1 Interrupt
+constant INTR_TXQ0    = 1 << 22; // Transmit Queue 0 Interrupt
+constant INTR_TXQ1    = 1 << 23; // Transmit Queue 1 Interrupt
+constant INTR_OTHER   = 1 << 24; // Other Interrupt
+                                 // Indicates one of the following was set:
+                                 // Link Status Change.
+                                 // Receiver Overrun.
+                                 // MDIO Access Complete.
+                                 // Small Receive Packet Detected.
+                                 // Receive ACK Frame Detected.
+                                 // Manageability Event Detected.
+
+constant OTHER_MASK = ( INTR_LSC | INTR_RXO | INTR_SRPD | INTR_ACK | INTR_MNG );
+
+	// TODO: add support for OTHER bit, which is the
+	// OR of (INTR_LSC |INTR_RXO|INTR_SRPD|INTR_ACK|INTR_MNG) 
+
+bank csr {
+    /* --------------------------------------------------------------
+       INTERRUPT REGISTERS
+       -------------------------------------------------------------- */
+    register eiac @ 0x000dc "Interrupt Auto Clear";
+    register ivar @ 0x000e4 "Interrupt Vector Allocation";
+//  register eitr[$EITR_CNT] @ 0x00e8 + $i * 4 "Extended Interrupt Throttle";
+//  register eitr[$EITR_CNT] is (unimplemented);
+
+    register ivar is (unimplemented);
+
+}

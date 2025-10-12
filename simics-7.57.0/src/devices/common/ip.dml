@@ -1,0 +1,96 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+bitorder be;
+
+typedef layout "big-endian" {
+    uint8  dhost[6];
+    uint8  shost[6];
+    uint16 type;
+} vt_ether_header_t;
+
+typedef layout "big-endian" {
+    uint16 tpid;
+    bitfields 16 {
+        uint3  upri @ [0:2];
+        uint1  cfi  @ [3:3];
+        uint12 vid  @ [4:15];
+    } tci;
+} vt_vlan_header_t;
+
+typedef layout "big-endian" {
+    bitfields 8 {
+        uint4 version @ [0:3];
+        uint4 length  @ [4:7];
+    } header;
+    uint8  tos;
+    uint16 len;
+    uint16 id;
+    bitfields 16 {
+        uint3  flags    @ [0:2];
+        uint13 frag_ofs @ [3:15];
+    } fragment;
+    uint8  ttl;
+    uint8  protocol;
+    uint16 chk_sum;
+    uint8 src[4];
+    uint8 dst[4];
+} vt_ipv4_header_t;
+
+typedef layout "big-endian" {
+    bitfields 32 {
+        uint4  version       @ [0:3];
+        uint8  traffic_class @ [4:11];
+        uint20 flow_label    @ [12:31];
+    } header;
+    uint16 len;
+    uint8  next;
+    uint8  hlim;
+    uint8  src[16];
+    uint8  dst[16];
+} vt_ipv6_header_t;
+
+typedef layout "big-endian" {
+    uint8 next;
+    uint8 len;
+} vt_ipv6_ext_t;
+
+typedef layout "big-endian" {
+    uint16 sport;
+    uint16 dport;
+    uint32 seq_num;
+    uint32 ack_num;
+    bitfields 16 {
+        uint4 data_ofs @ [0:3];
+        uint1 ns       @ [7:7];
+        uint1 cwr      @ [8:8];
+        uint1 ece      @ [9:9];
+        uint1 urg      @ [10:10];
+        uint1 ack      @ [11:11];
+        uint1 psh      @ [12:12];
+        uint1 rst      @ [13:13];
+        uint1 syn      @ [14:14];
+        uint1 fin      @ [15:15];
+    } control;
+    uint16 window;
+    uint16 chk_sum;
+    uint16 urgent_pointer;
+} vt_tcp_header_t;
+
+typedef layout "big-endian" {
+    uint16 sport;
+    uint16 dport;
+    uint16 length;
+    uint16 chk_sum;
+} vt_udp_header_t;

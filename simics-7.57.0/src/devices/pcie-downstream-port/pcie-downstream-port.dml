@@ -1,0 +1,1218 @@
+/*
+  pcie-downstream-port.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "simics/devs/pci.dml";
+import "simics/devs/translator.dml";
+import "simics/model-iface/transaction.dml";
+import "simics/simulator-api.dml";
+import "simics/util/hashtab.dml";
+
+import "common.dml";
+
+extern void VADD(...);
+extern void VADD_NODUPLICATE(...);
+extern void VREMOVE(...);
+extern void VREMOVE_FIRST_MATCH(...);
+extern void VFREE(...);
+extern void VCLEAR(...);
+extern int VLEN(...);
+extern bool VEMPTY(...);
+
+is post_init;
+
+port cfg is (downstream_translating) "access point into downstream Config space";
+port msg is (downstream_translating) "access point into downstream Message space";
+port mem is (downstream_translating) "access point into downstream Memory space";
+port io  is (downstream_translating) "access point into downstream I/O space";
+port ecam "ECAM configuration space" {
+    implement translator {
+        method translate(physical_address_t addr, access_t acc,
+                         const map_target_t *dt) -> (translation_t) {
+            /* ECAM puts Device ID in address bits [27:12] while PCIe
+               config space has them on [31:16] */
+            local translation_t txl;
+            txl.base[27:12] = addr[27:12];
+            txl.start[31:16] = addr[27:12];
+            txl.size = 1 << 12;
+            txl.target = cfg.map_target;
+            return txl;
+        }
+    }
+}
+
+group impl {
+    port msg_routing {
+        implement transaction_translator {
+            method translate(uint64 addr,
+                             access_t access,
+                             transaction_t *t,
+                             exception_type_t (*callback)(translation_t txl,
+                                                          transaction_t *tx,
+                                                          cbdata_call_t cbd),
+                             cbdata_register_t cbdata) -> (exception_type_t) {
+                local translation_t txl;
+                txl.target = route_message(t, addr);
+                return callback(txl, t, cbdata);
+            }
+        }
+        method route_message(transaction_t *t, uint64 addr) -> (map_target_t *) {
+            local pcie_msg_route_t route = ATOM_get_transaction_pcie_msg_route(t);
+            if (route == PCIE_Msg_Route_ID) {
+                return msg_space.map_target;
+            } else if (route == PCIE_Msg_Route_Not_Set) {
+                log spec_viol, 2:
+                    "Invalid pcie_msg_route atom %d (%s) for downstream, assuming %s",
+                    route, pcie_route_to_name(route),
+                    pcie_route_to_name(PCIE_Msg_Route_ID);
+                return msg_space.map_target;
+            } else if (route == PCIE_Msg_Route_Broadcast) {
+                return broadcast.map_target;
+            } else if (route == PCIE_Msg_Route_Address) {
+                log unimpl, 2: "PCIe Msg routed by address is not supported";
+            } else {
+                log spec_viol: "Invalid pcie_msg_route atom %d (%s) for downstream",
+                    route, pcie_route_to_name(route);
+            }
+            return NULL;
+        }
+        implement translation_flush {
+            method flush_range(uint64 base, uint64 size, access_t access,
+                               const map_target_t *default_target) -> (bool) {
+                local bool ret = true;
+                ret = SIM_map_target_flush(msg_space.map_target, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(msg_space.map_target));
+                    return false;
+                }
+                ret = SIM_map_target_flush(broadcast.map_target, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                        SIM_object_name(SIM_map_target_object(broadcast.map_target));
+                    return false;
+                }
+                return ret;
+            }
+        }
+    }
+}
+
+port broadcast is (init, destroy) {
+    session map_target_t *map_target;
+    method init() {
+        map_target = SIM_new_map_target(this.obj, NULL, NULL);
+    }
+
+    method destroy() {
+        if (this.map_target != NULL)
+            SIM_free_map_target(this.map_target);
+    }
+
+    implement transaction {
+        method issue(transaction_t *t, uint64 addr) -> (exception_type_t) default {
+            log info, 2: "Message broadcast";
+            local attr_value_t map = SIM_get_attribute(msg_space.obj, "map");
+
+            for (local int i = 0; i < SIM_attr_list_size(map); ++i) {
+                local attr_value_t v = SIM_attr_list_item(map, i);
+                local conf_object_t* mobj;
+                local const char* port = NULL;
+                if (SIM_attr_is_object(SIM_attr_list_item(v, 1))) {
+                    mobj = SIM_attr_object(
+                        SIM_attr_list_item(v, 1));
+                    if (mobj == msg_space.obj)
+                        continue;
+                } else if (SIM_attr_is_list(SIM_attr_list_item(v, 1))) {
+                    mobj = SIM_attr_object(
+                        SIM_attr_list_item(SIM_attr_list_item(v, 1), 0));
+                    port = SIM_attr_string(
+                        SIM_attr_list_item(SIM_attr_list_item(v, 1), 1));
+                }
+
+                // These map_target allocations are not ideal. See SIMICS-22637
+                // for more details regarding what we want to do here.
+                local map_target_t *msg_mt = SIM_new_map_target(
+                    mobj, port, NULL);
+                SIM_issue_transaction(msg_mt, t, addr);
+                SIM_free_map_target(msg_mt);
+            }
+            SIM_attr_free(&map);
+            return Sim_PE_No_Exception;
+        }
+    }
+}
+
+connect mem_space is (ms) "downstream Memory space";
+connect io_space  is (ms) "downstream I/O space";
+connect msg_space is (ms) "downstream Message space";
+connect cfg_space is (ms) "downstream Config space" {
+    method init() {
+        default();
+        SIM_set_attribute_default(
+            obj, "unmapped_read_value", SIM_make_attr_uint64(0xff));
+    }
+}
+
+port downstream is (init, destroy) "access point into downstream PCIe space" {
+    session map_target_t *map_target;
+    method init() {
+        map_target = SIM_new_map_target(this.obj, NULL, NULL);
+    }
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) {
+            local translation_t txl;
+            local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+
+            if (type == PCIE_Type_Msg)
+                txl.target = msg.map_target;
+            else if (type == PCIE_Type_Mem)
+                txl.target = mem.map_target;
+            else if (type == PCIE_Type_IO)
+                txl.target = io.map_target;
+            else if (type == PCIE_Type_Cfg)
+                txl.target = cfg.map_target;
+            else
+                log error: "Invalid pcie_type atom '%d'", type;
+
+            return callback(txl, t, cbdata);
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+                           const map_target_t *default_target) -> (bool) {
+            local bool ret = true;
+            ret = SIM_map_target_flush(msg.map_target, base, size, access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(msg.map_target));
+                return false;
+            }
+            ret = SIM_map_target_flush(mem.map_target, base, size, access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(mem.map_target));
+                return false;
+            }
+            ret = SIM_map_target_flush(io.map_target, base, size, access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(io.map_target));
+                return false;
+            }
+            ret = SIM_map_target_flush(cfg.map_target, base, size, access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(cfg.map_target));
+            }
+            return ret;
+        }
+    }
+
+
+    implement pcie_port_control {
+        // legacy support, the interface was initially implemented here
+        method set_secondary_bus_number(uint64 value) {
+            dev.pcie_port_control.set_secondary_bus_number(value);
+        }
+        method hot_reset() {
+            dev.pcie_port_control.hot_reset();
+        }
+    }
+
+    implement transaction {
+        // This interface is not preferred by Simics core; it is not expected
+        // to ever be called. We need it to be backwards compatible with
+        // early versions of the DML PCIe library
+        method issue(transaction_t *t, uint64 addr) -> (exception_type_t) {
+            return SIM_issue_transaction(map_target, t, addr);
+        }
+    }
+}
+
+implement pcie_port_control {
+    method set_secondary_bus_number(uint64 value) {
+        dev.cfg_space.map_demap.unmap(cfg_space.obj, NULL);
+        dev.msg_space.map_demap.unmap(msg_space.obj, NULL);
+        if (value > 0) {
+            /* Map the secondary bus number to bus 0, i.e. convert
+               transactions from type 1 to type 0. */
+            local map_info_t nfo;
+            nfo.base = value << 56;
+            nfo.length = 1 << 56;
+            dev.msg_space.map_demap.map_simple(msg_space.obj, NULL, nfo);
+
+            nfo.base = value << 24;
+            nfo.length = 1 << 24;
+            dev.cfg_space.map_demap.map_simple(cfg_space.obj, NULL, nfo);
+        }
+        if (transparent.enabled.val)
+            transparent.map_sec_bus(value);
+        sec_bus_num.val = value;
+    }
+
+    method hot_reset() default {
+        devices.hot_reset();
+        functions.hot_reset();
+    }
+}
+
+implement pcie_map {
+    method add_map(conf_object_t *mobj, map_info_t nfo,
+                   pcie_type_t type) {
+        if (type == PCIE_Type_Cfg) {
+            dev.cfg_space.map_demap.map_simple(mobj, NULL, nfo);
+        } else if (type == PCIE_Type_Msg) {
+            dev.msg_space.map_demap.map_simple(mobj, NULL, nfo);
+        } else if (transparent.enabled.val) {
+            /* Mem and I/O are mapped directly in upstream when transparent */
+            transparent.add_map(mobj, nfo, type);
+        } else if (type == PCIE_Type_Mem) {
+            dev.mem_space.map_demap.map_simple(mobj, NULL, nfo);
+        } else if (type == PCIE_Type_IO) {
+            dev.io_space.map_demap.map_simple(mobj, NULL, nfo);
+        } else {
+            log error: "add_map: invalid pcie_type %d (%s)",
+                type, pcie_type_to_name(type);
+        }
+    }
+
+    method del_map(conf_object_t *mobj, physical_address_t base,
+                   pcie_type_t type) {
+        if (type == PCIE_Type_Cfg) {
+            dev.cfg_space.map_demap.unmap_address(mobj, base, NULL);
+        } else if (type == PCIE_Type_Msg) {
+            dev.msg_space.map_demap.unmap_address(mobj, base, NULL);
+        } else if (transparent.enabled.val) {
+            /* Mem and I/O are mapped directly in upstream when transparent */
+            transparent.del_map(mobj, base, type);
+        } else if (type == PCIE_Type_Mem) {
+            dev.mem_space.map_demap.unmap_address(mobj, base, NULL);
+        } else if (type == PCIE_Type_IO) {
+            dev.io_space.map_demap.unmap_address(mobj, base, NULL);
+        } else {
+            log error: "del_map: invalid pcie_type %d (%s)",
+                type, pcie_type_to_name(type);
+        }
+    }
+
+    method add_function(conf_object_t *mobj, uint16 function_id) {
+        functions.add(mobj, function_id);
+    }
+
+    method del_function(conf_object_t *mobj, uint16 function_id) {
+        functions.del(mobj, function_id);
+    }
+
+    method enable_function(uint16 function_id) {
+        disabled.del(function_id);
+    }
+
+    method disable_function(uint16 function_id) {
+        disabled.add(function_id);
+    }
+
+    method get_device_id(conf_object_t *dev_obj) -> (uint16) default {
+        if (!dev_obj) {
+            log error: "get_device_id: invalid argument (NIL)";
+            return 0;
+        }
+        local pcie_device_t *pdev = vfind(devices.val, dev_obj);
+        if (!pdev)  // try run-time added functions
+            pdev = vfind(functions.val, dev_obj);
+        if (!pdev) // try devices that are being removed
+            pdev = vfind(devices.old_val, dev_obj);
+        if (!pdev) {
+            log info, 3: "Could not find device id for '%s'",
+                SIM_object_name(dev_obj);
+            return 0;
+        }
+
+        /* If the devid has a bus-number already, we don't add our own */
+        if (pdev->devid[15:8] != 0)
+            return pdev->devid;
+        else
+            return (sec_bus_num.val << 8) | pdev->devid;
+    }
+}
+
+implement transaction {
+    /* Simics prefers 'translator' over this interface, in most cases, but it
+       is kept for compatibility with early DML-templates */
+    method issue(transaction_t *t, uint64 addr) -> (exception_type_t) default {
+        if (transparent.target.map_target) {
+            return transparent.target.issue(t, addr);
+        } else if (upstream_target.map_target) {
+            return upstream_target.issue(t, addr);
+        } else {
+            return Sim_PE_IO_Not_Taken;
+        }
+    }
+}
+
+implement translator {
+    /* Translate all accesses to the upstream/transparent target */
+    method translate(physical_address_t addr, access_t access,
+                     const map_target_t *dt) -> (translation_t) {
+        local translation_t txl;
+        if (transparent.target.map_target)
+            txl.target = transparent.target.map_target;
+        else if (upstream_target.map_target)
+            txl.target = upstream_target.map_target;
+        log info, 3: "Translating upstream transaction to %s",
+            txl.target != NULL ?
+                SIM_object_name(SIM_map_target_object(txl.target)) :  "Nil";
+        return txl;
+    }
+}
+
+connect upstream_target is (post_init, init, mt)
+    "Target receiving all upstream transactions" {
+    interface pcie_map {
+        param required = false;
+    }
+    interface pcie_hotplug_events {
+        param required = false;
+    }
+    method init() {
+        local conf_object_t *parent = SIM_port_object_parent(dev.obj);
+        if (parent) {
+            try {
+                set_attribute(SIM_make_attr_object(parent));
+            } catch {
+                local sim_exception_t _ret = SIM_clear_exception();
+            }
+        }
+    }
+    method post_init() {
+        if (this.obj && transparent.enabled.val)
+            log error: "%s should not be used when in transparent mode", qname;
+    }
+}
+
+attribute sec_bus_num is (uint64_attr) "Secondary Bus Number";
+
+typedef struct {
+    conf_object_t *obj;
+    const pcie_device_interface_t *pdi;
+    map_target_t *map_target;
+    uint16 devid;
+    bool transparent;
+} pcie_device_t;
+typedef pcie_device_t vect pcie_device_list_t;
+
+attribute devices is (post_init, destroy) {
+    param documentation = "Connected PCIe devices. Format is"
+        + " (device_number, function_number, object)*)."
+        + " The <i>device_number</i> can be omitted, in which case"
+        + " <i>function_number</i> is an 8-bit or 16-bit number. In the case of"
+        + " a 16-bit number, the bus number (bits 8 through 15) is hardcoded"
+        + " for this device, even though it is physically connected to whatever"
+        + " bus this downstream port is configured to. The <i>object</i> must"
+        + " implement the <iface>pcie_device</iface> interface. Note that after"
+        + " being connected, devices must add their functions through the"
+        + " <iface>pcie_map</iface> interface, no transactions will be"
+        + " forwarded to the device by default. If both <i>device_number</i>"
+        + " and <i>function_number</i> are omitted, the <i>object</i> does not"
+        + " correspond to a physical device on this bus, but will receive the"
+        + " same calls as any other device. This is useful for transparent"
+        + " bridges to other buses.";
+
+    param type = "[[iio]|[io]|o*]";
+    session pcie_device_list_t val;
+    session pcie_device_list_t old_val;
+    session attr_value_t attr;
+
+    method set(attr_value_t value) throws default {
+        local pcie_device_list_t new_val;
+        for (local int i = 0; i < SIM_attr_list_size(value); ++i) {
+            local attr_value_t it = SIM_attr_list_item(value, i);
+            local pcie_device_t pdev;
+            if (SIM_attr_is_object(it)) {
+                pdev.obj = SIM_attr_object(it);
+                pdev.transparent = true;
+            } else if (SIM_attr_list_size(it) == 3) {
+                pdev.obj = SIM_attr_object(SIM_attr_list_item(it, 2));
+                local uint64 f = SIM_attr_integer(SIM_attr_list_item(it, 1));
+                local uint64 d = SIM_attr_integer(SIM_attr_list_item(it, 0));
+                if (d > 31 || f > 7) {
+                    SIM_c_attribute_error(
+                        "invalid dev,fun pair %lld.%lld for object '%s'",
+                        d, f, SIM_object_name(pdev.obj));
+                    VFREE(new_val);
+                    throw;
+                }
+                pdev.devid = d << 3 | f;
+            } else if (SIM_attr_list_size(it) == 2) {
+                pdev.obj = SIM_attr_object(SIM_attr_list_item(it, 1));
+                local uint64 did = SIM_attr_integer(SIM_attr_list_item(it, 0));
+                if (did > 0xffff) {
+                    SIM_c_attribute_error(
+                        "invalid function number %lld for object '%s'",
+                        did, SIM_object_name(pdev.obj));
+                    VFREE(new_val);
+                    throw;
+                }
+                pdev.devid = did;
+            } else {
+                assert(false);  // can't happen, checked by attribute type
+            }
+
+            pdev.pdi = SIM_get_interface(pdev.obj, "pcie_device");
+            if (!pdev.pdi) {
+                local sim_exception_t _ret = SIM_clear_exception();
+                SIM_attribute_error(SIM_last_error());
+                VFREE(new_val);
+                throw;
+            }
+
+            assert_no_duplicates(new_val, pdev);
+
+            VADD(new_val, pdev);
+        }
+
+        VFREE(old_val);
+        old_val = this.val;
+        this.val = new_val;
+
+        SIM_attr_free(&this.attr);
+        this.attr = SIM_attr_copy(value);
+
+        if (SIM_object_is_configured(obj)) {
+            inform_devices();
+
+            // We check against added functions here to ensure that we will not
+            // report adapter not present in the case of legacy devices being
+            // present. This check must be done after `inform_devices()` is called
+            if (VLEN(functions.val) > 0)
+                handle_hotplug_pd(PCIE_HP_PD_Adapter_Present);
+            else
+                handle_hotplug_pd(PCIE_HP_PD_Adapter_Not_Present);
+        }
+    }
+
+    method inform_devices() {
+        for (local int i = 0; i < VLEN(old_val); ++i) {
+            local pcie_device_t old = old_val[i];
+            local pcie_device_t *newd = vfind(this.val, old.obj);
+            if (!newd || newd->devid != old.devid)
+                old.pdi->disconnected(old.obj, dev.obj, old.devid);
+        }
+
+        for (local int i = 0; i < VLEN(this.val); ++i) {
+            local pcie_device_t newd = this.val[i];
+            local pcie_device_t *old = vfind(old_val, newd.obj);
+            if (!old || old->devid != newd.devid)
+                newd.pdi->connected(newd.obj, dev.obj, newd.devid);
+        }
+        VFREE(old_val);
+    }
+
+    method post_init() default {
+        inform_devices();
+    }
+
+    method get() -> (attr_value_t) {
+        if (SIM_attr_is_invalid(this.attr))
+            return SIM_make_attr_list(0);
+        return SIM_attr_copy(this.attr);
+    }
+
+    method hot_reset() {
+        local int i;
+        for (i = 0; i < VLEN(this.val); ++i)
+            this.val[i].pdi->hot_reset(this.val[i].obj);
+    }
+
+    method destroy() {
+        VFREE(this.val);
+        SIM_attr_free(&this.attr);
+    }
+}
+
+method handle_hotplug_pd(pcie_hotplug_pd_t state) {
+    if (upstream_target.pcie_hotplug_events.val != NULL) {
+        log info, 4: "Notifying upstream_target of presence detect change"
+                    + " since it implements the pcie_hotplug_events"
+                    + " interface.";
+        upstream_target.pcie_hotplug_events.presence_change(state);
+    }
+}
+
+attribute functions is destroy {
+    param documentation = "Mapped PCIe functions, added in runtime through the "
+        +" <iface>pcie_map</iface> interface";
+    param configuration = "pseudo";
+    param internal = true;
+    param type = "[[io]*]";
+    session pcie_device_list_t val;
+
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(val));
+        local int i;
+        for (i = 0; i < VLEN(val); ++i) {
+            local attr_value_t devid = SIM_make_attr_uint64(val[i].devid);
+            local attr_value_t devobj = SIM_make_attr_object(val[i].obj);
+            local attr_value_t item = SIM_make_attr_list(2, devid, devobj);
+            SIM_attr_list_set_item(&value, i, item);
+        }
+        return value;
+    }
+
+    method set(attr_value_t value) throws {
+        local pcie_device_list_t new_val;
+        local int i;for (i = 0; i < SIM_attr_list_size(value); ++i) {
+            local attr_value_t it = SIM_attr_list_item(value, i);
+            local pcie_device_t pdev = pcie_device(
+                SIM_attr_object(SIM_attr_list_item(it, 1)),
+                SIM_attr_integer(SIM_attr_list_item(it, 0)));
+            if (!pdev.map_target) {
+                free(new_val);
+                throw;
+            }
+            VADD(new_val, pdev);
+        }
+        free(this.val);
+        this.val = new_val;
+    }
+
+    method free(pcie_device_list_t lst) {
+        local int i;
+        for (i = 0; i < VLEN(lst); ++i)
+            SIM_free_map_target(lst[i].map_target);
+        VFREE(lst);
+    }
+
+    method pcie_device(conf_object_t *mobj, uint16 devid) -> (pcie_device_t) {
+        local pcie_device_t pdev;
+        pdev.obj = mobj;
+        pdev.devid = devid;
+        pdev.pdi = SIM_c_get_interface(pdev.obj, "pcie_device");
+        pdev.map_target = SIM_new_map_target(pdev.obj, NULL, NULL);
+        return pdev;
+    }
+
+    method find(uint16 devid) -> (pcie_device_t *) {
+        for (local int i = 0; i < VLEN(val); ++i) {
+            if (val[i].devid == devid)
+                return &val[i];
+        }
+        return NULL;
+    }
+
+    method add(conf_object_t *mobj, uint16 devid) {
+        local pcie_device_t *old = find(devid);
+        if (old) {
+            log error: "duplicate device id 0x%x (%d:%d.%d) (%s and %s)",
+                devid, devid[15:8], devid[7:3], devid[2:0],
+                SIM_object_name(mobj), SIM_object_name(old->obj);
+            return;
+        }
+        local pcie_device_t pdev = pcie_device(mobj, devid);
+        if (!pdev.map_target) {
+            log error: "Invalid PCIe device '%s' 0x%x: %s",
+                SIM_object_name(mobj), devid, SIM_last_error();
+            local sim_exception_t _ret = SIM_clear_exception();
+            return;
+        }
+        VADD(val, pdev);
+        map(mobj, devid);
+    }
+
+    method del(conf_object_t *mobj, uint16 devid) {
+        /* This attribute is pseudo so it will be empty when loading a
+           checkpoint. Unfortunately, the memory-space has checkpointed all
+           mappings that were performed, so endpoints that are loading a
+           checkpoint will remove old mappings first to avoid getting
+           duplicates in the memory space. Because of this, we must allow
+           unmapping even if there's no corresponding entry in the list of
+           functions */
+        unmap(mobj, devid);
+        for (local int i = 0; i < VLEN(val); ++i) {
+            if (val[i].obj == mobj && val[i].devid == devid) {
+                SIM_free_map_target(val[i].map_target);
+                VREMOVE(val, i);
+                return;
+            } else if (val[i].obj != mobj && val[i].devid == devid) {
+                log error: "%s, Unexpected duplicate device id 0x%x (%d:%d.%d) (%s and %s)",
+                    this.qname, devid, devid[15:8], devid[7:3], devid[2:0],
+                    SIM_object_name(mobj), SIM_object_name(val[i].obj);
+            }
+        }
+    }
+
+    method map(conf_object_t *mobj, uint16 devid) default {
+        /* Map the cfg- and msg-space for a device.
+           Local devices are mapped on bus 0. */
+        if (disabled.contains(devid)) {
+            log info, 2: "Disabled: not mapping in device %s @ 0x%x (%x:%x:%x)",
+                SIM_object_name(mobj), devid, devid[15:8], devid[7:3], devid[2:0];
+            return;
+        }
+        local map_info_t nfo;
+        /* DeviceID is in address-bits 63:48 for messages */
+        nfo.base = devid << 48;
+        nfo.length = 1 << 48;
+        pcie_map.add_map(mobj, nfo, PCIE_Type_Msg);
+
+        /* DeviceID is in address-bits 31:16 for configs */
+        nfo.base = devid << 16;
+        nfo.length = 1 << 16;
+        pcie_map.add_map(mobj, nfo, PCIE_Type_Cfg);
+    }
+
+    method unmap(conf_object_t *mobj, uint16 devid) default {
+        /* unmap cfg- and msg-space, let's hope the device has deleted
+           all other maps it's added */
+        pcie_map.del_map(mobj, devid << 48, PCIE_Type_Msg);
+        pcie_map.del_map(mobj, devid << 16, PCIE_Type_Cfg);
+    }
+
+    method map_all() {
+        for (local int i = 0; i < VLEN(val); ++i)
+            map(val[i].obj, val[i].devid);
+    }
+
+    method unmap_all() {
+        for (local int i = 0; i < VLEN(val); ++i)
+            unmap(val[i].obj, val[i].devid);
+    }
+
+    method hot_reset() {
+        local int i;
+        for (i = 0; i < VLEN(val); ++i) {
+            if (val[i].pdi)
+                val[i].pdi->hot_reset(val[i].obj);
+        }
+    }
+
+    method destroy() {
+        free(this.val);
+    }
+}
+
+attribute disabled is destroy {
+    param internal = true;
+    param type = "[i*]";
+    session uint8 vect val;
+    method set(attr_value_t value) throws {
+        VFREE(val);
+        local int i;
+        for (i = 0; i < SIM_attr_list_size(value); ++i)
+            VADD(val, SIM_attr_integer(SIM_attr_list_item(value, i)));
+
+        if (!SIM_is_restoring_state(obj) && SIM_object_is_configured(obj)) {
+            functions.unmap_all();
+            functions.map_all();
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(val));
+        local int i;
+        for (i = 0; i < VLEN(val); ++i)
+            SIM_attr_list_set_item(&value, i, SIM_make_attr_uint64(val[i]));
+        return value;
+    }
+
+    method contains(uint16 devid) -> (bool) {
+        local int i;
+        for (i = 0; i < VLEN(val); ++i) {
+            if (val[i] == devid)
+                return true;
+        }
+        return false;
+    }
+
+    method add(uint16 devid) {
+        VADD_NODUPLICATE(this.val, devid);
+        local int i;
+        for (i = 0; i < VLEN(functions.val); ++i) {
+            if (functions.val[i].devid == devid) {
+                functions.unmap(functions.val[i].obj, devid);
+                return;
+            }
+        }
+    }
+
+    method del(uint16 devid) {
+        local int i;
+        for (i = 0; i < VLEN(val); ++i) {
+            if (val[i] == devid) {
+                VREMOVE(val, i);
+                local int j;
+                for (j = 0; j < VLEN(functions.val); j++) {
+                    if (functions.val[j].devid == devid) {
+                        functions.map(functions.val[j].obj, devid);
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    method destroy() {
+        VFREE(this.val);
+    }
+}
+
+typedef struct {
+    transaction_t t;
+    atom_t atoms[5];
+} pcie_transaction_t;
+
+template downstream_translating {
+    #if (name != "cfg" && name != "msg" && name != "io" && name != "mem") {
+        error "invalid use of 'downstream_translating' template";
+    }
+    param target =
+        name == "cfg" ? cfg_space.obj :
+        name == "msg" ? impl.msg_routing.obj :
+        name == "io"  ? io_space.obj :
+        name == "mem" ? mem_space.obj :
+        NULL;
+    param default_type =
+        name == "cfg" ? PCIE_Type_Cfg :
+        name == "mem" ? PCIE_Type_Mem :
+        name == "msg" ? PCIE_Type_Msg :
+        name == "io"  ? PCIE_Type_IO :
+        PCIE_Type_Not_Set;
+    param cfg = name == "cfg";
+    param msg = name == "msg";
+    session map_target_t *map_target;
+    session translation_t txl;
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *prev,
+                         exception_type_t (*callback)(translation_t translation,
+                                                      transaction_t *transaction,
+                                                      cbdata_call_t cbdata),
+                         cbdata_register_t cbdata) -> (exception_type_t) {
+            if (txl.target == NULL)
+                txl.target = SIM_new_map_target(target, NULL, NULL);
+
+            local bool add_type =
+                ATOM_get_transaction_pcie_type(prev) == PCIE_Type_Not_Set;
+
+            local bool add_device_id;
+#if (cfg) {
+            add_device_id = ATOM_transaction_pcie_device_id(prev) == NULL;
+}
+#if (msg) {
+            add_device_id = ATOM_transaction_pcie_device_id(prev) == NULL
+                            && (ATOM_get_transaction_pcie_msg_route(prev) != PCIE_Msg_Route_ID
+                                || ATOM_get_transaction_pcie_msg_route(prev) == PCIE_Msg_Route_Not_Set);
+}
+
+            if (!add_type && !add_device_id)
+
+                return callback(txl, prev, cbdata);
+
+            local pcie_transaction_t pt;
+
+            pt.t.atoms = pt.atoms;
+            pt.t.prev = prev;
+
+            log info, 3: "Translating and adding required atoms";
+
+            local int num_atoms = 0;
+            if (add_type) {
+                pt.t.atoms[num_atoms++] = ATOM_pcie_type(default_type);
+                log info, 3: "  added pcie_type atom '%s'",
+                    pcie_type_to_name(default_type);
+            }
+
+            if (add_device_id) {
+                local uint16 did = cfg #? addr[31:16] #: addr[63:48];
+                pt.t.atoms[num_atoms++] = ATOM_pcie_device_id(did);
+                log info, 3: "  added device_id atom 0x%x", did;
+            }
+
+            pt.t.atoms[num_atoms++] = ATOM_owner(dev.obj);
+            local int compl_atom_ind = num_atoms++;
+            pt.t.atoms[compl_atom_ind] = ATOM_completion(&empty_completion);
+            pt.t.atoms[num_atoms] = ATOM_list_end(0);
+            local exception_type_t exc = callback(txl, &pt.t, cbdata);
+
+            if (exc == Sim_PE_Deferred) {
+                local pcie_transaction_t *new_pt = new pcie_transaction_t;
+                memcpy(new_pt->atoms, pt.atoms, sizeof(pt.atoms));
+                new_pt->t.atoms = new_pt->atoms;
+                new_pt->t.atoms[compl_atom_ind] = ATOM_completion(&completion);
+                new_pt->t.atoms[num_atoms] = ATOM_list_end(0);
+                new_pt->t.prev = prev;
+                SIM_replace_transaction(&pt.t, &new_pt->t);
+                VADD(chained_transactions.val, new_pt);
+                return SIM_monitor_chained_transaction(&new_pt->t, exc);
+            } else {
+                // Cannot return exc directly here. If the parent transaction_t
+                // has a completion atom that it expects to be called,
+                // it will only be called if SIM_monitor_chained_transaction
+                // is called by this transaction.
+                return SIM_monitor_chained_transaction(&pt.t, exc);
+            }
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+                           const map_target_t *default_target) -> (bool) {
+            local bool ret = true;
+            ret = SIM_map_target_flush(txl.target, base, size, access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(txl.target));
+            }
+            return ret;
+        }
+    }
+
+    is init;
+    method init() {
+        map_target = SIM_new_map_target(obj, NULL, NULL);
+    }
+
+    is destroy;
+    method destroy() {
+        SIM_free_map_target(map_target);
+        if (txl.target != NULL)
+            SIM_free_map_target(cast(txl.target, map_target_t *));
+    }
+}
+method empty_completion(transaction_t *t, exception_type_t e)
+    -> (exception_type_t) {
+    return e;
+}
+method completion(transaction_t *t,
+                  exception_type_t e) -> (exception_type_t) {
+    local pcie_transaction_t *pt = cast(t, pcie_transaction_t *);
+    VREMOVE_FIRST_MATCH(chained_transactions.val, pt);
+    delete pt;
+    return e;
+}
+
+attribute chained_transactions is destroy {
+    param type = "[[iii]*]";
+    param internal = true;
+    session pcie_transaction_t * vect val;
+
+    method set(attr_value_t value) throws {
+        if (!SIM_is_restoring_state(obj)) {
+            SIM_attribute_error("must only be set during checkpoint restore");
+            throw;
+        }
+
+        for (local int i = 0; i < VLEN(this.val); i++)
+            delete this.val[i];
+
+        VFREE(this.val);
+
+        for (local int i = 0; i < SIM_attr_list_size(value); i++) {
+            local attr_value_t li = SIM_attr_list_item(value, i);
+            local int64 id = SIM_attr_integer(SIM_attr_list_item(li, 0));
+            local pcie_type_t type =
+                SIM_attr_integer(SIM_attr_list_item(li, 1));
+            local uint16 did = SIM_attr_integer(SIM_attr_list_item(li, 2));
+
+            local pcie_transaction_t *pt = new pcie_transaction_t;
+            pt->t.atoms = pt->atoms;
+
+            local int j = 0;
+            if (type != PCIE_Type_Not_Set)
+                pt->t.atoms[j++] = ATOM_pcie_type(type);
+            if (did != 0)
+                pt->t.atoms[j++] = ATOM_pcie_device_id(did);
+            pt->t.atoms[j++] = ATOM_completion(&completion);
+            pt->t.atoms[j++] = ATOM_owner(dev.obj);
+            pt->t.atoms[j++] = ATOM_list_end(0);
+
+            VADD(this.val, pt);
+            SIM_reconnect_transaction(&pt->t, id);
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(this.val));
+        local transaction_t t;
+        for (local int i = 0; i < VLEN(this.val); i++) {
+            // connect the atom-list to an empty transaction, to avoid finding
+            // atoms in chained 'prev'
+            t.atoms = this.val[i]->atoms;
+            local attr_value_t li = SIM_make_attr_list(
+                3,
+                SIM_make_attr_uint64(SIM_get_transaction_id(&this.val[i]->t)),
+                SIM_make_attr_uint64(ATOM_get_transaction_pcie_type(&t)),
+                SIM_make_attr_uint64(ATOM_get_transaction_pcie_device_id(&t)));
+            SIM_attr_list_set_item(&value, i, li);
+        }
+        return value;
+    }
+
+    method destroy() {
+        // Deferred transactions are completed by Simics Core, we just need to
+        // free the vect
+        VFREE(this.val);
+    }
+}
+
+port HOT_RESET {
+    implement signal {
+        method signal_raise() {
+            dev.pcie_port_control.hot_reset();
+        }
+        method signal_lower() {}
+    }
+}
+
+method vfind(pcie_device_list_t lst, conf_object_t *obj) -> (pcie_device_t *) {
+    local int i;
+    for (i = 0; i < VLEN(lst); ++i) {
+        if (lst[i].obj == obj)
+            return &lst[i];
+    }
+    return NULL;
+}
+
+inline method assert_no_duplicates(inline lst, inline item) throws {
+    for (local int i = 0; i < VLEN(lst); i++) {
+        if (item.obj == lst[i].obj) {
+            SIM_c_attribute_error(
+                "duplicate object '%s'", SIM_object_name(item.obj));
+            VFREE(lst);
+            throw;
+        }
+        if (item.transparent || lst[i].transparent)
+            continue;
+        if (item.devid == lst[i].devid) {
+            SIM_c_attribute_error(
+                "duplicate device id %d:%d.%d (%s and %s)",
+                item.devid[15:8], item.devid[7:3], item.devid[2:0],
+                SIM_object_name(item.obj),
+                SIM_object_name(lst[i].obj));
+            VFREE(lst);
+            throw;
+        }
+    }
+}
+
+group transparent {
+    attribute enabled is bool_attr {
+        param documentation = "If TRUE, this bus operates in transparent mode,"
+            + " all ranges mapped by devices on this bus will be mapped in the"
+            + " upstream target of this bus. The sec_bus_num will be claimed in"
+            + " the upstream config and message space.";
+    }
+
+    connect target is (mt) "Upstream target used in transparent mode" {
+        param internal = true;
+        param configuration = "pseudo";
+        interface pcie_map;
+    }
+
+    method add_map(conf_object_t *mobj, map_info_t nfo, pcie_type_t type) {
+        if (target.pcie_map.val)
+            target.pcie_map.add_map(mobj, nfo, type);
+        else
+            log error: "transparent mode: no pcie_map interface, can't add_map";
+    }
+
+    method del_map(conf_object_t *mobj, uint64 base, pcie_type_t type) {
+        if (target.pcie_map.val)
+            target.pcie_map.del_map(mobj, base, type);
+        else
+            log error: "transparent mode: no pcie_map interface, can't del_map";
+    }
+
+    method unmap_sec_bus() {
+        if (target.pcie_map.val) {
+            local uint64 msg_base = sec_bus_num.val << 56;
+            target.pcie_map.del_map(msg.obj, msg_base, PCIE_Type_Msg);
+
+            local uint64 cfg_base = sec_bus_num.val << 24;
+            target.pcie_map.del_map(cfg.obj, cfg_base, PCIE_Type_Cfg);
+        }
+    }
+
+    method map_sec_bus(uint64 value) {
+        unmap_sec_bus();
+
+        if (value == 0) {
+            log info, 2: "transparent mode: bus 0 can't be transparent";
+            return;
+        }
+
+        if (!transparent.target.obj) {
+            log info, 2: "transparent mode: no upstream target";
+            return;
+        }
+
+        if (!transparent.target.pcie_map.val) {
+            log error: "transparent mode: no pcie_map interface in '%s'",
+                SIM_object_name(transparent.target.obj);
+            return;
+        }
+
+        local map_info_t nfo;
+        nfo.base = value << 56;
+        nfo.start = nfo.base;
+        nfo.length = 1 << 56;
+        transparent.target.pcie_map.add_map(msg.obj, nfo, PCIE_Type_Msg);
+
+        nfo.base = value << 24;
+        nfo.start = nfo.base;
+        nfo.length = 1 << 24;
+        transparent.target.pcie_map.add_map(cfg.obj, nfo, PCIE_Type_Cfg);
+    }
+}
+
+port downstream is (destroy) {
+    /* The downstream port implements pcie_device, to support acting as an
+       endpoint, but only during transparent operation. */
+
+    implement pcie_device {
+        session map_target_t *map_target_dev;
+
+        method hot_reset() {
+            if (!_enabled())
+                return;
+            dev.pcie_port_control.hot_reset();
+        }
+
+        method connected(conf_object_t *upstream_obj, uint16 nodevice_id) {
+            local bool ret;
+
+            if (map_target_dev == NULL)
+                map_target_dev = SIM_new_map_target(dev.obj, NULL, NULL);
+            if (!_enabled())
+                return;
+            if (transparent.target.obj) {
+                log error: "can't connect '%s', already connected to '%s'",
+                    SIM_object_name(upstream_obj),
+                    SIM_object_name(transparent.target.obj);
+            }
+            transparent.target.set(upstream_obj);
+            transparent.map_sec_bus(sec_bus_num.val);
+            ret = SIM_map_target_flush(map_target_dev, 0, -1, (Sim_Access_Read
+                                       | Sim_Access_Write | Sim_Access_Execute));
+            if (!ret) {
+                SIM_translation_changed(dev.obj);
+            }
+        }
+
+        method disconnected(conf_object_t *upstream_obj, uint16 no_device_id) {
+            local bool ret;
+
+            if (map_target_dev == NULL)
+                map_target_dev = SIM_new_map_target(dev.obj, NULL, NULL);
+            if (!_enabled())
+                return;
+            if (transparent.target.obj != upstream_obj) {
+                log error: "can't disconnect '%s', connected to '%s'",
+                    SIM_object_name(upstream_obj),
+                    SIM_object_name(transparent.target.obj);
+                return;
+            }
+            transparent.unmap_sec_bus();
+            transparent.target.set(NULL);
+            ret = SIM_map_target_flush(map_target_dev, 0, -1, (Sim_Access_Read
+                                       | Sim_Access_Write | Sim_Access_Execute));
+            if (!ret) {
+                SIM_translation_changed(dev.obj);
+            }
+        }
+    }
+
+    method _enabled() -> (bool) {
+        if (!transparent.enabled.val)
+            log error: "%s interface is only for transparent mode", qname;
+        return transparent.enabled.val;
+    }
+
+    method destroy() {
+        if (this.map_target != NULL)
+            SIM_free_map_target(this.map_target);
+        if (pcie_device.map_target_dev != NULL)
+            SIM_free_map_target(pcie_device.map_target_dev);
+    }
+}
+
+port phy {
+    implement translator {
+        session map_target_t *dev_mt;
+        method translate(physical_address_t addr, access_t acc,
+                         const map_target_t *dt) -> (translation_t) {
+            local translation_t txl;
+            local conf_object_t *link_phy_port;
+
+            // We need to create a new map each time since the device might
+            // change
+            if (dev_mt != NULL) {
+                SIM_free_map_target(dev_mt);
+                dev_mt = NULL;
+            }
+            if (VEMPTY(devices.val)) {
+                log info, 1: "Received physical transaction when there are no"
+                           + " devices connected";
+                return txl;
+            }
+
+            local bool found_dev = false;
+            local pcie_device_t dev;
+            for (local int i = 0; i < VLEN(devices.val); i++) {
+                local pcie_device_t dev_i = devices.val[i];
+                if (dev.devid == addr[31:16]) {
+                    found_dev = true;
+                    dev = dev_i;
+                    break;
+                }
+            }
+            if (!found_dev) {
+                log info, 1: "Could not find a connected device with device id"
+                          + " %d.", addr[31:16];
+                return txl;
+            }
+
+            link_phy_port = SIM_object_descendant(dev.obj, "port.phy");
+            if (link_phy_port != NULL) {
+                dev_mt = SIM_new_map_target(link_phy_port, NULL, NULL);
+                log info, 3: "Forwarding physical transaction to %s",
+                    SIM_object_name(dev.obj);
+                txl.target = dev_mt;
+            } else {
+                log info, 3: "No link training port on connected device,"
+                           + " transaction will not be translated.";
+            }
+            return txl;
+        }
+    }
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state(obj)) {
+        if (VLEN(functions.val) > 0)
+            handle_hotplug_pd(PCIE_HP_PD_Adapter_Present);
+    }
+}

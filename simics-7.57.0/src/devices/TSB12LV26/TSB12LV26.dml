@@ -1,0 +1,1857 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device TSB12LV26;
+parameter desc = "model of TSB12V26 1394 OHCI host controller";
+parameter limitations = 
+"<dl>"
++ "<dt>Limitations</dt>"
++ "<dd><ul>"
++ "    <li>The only contexts implemented are the ARRS, ATRQ and IsoRecv contexts.</li>"
++ "    <li>The wake field in the ContextControl registers of the DMA contexts is ignored.</li>"
++ "  </ul>"
++ "</dd>"
++ "</dl>";
+
+parameter firewire_phy = $PHY;
+parameter PHYSICAL_UPPER_BOUND = 0x100000000;
+
+header %{
+static void
+swab32_copy(void *dest, const void *src)
+{
+    STORESWAB32((uint32 *)dest, *(uint32 *)src);
+}
+%}
+extern void swab32_copy(void *dest, const void *src);
+extern uint32 SWAB32(uint32 v);
+
+import "utility.dml";
+import "io-memory.dml";
+import "pci/common.dml";
+import "firewire-device.dml";
+
+/*
+ * Protocol Messages
+ *
+ * These are the format of the various messages the DMA engines reads from
+ * memory. They correspond closely with the wire formats, but there are some
+ * differences.
+ */
+
+
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint4 cmd @ [31:28];
+        uint3 key @ [26:24];
+        uint1 p @ [23:23];
+        uint2 i @ [21:20];
+        uint2 b @ [19:18];
+        uint16 reqCount @ [15:0];
+    } h;
+    uint32 dataAddress;
+    bitfields 32 {
+        uint28 branchAddress @ [31:4];
+        uint4 z @ [3:0];
+    } commandPtr;
+    uint16 xferStatus;
+    uint16 timeStamp;
+} at_desc_t;
+
+/* The trailer of a packet written to memory */
+typedef layout "little-endian" {
+    uint16 timeStamp;
+    uint16 xferStatus;
+} trailer_t;
+
+typedef layout "little-endian" {
+    uint16 resCount;
+    uint16 xferStatus;
+} ar_desc_status_t;
+
+typedef layout "little-endian" {
+    uint16 timeStamp;
+    uint16 xferStatus;
+} at_desc_status_t;
+
+typedef layout "little-endian" {
+    bitfields 32 {
+        uint4 cmd @ [31:28];
+        uint1 s @ [27:27];
+        uint3 key @ [26:24];
+        uint2 i @ [21:20];
+        uint2 b @ [19:18];
+        uint16 reqCount @ [15:0];
+    } h;
+    uint32 dataAddress;
+    bitfields 32 {
+        uint28 branchAddress @ [31:4];
+        uint4 z @ [3:0];
+    } commandPtr;
+    ar_desc_status_t stat;
+} ar_desc_t;
+
+typedef layout "little-endian" {
+    uint32 self_id;
+    uint32 inv;
+} self_id_packet_t;
+
+typedef layout "little-endian" {
+    uint32 q;
+} le_quadlet_t;
+
+typedef layout "big-endian" {
+    uint32 q;
+} be_quadlet_t;
+
+typedef layout "little-endian" {
+    uint16 p;
+} pairlet_t;
+
+/*
+ * Local Templates
+ */
+
+/*
+ * OHCI has set/clear register, where you use one register to set bits in the
+ * register and another to clear them. You can use either register to read
+ * the current value. In DML use one unmapped register for the value and
+ * two mapped registers which delegate to the real register for the set and
+ * clear registers.
+ */
+template set_clear_register {
+    parameter offset default undefined;
+    parameter set_mask default 0xffffffff;
+    parameter clear_mask default 0xffffffff;
+
+    register reg @ undefined;
+
+    register set @ $parent.offset {
+        parameter allocated = false;
+        parameter configuration = "none";
+        method read_access (generic_transaction_t *memop, msb1, lsb)
+            -> (value) {
+            inline $parent.reg.read_access(memop, msb1, lsb) -> (value);
+        }
+        method write_access(generic_transaction_t *memop, msb1, lsb, value) {
+            local uint32 current;
+            inline $parent.reg.get() -> (current);
+            inline $parent.reg.write_access(memop, msb1, lsb,
+                                            current | (value
+                                                       & $parent.set_mask));
+        }
+    }
+    register clear @ $parent.offset + 4 {
+        parameter allocated = false;
+        parameter configuration = "none";
+        method read_access (generic_transaction_t *memop, msb1, lsb)
+            -> (value) {
+            inline $parent.reg.read_access(memop, msb1, lsb) -> (value);
+        }
+        method write_access(generic_transaction_t *memop, msb1, lsb, value) {
+            local uint32 current;
+            inline $parent.reg.get() -> (current);
+            inline $parent.reg.write_access(memop, msb1, lsb,
+                                            current & ~(value
+                                                        & $parent.clear_mask));
+        }
+    }
+}
+
+/*
+ * Interrupts on the OHCI controller are managed in a tree of interrupt flags.
+ * Each node of the tree has a pair of set/clear registers; one event and one
+ * mask. Each event bit is connected to an interrupt input signal which sets
+ * the event bit when raised. Software can raise or lower
+ * the event by setting or clearing the event bit. If any unmasked event bit is
+ * one the output of the node is high.
+ * The mask register can also have a master enable bit in its most significant
+ * bit. If so this bit must also be set for the output signal to be raised.
+ */
+template int_registers {
+    parameter offset default undefined;
+    parameter MASTER_ENABLE = 0x80000000;
+    parameter check_master_enable default false;
+
+    attribute raised {
+        parameter type = "b";
+        parameter allocate_type = "bool";
+
+        method hard_reset {
+            $this = false;
+        }
+    }
+
+    group event is (set_clear_register) {
+        parameter offset = $parent.offset;
+        
+        register reg {
+            method write(value) {
+                $this = value;
+                call $parent.parent.check_interrupts;
+            }
+            method after_write(mop) {
+                log info, 3: "value changed to 0x%x", $this;
+            }
+        }
+    }
+    group mask is (set_clear_register) {
+        parameter offset = $parent.offset + 8;
+        register reg {
+            method write(value) {
+                $this = value;
+                call $parent.parent.check_interrupts;
+            }
+            method after_write(mop) {
+                log info, 3: "mask changed to 0x%x", $this;
+            }
+        }
+    }
+
+    method check_interrupts {
+        /*
+         * Handle the raised flag in this method since raise and lower have
+         * several different implementations.
+         */
+        if ((!$check_master_enable || (($MASTER_ENABLE & $mask.reg) != 0))
+            && (($event.reg & $mask.reg) != 0)) {
+            if (!$raised) {
+                call $raise;
+                $raised = true;
+            }
+        } else {
+            if ($raised) {
+                call $lower;
+                $raised = false;
+            }
+        }
+    }
+
+    /*
+     * Override these methods to add the behaviour needed when the output
+     * signal is raised or lowered.
+     */
+    method raise default {}
+    method lower default {}
+
+    /*
+     * raise_event and lower_event are called to raise and lower the input
+     * signals. Each bit set represents an input signal to raise/lower.
+     */
+    method raise_event(uint32 value) {
+        log info, 3: "raising events 0x%x", value;
+        local uint32 new_value = $event.reg | (value & $event.set_mask);
+        if (new_value != $event.reg) {
+            $event.reg = new_value;
+            inline $check_interrupts;
+        }
+    }
+
+    method lower_event(uint32 value) {
+        log info, 3: "lowering events 0x%x", value;
+        local uint32 new_value = $event.reg & ~value;
+        if (new_value != $event.reg) {
+            $event.reg = new_value;
+            inline $check_interrupts;
+        }
+    }
+}
+
+template dma_context {
+    parameter offset default undefined;
+
+    attribute last_pointer_address {
+        parameter type = "i";
+        parameter allocate_type = "uint32";
+    }
+
+    attribute has_last_pointer_address {
+        parameter type = "b";
+        parameter allocate_type = "bool";
+    }
+
+    group ContextControl is (set_clear_register) {
+        parameter offset = $parent.offset;
+        register reg {
+            field eventcode[4:0] is (ignore_write);
+            field spd[7:5] is (ignore_write);
+            field active[10] is (ignore_write);
+            field dead[11] is (ignore_write);
+            field wake[12] is (write_1_only);
+            field run[15] {
+                method write(value) {
+                    if (value == 0) $dead = 0;
+                    $this = value;
+                }
+            }
+        }
+    }
+    register CommandPtr @ $parent.offset + 0xc {
+        field descriptorAddress[31:4];
+        field Z[3:0];
+    }
+
+    method read_last_pointer {
+        if (!$has_last_pointer_address) return;
+        local uint64 val;
+        local exception_type_t ex;
+        call $pci_value_from_memory(Sim_Addr_Space_Memory,
+                                    $last_pointer_address, 4)
+            -> (val, ex);
+        // TODO: how to handle ex
+        $CommandPtr.descriptorAddress = val[31:4];
+        $CommandPtr.Z = val[3:0];
+        $has_last_pointer_address = false;
+    }
+    method set_last_pointer_address(address) {
+        $last_pointer_address = address;
+        $has_last_pointer_address = true;
+    }
+
+    parameter z_max default 12;
+
+    method data_from_memory(void *into, uint64 address, uint64 size,
+                            uint5 failure_code) {
+        local exception_type_t ex;
+        call $pci_data_from_memory(Sim_Addr_Space_Memory, into, address, size)
+            -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "failed to read host memory (event code: 0x%x)", failure_code;
+            $ContextControl.reg.eventcode = failure_code;
+            throw;
+        }
+
+    }
+
+    method read_descriptor(void *into, uint64 address, uint64 size) {
+        inline $data_from_memory(into, address, size, $evt_descriptor_read);
+    }
+
+    method read_data(void *into, uint64 address, uint64 size) {
+        inline $data_from_memory(into, address, size, $evt_data_read);
+    }
+
+    method descriptor_error(const char *key, uint64 address) {
+        log spec_viol: "invalid %s in descriptor at 0x%x", key, address;
+        $ContextControl.reg.eventcode = $evt_unknown;
+        throw;
+    }
+
+    method get_xferStatus -> (uint16 s) {
+        inline $ContextControl.reg.get -> (s);
+    }
+
+    method update_descriptor(uint32 desc_address, uint8 *value) {
+        local exception_type_t ex;
+        call $pci_data_to_memory(Sim_Addr_Space_Memory, value,
+                                 desc_address + 12, 4) -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "failed to update descriptor";
+            $ContextControl.reg.eventcode = $evt_unknown;
+            throw;
+        }
+    }
+}
+
+template buffer_fill_receive_context {
+    parameter packetCompleteEvent default undefined;
+    parameter bufferCompleteEvent default undefined;
+
+    method raise_events(uint32 events) default {
+        log unimpl: "raising events after receiving packets";
+    }
+
+    method write_response_packet(uint8 *packet, uint32 size) {
+        local uint32 events;
+        local uint32 first_desc_address
+            = $CommandPtr.descriptorAddress << 4;
+        local uint32 desc_address = first_desc_address;
+        local uint4 z = $CommandPtr.Z;
+        local ar_desc_t desc;
+        local uint32 bytes_written;
+        events = $packetCompleteEvent;
+        call $write_to_buffer(desc_address, z, packet, size)
+            -> (desc, bytes_written, packet, size);
+        while (size != 0) {
+            /* Check the just completed descriptor's i flag */
+            if (desc.h.i == 0x3) {
+                events |= $bufferCompleteEvent;
+            }
+            desc_address = desc.commandPtr.branchAddress << 4;
+            z = desc.commandPtr.z;
+            call $write_to_buffer(desc_address, z, packet, size)
+                -> (desc, bytes_written, packet, size);
+        }
+        /* Now desc_address points to the last descriptor used */
+        local ar_desc_status_t stat;
+        stat.resCount = desc.stat.resCount - bytes_written;
+        inline $get_xferStatus -> (stat.xferStatus);
+        call $update_descriptor(desc_address, cast(&stat, uint8*));
+        if (first_desc_address != desc_address) {
+            stat.resCount = 0;
+            call $update_descriptor(first_desc_address, cast(&stat, uint8*));
+        }
+        $CommandPtr.descriptorAddress = desc_address >> 4;
+        $CommandPtr.Z = z;
+        inline $set_last_pointer_address(desc_address+8);
+        inline $raise_events(events);
+    }
+    method write_to_buffer(uint32 desc_address, uint4 z,
+                           uint8 *packet, uint32 size)
+        -> (ar_desc_t desc, uint32 bytes_written,
+            uint8 *remaining_packet, uint32 remaining_size)
+    {
+        if (z != 1) {
+            log info, 2: "packet too long for buffer";
+            $ContextControl.reg.eventcode = $evt_long_packet;
+            throw;
+        }
+        call $read_descriptor(&desc, desc_address, sizeof(desc));
+        if (desc.h.cmd != 0x2)
+            inline $descriptor_error("cmd", desc_address);
+        if (desc.h.key != 0x0)
+            inline $descriptor_error("key", desc_address);
+        if (desc.h.s != 0x1) inline $descriptor_error("s", desc_address);
+        if (desc.h.b != 0x3) inline $descriptor_error("b", desc_address);
+        local uint64 data_address = desc.dataAddress & ~3;
+        /*
+          There is an undocumented feature in the TSB12LV26. If the resCount
+          is zero then it is reset to reqCount. This allows you to have your
+          descriptors linked in a circular structure.
+        */
+        if (desc.stat.resCount == 0) {
+            desc.stat.resCount = desc.h.reqCount;
+        }
+        data_address += desc.h.reqCount - desc.stat.resCount;
+        bytes_written = (desc.stat.resCount < size) 
+            ? desc.stat.resCount : size;
+        local exception_type_t ex;
+        call $pci_data_to_memory(Sim_Addr_Space_Memory, packet,
+                                 data_address, bytes_written)
+            -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 2: "failed to write packet to memory";
+            $ContextControl.reg.eventcode = $evt_data_write;
+            throw;
+        }
+        remaining_packet = packet + bytes_written;
+        remaining_size = size - bytes_written;
+    }
+    method write_trailer(uint8 *dest) {
+        local trailer_t *t = cast(dest, trailer_t *);
+        call $ohci.Isocyctimer.get_timeStamp -> (t->timeStamp);
+        call $get_xferStatus -> (t->xferStatus);
+    }
+}
+
+template register_alias {
+    parameter target default undefined;
+    parameter allocate = false;
+    method read_access(mop, msb1, lsb) -> (val) {
+        inline $target.read_access(mop, msb1, lsb) -> (val);
+    }
+    method write_access(mop, msb1, lsb, val) {
+        inline $target.write_access(mop, msb1, lsb, val);
+    }
+    method get -> (val) {
+        inline $target.get -> (val);
+    }
+    method set(val) {
+        inline $target.set(val);
+    }
+}
+
+template field_alias {
+    parameter target default undefined;
+    parameter allocate = false;
+    method read -> (val) {
+        inline $target.read -> (val);
+    }
+    method write(val) {
+        inline $target.write(val);
+    }
+    method get -> (val) {
+        inline $target.get -> (val);
+    }
+    method set(val) {
+        inline $target.set(val);
+    }
+}
+
+template bus_configurable_register {
+    method physical_request(dbuffer_t *packet) -> (firewire_ack_code_t ack) {
+        log unimpl: "bus access of register %s", $name;
+        ack = Firewire_Ack_Type_Error;
+    }
+}
+
+/*
+ * Constants
+ */
+
+/* Event codes for DMA contexts */
+parameter evt_no_status = 0x0;
+parameter evt_long_packet = 0x2;
+parameter evt_missing_ack = 0x3;
+parameter evt_underrun = 0x4;
+parameter evt_overrun = 0x5;
+parameter evt_descriptor_read = 0x6;
+parameter evt_data_read = 0x7;
+parameter evt_data_write = 0x8;
+parameter evt_bus_reset = 0x9;
+parameter evt_timeout = 0xa;
+parameter evt_tcode_err = 0xb;
+parameter evt_unknown = 0xe;
+parameter evt_flushed = 0xf;
+parameter ack_complete = 0x11;
+parameter ack_pending = 0x12;
+parameter ack_busy_X = 0x14;
+parameter ack_busy_A = 0x15;
+parameter ack_busy_B = 0x16;
+parameter ack_tardy = 0x1b;
+parameter ack_data_error = 0x1d;
+parameter ack_type_error = 0x1e;
+
+
+
+/*
+ * Bank definitions
+ */
+
+is pci_device;
+bank pci_config {
+    parameter base_address_registers = ["ohci_bar", "ti_bar"];
+    register vendor_id { parameter hard_reset_value = 0x104c; }
+    register device_id { parameter hard_reset_value = 0x8020; }
+    register status { parameter hard_reset_value = 0x210; }
+
+    register revision_id { parameter hard_reset_value = 0x0; }
+    register class_code { parameter hard_reset_value = 0x0c0010; }
+
+    register ohci_bar @ 0x10 is (memory_base_address_32) {
+        parameter size_bits = 11;
+        parameter map_func = $ohci.function;
+    }
+    register ti_extensions_bar @ 0x14 is (memory_base_address_32) {
+        parameter size_bits = 8;
+        parameter map_func = $ti_extensions.function;
+    }
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1C is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+
+    register capabilities_ptr { parameter hard_reset_value = 0x44; }
+    register interrupt_pin { parameter hard_reset_value = 0x1; }
+    register min_gnt { parameter hard_reset_value = 0x2; }
+    register max_lat { parameter hard_reset_value = 0x4; }
+
+    register ohci_control size 4 @ 0x40;
+    is defining_pci_pm_capability;
+    parameter pm_offset = 0x44;
+    parameter pm_next_ptr = 0x0;
+
+    register misc_config size 4 @ 0xf0 {
+        parameter hard_reset_value = 0x2400;
+    }
+    register link_enhancement_control size 4 @ 0xf4 {
+        parameter hard_reset_value = 0x1000;
+    }
+    register subsystem_vecndor_id_alias size 2 @ 0xf8;
+    register subsystem_id_alias size 2 @ 0xfc;
+    register gpio2 size 1 @ 0xfe;
+    register gpio3 size 1 @ 0xff;
+}
+
+bank ohci {
+    parameter function = 1;
+    parameter register_size = 4;
+    register Version @ 0x0;
+    register GUID_ROM @ 0x04;
+    register ATRetries @ 0x08;
+    register CSRData @ 0xc;
+    register CSRCompareData @ 0x10;
+    register CSRControl @ 0x14;
+    register ConfigRomHdr @ 0x18;
+    register BusID @ 0x1c;
+    register BusOptions @ 0x20;
+    register GUIDHi @ 0x24;
+    register GUIDLo @ 0x28;
+    register ConfigROMMap @ 0x34;
+    register PostedWriteAddressLo @ 0x38;
+    register PostedWriteAddressHi @ 0x3c;
+    /*
+     * The register map says that this register is mapped at 0x40-0x4c, but
+     * the register documentation only places it at 0x40
+     */
+    register VendorID @ 0x40;
+    group HCControl is (set_clear_register) {
+        parameter offset = 0x50;
+    }
+
+    register SelfIDBuffer @ 0x64;
+    register SelfIDCount @ 0x68;
+
+    group IRChannelMaskHi is (set_clear_register) {
+        parameter offset = 0x70;
+    }
+    group IRChannelMaskLo is (set_clear_register) {
+        parameter offset = 0x78;
+    }
+    group Int is (int_registers) {
+        parameter offset = 0x80;
+    }
+    group IsoXmitInt is (int_registers) {
+        parameter offset = 0x90;
+    }
+    group IsoRecvInt is (int_registers) {
+        parameter offset = 0xa0;
+    }
+    register FairnessControl @ 0xdc;
+    group LinkControl is (set_clear_register) {
+        parameter offset = 0xe0;
+    }
+    register NodeID @ 0xe8;
+    register PhyControl @ 0xec;
+    register Isocyctimer @ 0xf0;
+    group AsyncRequestFilterHi is (set_clear_register) {
+        parameter offset = 0x100;
+    }
+    group AsyncRequestFilterLo is (set_clear_register) {
+        parameter offset = 0x108;
+    }
+    group PhysicalRequestFilterHi is (set_clear_register) {
+        parameter offset = 0x110;
+    }
+    group PhysicalRequestFilterLo is (set_clear_register) {
+        parameter offset = 0x118;
+    }
+    register PhysicalUpperBound @ 0x120;
+
+    group ATRQ is (dma_context) {
+        parameter offset = 0x180;
+    }
+    group ATRS is (dma_context) {
+        parameter offset = 0x1a0;
+    }
+    group ARRQ is (dma_context) {
+        parameter offset = 0x1c0;
+    }
+    group ARRS is (dma_context) {
+        parameter offset = 0x1e0;
+    }
+    group IsoXmit[8] is (dma_context) {
+        parameter offset = 0x200 + 16 * $i;
+    }
+    group IsoRecv[4] is (dma_context) {
+        parameter offset = 0x400 + 32 * $i;
+
+        register ContextMatch @ $parent.offset + 0x10;
+    }
+}
+
+bank ti_extensions {
+    parameter function = 2;
+    parameter register_size = 4;
+    /* There doesn't seem to be any registers defined for this bank */
+}
+
+bank firewire_config_registers is (firewire_config_registers) {
+    register bus_manager_id @ 0x21c;
+    register bandwidth_available @ 0x220;
+    register channels_available_hi @ 0x224;
+    register channels_available_lo @ 0x228;
+}
+
+bank csr_aliases {
+    parameter register_size = 4;
+    register bus_manager_id @ 0x0;
+    register bandwidth_available @ 0x4;
+    register channels_available_hi @ 0x8;
+    register channels_available_lo @0xc;
+}
+
+bank PHY is (PHY_1394a, locally_accessible_bank) {
+    parameter port_count = 3;
+    parameter link_power_status = $ohci.HCControl.reg.LPS;
+}
+
+/*
+ * Methods
+ */
+
+/*
+  Copy quadlets
+ */
+method copy_quadlets(uint8 *dest, const uint8 *src, int len) {
+    if ($ohci.HCControl.reg.noByteSwapData == 0) {
+        if (dest != src)
+            memcpy(dest, src, len);
+    } else {
+        local int i;
+        for (i = 0; i < len; i += 4) {
+            swab32_copy(&dest[i], &src[i]);
+        }
+    }
+}
+
+method add_crc(dbuffer_t *packet) {
+    local uint8 *crc = dbuffer_append(packet, 4);
+    local int i;
+    for (i = 0; i < 4; i++)
+        crc[i] = 0;
+}
+
+method firewire_handle_packet(dbuffer_t *packet, int crc_calculated)
+    -> (firewire_ack_code_t ack) {
+    ack = Firewire_Ack_No_Ack;
+    switch (fw_extract_tcode(packet)) {
+    case Firewire_Write_Quadlet:
+    case Firewire_Write_Block:
+    case Firewire_Read_Quadlet:
+    case Firewire_Read_Block:
+    case Firewire_Lock:
+        call $handle_request(packet) -> (ack);
+        break;
+    case Firewire_Write_Response:
+    case Firewire_Read_Quadlet_Response:
+    case Firewire_Read_Block_Response:
+    case Firewire_Lock_Response:
+        log info, 3: "received asynchronous packet";
+        call $ohci.ARRS.handle_response(packet) -> (ack);
+        break;
+    case Firewire_Streaming: {
+        log info, 3: "received streaming packet";
+        local int i;
+        for (i = 0; i< $ohci.IsoRecvCount; i++) {
+            call $ohci.IsoRecv[i].handle_packet(packet);
+        }
+        break;
+    }
+    case Firewire_Cycle_Start:
+        log info: "ignoring all cycle start packets";
+        break;
+    default:
+        log error: "unknown packet type";
+    }
+}
+
+method handle_physical_memory_request(dbuffer_t *packet)
+    -> (firewire_ack_code_t ack) {
+    local uint6 tcode = fw_extract_tcode(packet);
+    local uint64 address = fw_extract_address(packet);
+    local exception_type_t ex;
+    switch (tcode) {
+    case Firewire_Write_Block:
+    case Firewire_Write_Quadlet: {
+        local dbuffer_t *db = dbuffer_clone(packet);
+        if (($ohci.Int.event.reg & $ohci.Int.postedWriteErr) != 0) {
+            /* There may only be one pending posted write */
+            ack = Firewire_Ack_Busy_X;
+            break;
+        }
+        ack = Firewire_Ack_Complete;
+        local uint16 data_length;
+        local uint8 *buf;
+        if (tcode == Firewire_Write_Block) {
+            data_length = fw_extract_data_length(db);
+            buf = dbuffer_update(db, 20, (data_length + 3) & ~3);
+        } else {
+            data_length = 4;
+            buf = dbuffer_update(db, 12, 4);
+        }
+        call $copy_quadlets(buf, buf, data_length);
+        call $pci_data_to_memory(Sim_Addr_Space_Memory, buf, address,
+                                 data_length) -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            $ohci.PostedWriteAddressLo.offsetLo = address & 0xffffffff;
+            $ohci.PostedWriteAddressHi.offsetHi = (address >> 32) & 0xffff;
+            $ohci.PostedWriteAddressHi.sourceID = fw_extract_source_id(db);
+            inline $ohci.Int.raise_event($ohci.Int.postedWriteErr);
+        }
+        dbuffer_free(db);
+        break;
+    }
+    case Firewire_Read_Block: 
+    case Firewire_Read_Quadlet: {
+        ack = Firewire_Ack_Pending;
+        local uint16 data_length;
+        if (tcode == Firewire_Read_Block) {
+            data_length = fw_extract_data_length(packet);
+        } else {
+            data_length = 4;
+        }
+        local uint8 *buf = new uint8[data_length];
+        call $pci_data_from_memory(Sim_Addr_Space_Memory, buf, address,
+                                   data_length) -> (ex);
+        local dbuffer_t *response = new_dbuffer();
+        local uint8 *bytes = dbuffer_append(response, sizeoftype(async_packet_t));
+        local async_packet_t *res = cast(bytes, async_packet_t *);
+        memset(res, 0, sizeof *res);
+        res->destination_id = fw_extract_source_id(packet);
+        res->h.label = fw_extract_label(packet); 
+        res->h.rt = 0;
+        res->h.tcode = tcode == Firewire_Read_Block
+            ? Firewire_Read_Block_Response
+            : Firewire_Read_Quadlet_Response;
+        res->source_id = fw_extract_destination_id(packet);
+        if (ex == Sim_PE_No_Exception) {
+            if (tcode == Firewire_Read_Block) {
+                res->quadlet.data_length = data_length;
+                res->quadlet.extended_tcode = 0;
+                local uint8 *payload = dbuffer_append(response,
+                                                      ((data_length + 3) &~3));
+                memset(payload, 0, ((data_length + 3) & ~3));
+                call $copy_quadlets(payload, buf, data_length);
+                call $add_crc(response);
+            } else {
+                local uint32 q = cast(buf, le_quadlet_t *)->q;
+                res->quadlet = ($ohci.HCControl.reg.noByteSwapData == 0)
+                    ? SWAB32(q)
+                    : q;
+            }
+        } else {
+            res->addrh.rcode = Firewire_Response_Address_Error;
+            res->quadlet = 0;
+            if (tcode == Firewire_Read_Block) {
+                call $add_crc(response);
+            }
+        }
+        inline $firewire_bus.transfer_after_delay(0, response);
+        delete buf;
+        break;
+    }
+    default:
+        ack = Firewire_Ack_Pending;
+        assert false;
+    }
+}
+
+method will_allow_async_request(dbuffer_t *packet) -> (bool allow) {
+    local uint6 tcode = fw_extract_tcode(packet);
+    allow = false;
+    local uint16 source_id = fw_extract_source_id(packet);
+    local uint6 node_id = source_id & 0x3f;
+    local uint10 bus_id = source_id >> 6;
+    if ((bus_id != 0x3ff)
+        && (bus_id != $firewire_config_registers.node_ids.bus_id)) {
+        /* Non-local source */
+        allow = ($ohci.AsyncRequestFilterHi.reg.asynReqAllBuses != 0);
+    } else if (node_id <= 31) {
+        local int s = 1 << node_id;
+        allow = (($ohci.AsyncRequestFilterLo.reg.asynReqResourceLo & s) != 0);
+    } else if (node_id < 63) {
+        local int s = 1 << (node_id - 32);
+        allow = (($ohci.AsyncRequestFilterHi.reg.asynReqResourceHi & s) != 0);
+    }
+}
+
+method will_allow_physical_memory_request(dbuffer_t *packet) -> (bool allow) {
+    local uint6 tcode = fw_extract_tcode(packet);
+    local uint48 address = fw_extract_address(packet);
+    allow = false;
+    if (address >= 0x100000000) {
+        return;
+    }
+    if ((tcode == Firewire_Lock)
+        || ((tcode == Firewire_Read_Block || tcode == Firewire_Write_Block)
+            && fw_extract_extended_tcode(packet) != 0)) {
+        return;
+    }
+    local uint16 source_id = fw_extract_source_id(packet);
+    local uint6 node_id = source_id & 0x3f;
+    local uint10 bus_id = source_id >> 6;
+    if ((bus_id != 0)
+        && (bus_id != $firewire_config_registers.node_ids.bus_id)) {
+        /* Non-local source */
+        allow = ($ohci.PhysicalRequestFilterHi.reg.physReqAllBuses != 0);
+    } else if (node_id <= 31) {
+        local int s = 1 << node_id;
+        allow = (($ohci.PhysicalRequestFilterLo.reg.physReqResourceLo & s)!=0);
+    } else if (node_id < 63) {
+        local int s = 1 << (node_id - 32);
+        allow = (($ohci.PhysicalRequestFilterHi.reg.physReqResourceHi & s)
+                 != 0);
+    }
+}
+
+method handle_request(dbuffer_t *packet) -> (firewire_ack_code_t ack) {
+    ack = Firewire_Ack_Type_Error;
+
+    if (is_fw_packet_size_correct(packet) == 0) {
+        ack = Firewire_Ack_Busy_X;
+        return;
+    }
+    
+    local uint48 address = fw_extract_address(packet);
+    /* Handle firewire config registers. These accesses are not filtered */
+    foreach r in ($csr_aliases.mapped_registers) {
+        if ((r.address) == address) {
+            call r.physical_request(packet) -> (ack);
+            return;
+        }
+    }
+
+    /* Access to config rom */
+    if (0xfffff0000400 <= address && address <= 0xfffff0000800) {
+        log unimpl: "physical access to config ROM not implemented";
+        return;
+    }
+
+    local bool allow;
+    call $will_allow_async_request(packet) -> (allow);
+    if (!allow) {
+        ack = Firewire_Ack_No_Ack;
+        return;
+    }
+
+    /* Accesses in the physical range */
+    call $will_allow_physical_memory_request(packet) -> (allow);
+    if (allow) {
+        call $handle_physical_memory_request(packet) -> (ack);
+        return;
+    }
+
+    log unimpl: "ARRQ context";
+}
+
+method update_channel_registrations {
+    call $firewire_bus.unregister_all_channels;
+    local int i;
+    for (i = 0; i < $ohci.IsoRecvCount; i++) {
+        call $ohci.IsoRecv[i].register_channels;
+    }
+}
+
+method firewire_handle_bus_reset(uint16 new_id, uint8 root_id,
+                                 uint32_array_t self_ids) {
+    inline $ohci.Int.raise_event($ohci.Int.busReset);
+    inline $ohci.Int.lower_event($ohci.Int.selfIDComplete);
+    
+    $firewire_config_registers.node_ids.offset_id = new_id;
+    $firewire_config_registers.state.gone = 0;
+    $ohci.NodeID.iDValid = 1;
+    $ohci.NodeID.root =
+        cast(root_id == $firewire_config_registers.node_ids.offset_id, uint1);
+    $ohci.NodeID.CPS = 1;
+    
+    /* TODO: Flush dma buffers which need flushing */
+
+    $ohci.SelfIDCount.selfIDGeneration++;
+    $ohci.SelfIDCount.selfIDError = 0;
+    inline $ohci.ARRS.insert_bus_reset($ohci.SelfIDCount.selfIDGeneration);
+
+    if ($ohci.LinkControl.reg.RcvSelfID == 0) return;
+    $ohci.SelfIDCount.selfIDSize = 1;
+
+    local int i;
+    for (i = 0; i < self_ids.len; i++) {
+        local self_id_packet_t self_id_pkt;
+        self_id_pkt.self_id = self_ids.data[i];
+        self_id_pkt.inv = ~self_ids.data[i];
+        local uint64 address = $ohci.SelfIDBuffer 
+            + $ohci.SelfIDCount.selfIDSize * 4;
+        local exception_type_t ex = 0;
+        log info, 3: "writing self_id packet 0x%x%x", self_id_pkt.self_id, self_id_pkt.inv;
+        call $pci_data_to_memory(Sim_Addr_Space_Memory, &self_id_pkt,
+                                  address, 8) -> (ex);
+        if (ex != Sim_PE_No_Exception) {
+            $ohci.SelfIDCount.selfIDError = 1;
+        }
+        /* Exactly how to continue after errors is undefined.
+           Here we just keep going. */
+        $ohci.SelfIDCount.selfIDSize += 2;
+    }
+    local uint32 self_id_header = 0;
+    self_id_header[23:16] = $ohci.SelfIDCount.selfIDGeneration;
+    call $ohci.Isocyctimer.get_timeStamp -> (self_id_header[15:0]);
+    local exception_type_t ex = 0;
+    log info, 3: "writing self_id header packet 0x%x", self_id_header;
+    call $pci_value_to_memory(Sim_Addr_Space_Memory, self_id_header,
+                              $ohci.SelfIDBuffer, 4) -> (ex);
+    /* TODO: What to do if the header write fails */
+    inline $ohci.Int.raise_event($ohci.Int.selfIDComplete);
+    inline $ohci.Int.raise_event($ohci.Int.selfIDComplete2);
+    log info, 2: "reset with %d self-id messages", ($ohci.SelfIDCount.selfIDSize - 1) >> 1;
+}
+
+method command_reset {
+    $firewire_config_registers.state.gone = 0;
+}
+
+/*
+ * Bank Declarations
+ */
+
+bank ohci {
+    register Version {
+        field revision [7:0] is (read_only) {
+            parameter hard_reset_value = 0x00;
+        }
+        field version [23:16] is (read_only) {
+            parameter hard_reset_value = 0x01;
+        }
+        field GUID_ROM [24] is (read_only) {
+            /* EEPROM not implemented */
+            parameter hard_reset_value = 0x0;
+        }
+    }
+
+    register GUID_ROM {
+        field rdData [23:16];
+        field rdStart [25];
+        field addrReset [31];
+    }
+
+    register ATRetries {
+        field maxATReqRetries [3:0];
+        field maxAtRespRetries [7:4];
+        field maxPhysRespRetries [11:8];
+        field cycleLimit [28:16] is (ignore_write);
+        field secondLimit [31:29] is (ignore_write);
+    }
+
+    register CSRData;
+    register CSRCompareData;
+    register CSRControl {
+        field csrSel [1:0];
+        field csrDone [31] is (ignore_write) {
+            parameter hard_reset_value = 1;
+        }
+        method after_write(mop) {
+            local uint32 old_value;
+            inline $get_csr_value($csrSel) -> (old_value);
+            if (old_value == $parent.CSRCompareData) {
+                inline $write_csr_value($csrSel, $parent.CSRData);
+            }
+            $parent.CSRData = old_value;
+        }
+
+        method get_csr_value(sel) -> (val) {
+            foreach r in ($csr_aliases.mapped_registers) {
+                if ((r.offset >> 2) == sel) {
+                    inline r.get -> (val);
+                    return;
+                }
+            }
+        }
+
+        method write_csr_value(sel, val) {
+            foreach r in ($csr_aliases.mapped_registers) {
+                if ((r.offset >> 2) == sel) {
+                    inline r.write_locally(val);
+                    return;
+                }
+            }
+        }
+    }
+
+    register ConfigRomHdr {
+        parameter hard_reset_value = 0x0;
+        field rom_crc_value [15:0];
+        field crc_length [23:16];
+        field info_length [31:24];
+    }
+
+    register BusID is (constant) {
+        parameter hard_reset_value = 0x31333934; /* '1394' */
+    }
+
+    register BusOptions {
+        parameter hard_reset_value = 0x0000a002;
+        field Lnk_spd[2:0] is (ignore_write);
+        field g[7:6];
+        field max_rec[15:12];
+        field cyc_clk_acc[23:16];
+        field pmc[27];
+        field bmc[28];
+        field isc[29];
+        field cmc[30];
+        field irmc[31];
+    }
+
+    register GUIDHi;
+    register GUIDLo;
+
+    register ConfigROMMap {
+        field configROMaddr[31:10];
+    }
+
+    register PostedWriteAddressLo {
+        field offsetLo[31:0];
+    }
+    register PostedWriteAddressHi {
+        field offsetHi[15:0];
+        field sourceID[31:16];
+    }
+
+    register VendorID;
+
+    group HCControl {
+        parameter set_mask = 0x404f0000;
+        parameter clear_mask = 0x40cf0000;
+        register reg {
+            field SoftReset[16] {
+                method write(value) {
+                    if (value == 1) {
+                        /* Reset the non-pci parts of the device */
+                        call $ohci.soft_reset;
+                        call $firewire_config_registers.soft_reset;
+                        call $csr_aliases.soft_reset;
+                        call $PHY.soft_reset;
+                    }
+                }
+            }
+            field linkEnable[17] {
+                method write(value) {
+                    if ((value == 1) && ($this == 0)) {
+                        call $firewire_bus.reset;
+                    }
+                }
+            }
+            field postedWriteEnable[18];
+            field LPS[19];
+            field aPhyEnhanceEnable[22];
+            field programPhyEnable[23];
+            field noByteSwapData[30];
+            field BIBimageValid[31];
+        }
+    }
+
+    register SelfIDBuffer {
+        parameter mask = 0xffffff00;
+        method write(value) {
+            $this = value & $mask;
+        }
+    }
+
+    register SelfIDCount {
+        field selfIDSize[10:2];
+        field selfIDGeneration[23:16];
+        field selfIDError[31];
+    }
+
+    group IRChannelMaskHi {
+        register reg {
+            method after_write(mop) {
+                call $update_channel_registrations;
+            }
+        }
+
+        method register_channels {
+            local int i;
+            for (i = 0; i < 32; i++) {
+                if (($reg & (1 << i)) != 0) {
+                    call $firewire_bus.register_channel(32 + i);
+                }
+            }
+        }
+    }
+
+    group IRChannelMaskLo {
+        register reg {
+            method after_write(mop) {
+                call $update_channel_registrations;
+            }
+        }
+
+        method register_channels {
+            local int i;
+            for (i = 0; i < 32; i++) {
+                if (($reg & (1 << i)) != 0) {
+                    call $firewire_bus.register_channel(i);
+                }
+            }
+        }
+    }
+    method channel_matches_channel_mask(uint6 channel) -> (bool match) {
+        local uint64 mask = (($IRChannelMaskHi.reg << 32)
+                             | $IRChannelMaskLo.reg);
+        match = ((1 << channel) & mask) != 0;
+    }
+
+    group Int {
+        parameter check_master_enable = true;
+
+        /* Available interrupts */
+        parameter reqTxComplete = 0x1;
+        parameter respTxComplete = 0x2;
+        parameter ARRQ = 0x4;
+        parameter ARRS = 0x8;
+        parameter RQPkt = 0x10;
+        parameter RSPkt = 0x20;
+        parameter isochTx = 0x40;
+        parameter isochRx = 0x80;
+        parameter postedWriteErr = 0x100;
+        parameter lockRespErr = 0x200;
+        parameter selfIDComplete2 = 0x8000;
+        parameter selfIDComplete = 0x10000;
+        parameter busReset = 0x20000;
+        parameter phy = 0x80000;
+        parameter cycleSynch = 0x100000;
+        parameter cycle64Seconds = 0x200000;
+        parameter cycleLost = 0x400000;
+        parameter cycleInconsistent = 0x800000;
+        parameter unrecoverableError = 0x1000000;
+        parameter cycleTooLong = 0x2000000;
+        parameter phyRegRcvd = 0x4000000;
+        parameter vendorSpecific = 0x40000000;
+
+        method raise {
+            log info, 2: "raising interrupt pin";
+            call $pci_raise_interrupt_pin($pci_config.interrupt_pin);
+        }
+        method lower {
+            log info, 2: "lowering interrupt pin";
+            call $pci_lower_interrupt_pin($pci_config.interrupt_pin);
+        }
+    }
+    group IsoXmitInt {
+        group event {
+            parameter set_mask = 0xff;
+            parameter clear_mask = 0xff;
+        }
+        group mask {
+            parameter set_mask = 0xff;
+            parameter clear_mask = 0xff;
+        }
+        method raise {
+            call $Int.raise_event($Int.isochTx);
+        }
+        method lower {
+            call $Int.lower_event($Int.isochTx);
+        }
+    }
+
+    group IsoRecvInt {
+        group event {
+            parameter set_mask = 0xf;
+            parameter clear_mask = 0xf;
+        }
+        group mask {
+            parameter set_mask = 0xf;
+            parameter clear_mask = 0xf;
+        }
+        method raise {
+            call $Int.raise_event($Int.isochRx);
+        }
+        method lower {
+            call $Int.lower_event($Int.isochRx);
+        }
+    }
+    
+    register FairnessControl {
+        field pri_req [7:0];
+    }
+
+    group LinkControl {
+        register reg {
+            field RcvSelfID[9];
+            field RcvPhyPkt[10] is (unimplemented);
+            field CycleTimerEnable[20] is (unimplemented);
+            field cycleMaster[21];
+            field cycleSource[22];
+        }
+    }
+
+    register NodeID {
+        field NodeNumber[5:0] is (field_alias) {
+            parameter target = $firewire_config_registers.node_ids.offset_id;
+        }
+        field BusNumber[15:6] is (field_alias) {
+            parameter target = $firewire_config_registers.node_ids.bus_id;
+        }
+        field CPS[27] is (ignore_write);
+        field root[30] is (ignore_write);
+        field iDValid[31] is (ignore_write);
+    }
+
+    register PhyControl {
+        field wrData[7:0];
+        field regAddr[11:8];
+        field wrReg[14];
+        field rdReg[15];
+        field rdData[23:16] is (ignore_write);
+        field rdAddr[27:24] is (ignore_write);
+        field rdDone[31] is (ignore_write);
+
+        method after_write(mop) {
+            local bool success = false;
+            if ($rdReg == 1) {
+                local uint64 wide_val;
+                inline $PHY.read_locally($regAddr, 1) -> (success, wide_val);
+                $rdData = wide_val;
+                inline $ohci.Int.raise_event($ohci.Int.phyRegRcvd);
+            } else if ($wrReg == 1) {
+                inline $PHY.write_locally($regAddr, 1, $wrData) -> (success);
+            }
+            if (!success)
+                log unimpl: "access to unimplemented PHY register %d", $regAddr;
+            $rdDone = 1;
+            $rdAddr = $regAddr;
+            $rdReg = 0;
+            $wrReg = 0;
+        }
+    }
+
+    register Isocyctimer {
+        field cycleOffset[11:0];
+        field cycleCount[24:12];
+        field cycleSeconds[31:25];
+        method get_timeStamp -> (uint16 timeStamp) {
+            timeStamp = (($cycleSeconds & 7) << 13) | $cycleCount;
+        }
+    }
+
+    group AsyncRequestFilterHi {
+        register reg {
+            field asynReqResourceHi[30:0];
+            field asynReqAllBuses[31];
+        }
+    }
+
+    group AsyncRequestFilterLo {
+        register reg {
+            field asynReqResourceLo[31:0];
+        }
+    }
+
+    group PhysicalRequestFilterHi {
+        register reg {
+            field physReqResourceHi[30:0];
+            field physReqAllBuses[31];
+        }
+    }
+
+    group PhysicalRequestFilterLo {
+        register reg {
+            field physReqResourceLo[31:0];
+        }
+    }
+    register PhysicalUpperBound is (zeros);
+
+    group ATRQ {
+        group ContextControl {
+            register reg {
+                method after_write(generic_transaction_t *memop) {
+                    /*
+                     * Process the entire descriptor list in one go since we
+                     * don't model the timing on the FireWire bus. This means
+                     * that active will never be set.
+                     */
+                    if ($dead == 1 || $run == 0) return;
+                    $active = 1;
+                    call $perform_dma_list;
+                    $active = 0;
+                }
+            }
+        }
+
+        method perform_descriptor_block {
+            local uint64 address = $CommandPtr.descriptorAddress << 4;
+            local bool last = false;
+            local at_desc_t desc;
+
+            call $read_descriptor(&desc, address, sizeof(desc));
+            if (desc.h.key != 2) inline $descriptor_error("key", address);
+            if (desc.h.cmd == 1) {
+                last = true;
+            }
+
+            local le_quadlet_t qs[4];
+            call $read_data(qs, address+16, sizeof(qs));
+            local dbuffer_t *packet = new_dbuffer();
+            inline $write_header(qs, desc.h.reqCount, address, packet);
+
+            address += 32;
+            /* Read block bodies into buffer */
+            local dbuffer_t *payload = new_dbuffer();
+            while (!last) {
+                local uint8 *buf;
+                call $read_descriptor(&desc, address, sizeof(desc));
+                if (desc.h.key != 0) inline $descriptor_error("key", address);
+                switch (desc.h.cmd) {
+                case 0:
+                    if (desc.h.b != 0)
+                        inline $descriptor_error("branch control", address);
+                    break;
+                case 1:
+                    if (desc.h.b != 0x3)
+                        inline $descriptor_error("branch control", address);
+                    last = true;
+                    break;
+                default:
+                    inline $descriptor_error("cmd code", address);
+                }
+                call $append_payload_block(desc, payload);
+                address += 16;
+            }
+
+            /* Pad the payload to an even number of quadlets */
+            local int payload_size = dbuffer_len(payload);
+            local int padding_size = ((payload_size + 3) & ~3) - payload_size;
+            local uint8 *buf = dbuffer_append(payload, padding_size);
+            memset(buf, 0, padding_size);
+
+            /* Swap payload if needed */
+            if ($ohci.HCControl.reg.noByteSwapData == 1) {
+                local uint8 *buf = dbuffer_update_all(payload);
+                local int i;
+                for (i = 0; i < dbuffer_len(payload); i += 4) {
+                    swab32_copy(&buf[i], &buf[i]);
+                }
+            }
+            if (dbuffer_len(payload) > 0)
+                call $add_crc(payload);
+            
+            /* Add payload to packet */
+            dbuffer_copy_append(packet, payload, 0, dbuffer_len(payload));
+            dbuffer_free(payload);
+
+            local firewire_ack_code_t ack = 0;
+            call $firewire_bus.transfer(packet) -> (ack);
+            switch (ack) {
+            case Firewire_Ack_No_Destination:
+            case Firewire_Ack_No_Ack:
+                $ContextControl.reg.eventcode = $evt_no_status;
+                break;
+            default:
+                $ContextControl.reg.eventcode = 0x10 | ack;
+            }
+            dbuffer_free(packet);
+
+            /* Write xferStatus and timeStamp */
+            local at_desc_status_t stat;
+            call $ohci.Isocyctimer.get_timeStamp -> (stat.timeStamp);
+            call $get_xferStatus -> (stat.xferStatus);
+            call $update_descriptor(address, cast(&stat, uint8*));
+
+            switch (desc.h.i) {
+            case 0:
+                break;
+            case 1:
+                if ((ack == Firewire_Ack_Complete)
+                    || (ack == Firewire_Ack_Pending)
+                    || (ack == Firewire_Ack_No_Ack)) {
+                    /* These ack codes shouldn't generate interrupts,
+                       but all others should */
+                    break;
+                }
+            case 3:
+                /* Raise interrupt */
+                call $ohci.Int.raise_event($ohci.Int.reqTxComplete);
+                break;
+            case 2:
+                log spec_viol: "invalid flag in descriptor at 0x%x", address;
+                break;
+            }
+            $CommandPtr.descriptorAddress = desc.commandPtr.branchAddress;
+            $CommandPtr.Z = desc.commandPtr.z;
+            inline $set_last_pointer_address(address+8);
+        }
+
+        method write_header(le_quadlet_t *qs, int reqCount, uint64 address,
+                            dbuffer_t *packet) {
+            local uint4 tCode = qs[0].q[7:4];
+
+            /* PHY packets are special */
+            if (tCode == 0xe) {
+                local uint8 *buf = dbuffer_append(packet, 8);
+                swab32_copy(buf, &qs[1]);
+                swab32_copy(&buf[4], &qs[2]);
+                return;
+            }
+
+            /* Fill in the sourceID and destinationID fields */
+            /* This also works for filling in the dataLength field of
+               stream packets */
+            local uint16 sourceID = 0;
+            if (qs[0].q[23] == 1) {
+                inline $firewire_config_registers.node_ids.get_node_id
+                    -> (sourceID);
+            } else {
+                sourceID = $firewire_config_registers.node_ids.offset_id
+                    | 0xffc0;
+            }
+            qs[0].q[31:16] = qs[1].q[31:16];
+            qs[1].q[31:16] = sourceID;
+            
+            /* Check how long the header should be and if it is consistent */
+            local int count;
+            switch (tCode) {
+            case Firewire_Read_Quadlet:
+            case Firewire_Write_Response:
+                if (reqCount != 16) inline $descriptor_error("reqCount",
+                                                             address);
+                count = 3;
+                break;
+            case Firewire_Streaming:
+                /* 2 quadlets in the descriptor, but only one on the bus */
+                if (reqCount != 8) inline $descriptor_error("reqCount",
+                                                            address);
+                count = 1;
+                break;
+            case 0xe:
+                /* Already handled above */
+                assert false;
+                break;
+            case Firewire_Read_Quadlet_Response:
+            case Firewire_Write_Quadlet:
+                if (reqCount != 16) inline $descriptor_error("reqCount",
+                                                             address);
+                count = 4;
+                qs[3].q = ($ohci.HCControl.reg.noByteSwapData == 0)
+                    ? SWAB32(qs[3].q)
+                    : qs[3].q;
+                /* Fall through */
+            default:
+                if (reqCount != 16) inline $descriptor_error("reqCount",
+                                                             address);
+                count = 4;
+                break;
+            }
+            local int i;
+            local uint8 *buf = dbuffer_append(packet, count * 4);
+            for (i = 0; i < count; i++) {
+                swab32_copy(&buf[i * 4], &qs[i]);
+            }
+            call $add_crc(packet);
+        }
+
+        method append_payload_block(at_desc_t desc, dbuffer_t *payload) {
+            local uint8 *buf = dbuffer_append(payload, desc.h.reqCount);
+            memset(buf, 0, desc.h.reqCount);
+            call $read_data(buf, desc.dataAddress, desc.h.reqCount);
+        }
+
+        method perform_dma_list {
+            /*
+             * Z-error handling here since it is the same for all contexts
+             */
+            if ($CommandPtr.Z == 1 || $CommandPtr.Z > $z_max) {
+                $ContextControl.reg.dead = 1;
+                $ContextControl.reg.eventcode = $evt_unknown;
+            }
+            try {
+                while ($CommandPtr.Z > 1) {
+                    inline $perform_descriptor_block;
+                }
+            } catch {
+                $ContextControl.reg.dead = 1;
+                call $ohci.Int.raise_event($ohci.Int.unrecoverableError);
+            }
+        }
+    }
+    group ARRS is (buffer_fill_receive_context) {
+        parameter packetCompleteEvent = $ohci.Int.RSPkt;
+        parameter bufferCompleteEvent = $ohci.Int.ARRS;
+        group ContextControl {
+            register reg {
+                method after_write(generic_transaction_t *memop) {
+                    if ($dead == 1 || $run == 0) {
+                        $active = 0;
+                    } else {
+                        $active = 1;
+                    }
+                }
+            }
+        }
+        method handle_response(dbuffer_t *packet)
+            -> (firewire_ack_code_t ack) {
+            if ($ohci.ARRS.ContextControl.reg.active == 0) {
+                /* TODO: What should happen here */
+                ack = Firewire_Ack_Busy_X;
+                return;
+            }
+            if (is_fw_packet_size_correct(packet) == 0) {
+                /*
+                  Since we fail here later code can rely on the dbuffer being
+                  the right size when it parses the header.
+                */
+                ack = Firewire_Ack_Busy_X;
+                return;
+            }
+            local int header_size;
+            local int body_size;
+            inline $get_packet_sizes(packet) -> (header_size, body_size);
+
+            /* buffer = header, body and trailer */
+            local int packet_size = header_size + body_size + 4;
+            local uint8 *packet_data = new uint8[packet_size];
+            
+            inline $construct_packet(packet, packet_data, header_size,
+                                     body_size);
+
+            try {
+                inline $write_response_packet(packet_data, packet_size);
+                ack = Firewire_Ack_Complete;
+            } catch {
+                /*
+                 * It's not really specified what should happen if receiving
+                 * a response fails.
+                 */
+                $ContextControl.reg.dead = 1;
+                $ContextControl.reg.active = 0;
+                call $ohci.Int.raise_event($ohci.Int.unrecoverableError);
+                ack = Firewire_Ack_Busy_X;
+            }
+            delete packet_data;
+        }
+
+        method get_packet_sizes(dbuffer_t *packet) -> (int header_size,
+                                                       int body_size) {
+            local int expected_size;
+            switch (fw_extract_tcode(packet)) {
+            case Firewire_Write_Response:
+                header_size = 12;
+                body_size = 0;
+                return;
+            case Firewire_Read_Quadlet_Response:
+                header_size = 16;
+                body_size = 0;
+                return;
+            case Firewire_Read_Block_Response:
+            case Firewire_Lock_Response:
+                header_size = 16;
+                body_size = (fw_extract_data_length(packet) + 3) & ~3;
+                return;
+            default:
+                assert false;
+            }
+        }
+
+        method construct_packet(dbuffer_t *packet, uint8 *dest,
+                                int header_size, body_size) {
+            local const uint8 *buf = dbuffer_read(packet, 0, header_size);
+            local int i;
+            for (i = 0; i < header_size; i += 4) {
+                swab32_copy(&dest[i], &buf[i]);
+            }
+            if ($ohci.HCControl.reg.noByteSwapData == 0) {
+                if (fw_extract_tcode(packet) == Firewire_Read_Quadlet_Response)
+                {
+                    swab32_copy(&dest[12], &dest[12]);
+                }
+            }
+            buf = dbuffer_read(packet, header_size + 4, body_size);
+            call $copy_quadlets(&dest[header_size], buf, body_size);
+            call $write_trailer(&dest[header_size + body_size]);
+        }
+
+        method insert_bus_reset(uint8 generation) {
+            if ($ContextControl.reg.active == 0) return;
+            local uint8 packet[16];
+            packet[0] = 0xe0;
+            packet[10] = generation;
+            packet[14] = 0x09;
+            try {
+                inline $write_response_packet(packet, sizeof(packet));
+            } catch {
+                /*
+                 * It's not really specified what should happen if receiving
+                 * a response fails.
+                 */
+                $ContextControl.reg.dead = 1;
+                $ContextControl.reg.active = 0;
+                call $ohci.Int.raise_event($ohci.Int.unrecoverableError);
+            }
+        }
+        method raise_events(uint32 events) {
+            inline $ohci.Int.raise_event(events);
+        }
+    }
+    group IsoXmit[8] {
+        group ContextControl {
+            register reg {
+                field cycleMatch[30:16];
+                field cycleMatchEnable[31];
+            }
+        }
+        /*
+         * It feels strange that this register is read only. How do you set the
+         * context command pointer?
+         */
+        register CommandPtr is (read_only);
+    }
+
+    parameter IsoRecvCount = 4;
+    group IsoRecv[$IsoRecvCount] is (buffer_fill_receive_context) {
+        parameter packetCompleteEvent = (1 << $i);
+        parameter bufferCompleteEvent = 0;
+        group ContextControl {
+            register reg {
+                field bufferFill[31];
+                field isochHeader[30];
+                field cycleMatchEnable[29] is (unimplemented);
+                field multiChanMode[28];
+                method after_write(mop) {
+                    if ($dead == 1 || $run == 0) {
+                        $active = 0;
+                    } else {
+                        $active = 1;
+                    }
+                    if (($bufferFill != 1) && ($active == 1)) {
+                        log unimpl: "Packet-per-Buffer Mode";
+                    }
+                    call $update_channel_registrations;
+                }
+            }
+
+        }
+        register CommandPtr;
+
+        register ContextMatch {
+            field tags[31:28];
+            field cycleMatch[26:12] is (unimplemented);
+            field sync[11:8] is (unimplemented);
+            field tag1SyncFilter[6] is (unimplemented);
+            field channelNumber[5:0];
+
+            method after_write(mop) {
+                call $update_channel_registrations;
+            }
+        }
+
+        method register_channels {
+            if ($ContextControl.reg.active == 0) return;
+            if ($ContextControl.reg.multiChanMode == 1) {
+                call $ohci.IRChannelMaskLo.register_channels;
+                call $ohci.IRChannelMaskHi.register_channels;
+            } else {
+                call $firewire_bus.register_channel(
+                    $ContextMatch.channelNumber);
+            }
+        }
+
+        method handle_packet(dbuffer_t *packet) {
+            if ($ContextControl.reg.active == 0) {
+                log info, 4: "context %d not active", $i;
+                return;
+            }
+            if (is_fw_packet_size_correct(packet) == 0) {
+                /* The packet has the wrong length */
+                log info, 2: "skipping streaming packet with wrong length";
+                return;
+            }
+            /* Check the channel of the packet */
+            local uint6 channel = fw_extract_channel(packet);
+            if ($ContextControl.reg.multiChanMode == 0) {
+                if ($ContextMatch.channelNumber != channel) {
+                    log info, 4: "packet not handled by %d, wrong channel", $i;
+                    return;
+                }
+            } else {
+                local bool match;
+                call $channel_matches_channel_mask(channel) -> (match);
+                if (!match) {
+                    log info, 4: "packet not handled by %d, wrong channel", $i;
+                    return;
+                }
+            }
+            /* Check the tag of the packet */
+            local uint2 tag = fw_extract_tag(packet);
+            local uint4 shifted_tag = 1 << tag;
+            if ((shifted_tag & $ContextMatch.tags) == 0) {
+                    log info, 4: "packet not handled by %d, wrong tag", $i;
+                return;
+            }
+            log info, 3: "handling streaming packet in context %d", $i;
+
+            local uint16 data_length = fw_extract_iso_data_length(packet);
+            local uint16 payload_length = (data_length + 3) & ~3;
+
+            /* Create buffer for the packet */
+            local int buffer_length = $ContextControl.reg.isochHeader
+                ? payload_length + 8
+                : data_length;
+            local uint8 *buffer = new uint8[buffer_length];
+            local int offset = 0;
+            if ($ContextControl.reg.isochHeader == 1) {
+                local const uint8 *header = dbuffer_read(packet, 0, 4);
+                swab32_copy(buffer, header);
+                offset = 4;
+            }
+            local const uint8 *payload
+                = dbuffer_read(packet, 8, payload_length);
+            call $copy_quadlets(&buffer[offset], payload, payload_length);
+            if ($ContextControl.reg.isochHeader == 1) {
+                /* Add trailer */
+                call $write_trailer(&buffer[buffer_length - 4]);
+            }
+            /* Write the buffer to the destination */
+            try {
+                inline $write_response_packet(buffer, buffer_length);
+            } catch {
+                /*
+                 * It's not really specified what should happen if receiving
+                 * a response fails.
+                 */
+                $ContextControl.reg.dead = 1;
+                $ContextControl.reg.active = 0;
+                call $ohci.Int.raise_event($ohci.Int.unrecoverableError);
+            }
+            delete buffer;
+        }
+        method raise_events(uint32 events) {
+            inline $ohci.IsoRecvInt.raise_event(events);
+        }
+    }
+}
+
+bank firewire_config_registers {
+    register bus_manager_id {
+
+    }
+
+    register bandwidth_available {
+        parameter hard_reset_value = ~0;
+    }
+
+    register channels_available_hi {
+        parameter hard_reset_value = ~0;
+    }
+
+    register channels_available_lo {
+        parameter hard_reset_value = ~0;
+    }
+
+}
+
+bank csr_aliases {
+        register bus_manager_id is (register_alias,
+                                    locally_accessible_register,
+                                    bus_configurable_register) {
+        parameter target = $firewire_config_registers.bus_manager_id;
+        parameter address = 0xfffff000021c;
+    }
+    register bandwidth_available is (register_alias,
+                                     locally_accessible_register,
+                                     bus_configurable_register) {
+        parameter target = $firewire_config_registers.bandwidth_available;
+        parameter address = 0xfffff0000220;
+    }
+    register channels_available_hi is (register_alias,
+                                       locally_accessible_register,
+                                       bus_configurable_register) {
+        parameter target = $firewire_config_registers.channels_available_hi;
+        parameter address = 0xfffff0000224;
+    }
+    register channels_available_lo is  (register_alias,
+                                        locally_accessible_register,
+                                        bus_configurable_register) {
+        parameter target = $firewire_config_registers.channels_available_lo;
+        parameter address = 0xfffff0000228;
+    }
+}

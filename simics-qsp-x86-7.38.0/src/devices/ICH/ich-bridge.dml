@@ -1,0 +1,215 @@
+/*
+  ich-bridge.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "pci/pcie-to-pci.dml";
+import "simics/devs/signal.dml";
+
+parameter forward_io                = true;
+parameter forward_mem               = true;
+parameter forward_prefetchable      = true;
+parameter forward_prefetchable64    = true;
+
+port pltrst {
+    implement signal {
+        method signal_raise() {
+            $secondary_bus.pci_bus.bus_reset();
+        }
+        method signal_lower() {
+        }
+    }
+}
+
+bank pci_config {
+    register vendor_id { parameter hard_reset_value = 0x8086; }
+    register status {
+        field c {
+            parameter hard_reset_value = 1;
+        }
+    }
+    register class_code       { parameter interface = 0x1; }
+    register capabilities_ptr { parameter hard_reset_value = 0x50; }
+
+    register base_address_0 @ 0x10 is (no_base_address_32);
+    register base_address_1 @ 0x14 is (no_base_address_32);
+
+    register spdh  size 2 @ 0x40 "Secondary PCI Device Hiding Register";
+    register dtc   size 4 @ 0x44 "Delayed Transaction Control";
+    register bps   size 4 @ 0x48 "Bridge Proprietary Status";
+    register bpc   size 4 @ 0x4C "Bridge Policy Configuration";
+    register svcap size 2 @ 0x50 "Subsystem Vendor Capability Pointer";
+    register svid  size 4 @ 0x54 "Subsystem Vendor IDs";
+
+    //details
+    register spdh {
+        field HD3[3] is (unimplemented) "Hide Device 3";
+        field HD2[2] is (unimplemented) "Hide Device 2";
+        field HD1[1] is (unimplemented) "Hide Device 1";
+        field HD0[0] is (unimplemented) "Hide Device 0";
+    }
+
+    register dtc {
+        field DDT[31]  is (unimplemented) "Discard Delayed Transaction";
+        field BDT[30]  is (unimplemented) "Block Delayed Transaction";
+        field MDT[7:6] is (unimplemented) "Maximum Delayed Transactions";
+        field AFADE[4] is (unimplemented) "Auto Flush After Disconnect Enable";
+        field NP[3]    is (unimplemented) "Never Prefetch";
+        field MRMPD[2] is (unimplemented)
+                "Memory Read Multiple Prefetch Disable";
+        field MRLPD[1] is (unimplemented) "Memory Read Line Prefetch Disable";
+        field MRPD[0]  is (unimplemented) "Memory Read Prefetch Disable";
+    }
+
+    register bps {
+        field PAD[16] is (read_write) "PERR# Assertion Detected" {
+            method write(value) {
+                $this = 0;
+            }
+        }
+        field NPT[6:4] is (read_only) "Number of Pending Transactions";
+        field NAT[1:0] is (read_only) "Number of Active Transactions";
+    }
+
+    register bpc {
+        field URLT[13:8] is (unimplemented) "Upstream Read Latency Threshold";
+        field SDP[7]     is (unimplemented) "Subtractive Decode Policy";
+        field PSE[6]     is (unimplemented) "PERR#-to-SERR# enable";
+        field SDTT[5]    is (unimplemented) "Secondary Discard Timer Testmode";
+        field PDE[2]     is (unimplemented) "Peer Decode Enable";
+        field RTAE[0]    is (unimplemented)
+                "Received Target Abort SERR# Enable";
+    }
+
+    register svcap is (read_only) { parameter hard_reset_value = 0x000d; }
+    register svid {
+        method write(value) {
+            if ($write_svid == 0) {
+                $this = value;
+                $write_svid = 1;
+            }
+        }
+    }
+    register write_svid size 1 "SVID Wrote Once" { is unmapped; }
+}
+
+method remap_memory() {
+    local uint64 mem_base;
+    local uint64 mem_limit;
+    local uint64 pref_base;
+    local uint64 pref_limit;
+    local uint64 highest;
+    local uint64 highest32 = 0xffffffff;
+    local map_pair_t map_pair[3];
+    local int num_mappings = 0;
+
+    local int i;
+    local uint64 prev_end = 0;
+
+    if (!$forward_mem) return;
+
+    highest = $forward_prefetchable64 ? 0xffffffffffffffff : 0xffffffff;
+
+    inline $remove_memory();  // also verifies that both busses are connected
+
+    /* check if memory mappings are enabled */
+    if ($pci_config.command.mem == 0)
+        return;
+
+    mem_base  = $pci_config.memory_base.addr << 20;
+    mem_limit = ($pci_config.memory_limit.addr << 20) | 0xFFFFF;
+
+    pref_base  = $pci_config.prefetchable_base.addr << 20;
+    pref_limit = ($pci_config.prefetchable_limit.addr << 20) | 0xFFFFF;
+
+    if ($forward_prefetchable64) {
+        pref_base  |= cast($pci_config.prefetchable_base_upper,  uint64) << 32;
+        pref_limit |= cast($pci_config.prefetchable_limit_upper, uint64) << 32;
+    }
+
+    if ((mem_limit > mem_base) && (mem_limit > 0xFFFFF) && $forward_mem) {
+
+        call $map_downstream(Sim_Addr_Space_Memory,
+                             mem_base, mem_limit - mem_base,
+                             DOWNSTREAM_MEM);
+
+        map_pair[num_mappings].base = mem_base;
+        map_pair[num_mappings].limit = mem_limit;
+        num_mappings++;
+    }
+
+    if ((pref_limit > pref_base) && (pref_limit > 0xFFFFF) && $forward_prefetchable) {
+
+        call $map_downstream(Sim_Addr_Space_Memory,
+                             pref_base, pref_limit - pref_base,
+                             DOWNSTREAM_PREF);
+
+        map_pair[num_mappings].base = pref_base;
+        map_pair[num_mappings].limit = pref_limit;
+        num_mappings++;
+    }
+
+    if ($pci_config.bridge_control.vgae == 1) {
+        call $map_downstream(Sim_Addr_Space_Memory, 0xa0000, 
+                             0xbffff - 0xa0000 + 1, DOWNSTREAM_MEM_VGA);
+        map_pair[num_mappings].base = 0xa0000;
+        map_pair[num_mappings].limit = 0xbffff;
+        num_mappings++;
+    }
+
+    if (num_mappings == 0) {
+        /* fake mapping since we can't map one 64-bit length */
+        map_pair[num_mappings].base = highest32 + 1;
+        map_pair[num_mappings].limit = highest32;
+        num_mappings++;
+    }
+
+    assert(num_mappings <= 3);
+
+    if (!$forward_prefetchable && !$forward_mem)
+        return;
+        
+    /* now create upstream mappings in the holes */
+
+    /* only upstream if master enable set */
+    if ($pci_config.command.m == 0)
+        return;
+
+    // sort the mappings by base
+    if (num_mappings > 1) {
+        if (map_pair[0].base > map_pair[1].base)
+            inline $swap_map_pair(&map_pair[0], &map_pair[1]);
+        if (num_mappings > 2) {
+            if (map_pair[1].base > map_pair[2].base) {
+                inline $swap_map_pair(&map_pair[1], &map_pair[2]);
+                if (map_pair[0].base > map_pair[1].base)
+                    inline $swap_map_pair(&map_pair[0], &map_pair[1]);
+            }
+        }
+    }
+
+    for (i = 0; i < num_mappings; i++) {
+        if (prev_end < map_pair[i].base)
+            call $map_upstream(Sim_Addr_Space_Memory,
+                               prev_end, map_pair[i].base - prev_end,
+                               UPSTREAM_MEM_1);
+        prev_end = map_pair[i].limit + 1;
+    }
+    if (prev_end < highest) {
+        call $map_upstream(Sim_Addr_Space_Memory,
+                           prev_end, highest - prev_end + 1,
+                           UPSTREAM_MEM_2);
+    }
+}

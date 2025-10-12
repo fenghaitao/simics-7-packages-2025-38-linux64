@@ -1,0 +1,223 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+  p-button : A button in DML
+
+  Configured using
+  - x, y
+  - p-output-image object that holds images, connected over uint64_state
+    - Image #0: idle state
+    - Image #1: activated state
+    (size of image retrieved from the object)
+  - object to signal button presses to 
+ 
+  Note: to fake a button press to test the model, use the p_control_button
+  interface and send in a start_press() followed by an end_press()
+    running> @conf.machine.training_card.panel.controls.button_a.port.control.iface.p_control_button.start_press()
+    running> @conf.machine.training_card.panel.controls.button_a.port.control.iface.p_control_button.end_press()
+
+*/
+
+dml 1.4;
+
+device p_button;
+
+param desc = "panel button";
+
+param documentation = "Button for use in the display panel.";
+
+import "utility.dml";
+
+import "simics/simulator-api.dml";
+import "simics/model-iface/state.dml"; 
+
+import "p-control-button-interface.dml";
+import "p-image-properties-interface.dml";
+
+
+//----------------------------------------------------------------------
+//
+// Extent in the drawing canvas: X, Y, width, height
+// 
+// All values retrieved from the connected output image
+// Only cached here. 
+//
+//----------------------------------------------------------------------
+
+template report_uint64_attr {
+    session uint64 val;
+    is (read_only_attr);
+    param type= "i";          
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(this.val);
+    }        
+}
+
+attribute width  is (report_uint64_attr) "Width of button";
+attribute height is (report_uint64_attr) "Height of button";
+attribute x is (report_uint64_attr) "X coordinate of the button";
+attribute y is (report_uint64_attr) "Y coordinate of the button";
+
+
+//----------------------------------------------------------------------
+//
+// Connect to the p-output-image
+//   Use fixed roles for images number 0 (idle) and 1 (active)
+// 
+//----------------------------------------------------------------------
+
+connect output_image  {
+    param desc = "p-output-image object to use to draw the button";
+    param configuration = "optional";
+    param internal = false; 
+    interface uint64_state; 
+    interface p_image_properties;
+
+    method set_idle_state() {
+        if(obj) {
+            log info, 3 : "Driving button image to idle state";            
+            uint64_state.set(0);
+        } else {
+            log error : "No image object configured (%s)", this.qname;
+        }
+    }
+
+    method set_active_state() {
+        if(obj) {
+            log info, 3 : "Driving button image to active state";            
+            uint64_state.set(1);
+        } else {
+            log error : "No image object configured (%s)", this.qname;
+        }
+    }
+
+    method get_output_image_extents() -> () {
+        if(this.obj != NULL) {
+            // Change cached values
+            x.val = p_image_properties.get_x();
+            y.val = p_image_properties.get_y();
+            width.val = p_image_properties.get_width();
+            height.val = p_image_properties.get_height();
+            log info, 3 : "Retrieved extents from output image: x=%d y=%d width=%d height=%d",
+                          x.val, y.val, width.val, height.val;            
+        } else {
+            log info, 3 : "No output-image configured, cannot get extents!";
+            x.val = 0;
+            y.val = 0;            
+            width.val  = 0;
+            height.val = 0;        
+        }
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Connect to the signal target
+// - On a completed button press, send signal raise and then lower
+//   to the connected object 
+// 
+//----------------------------------------------------------------------
+
+connect output  {
+    param desc = "output via signal";
+    param configuration = "optional";
+    param internal = false; 
+    interface signal; 
+
+    // Signal that we got a button press
+    //   With a bit of safey
+    method signal_button_pressed() {
+        if(obj) {
+            log info, 2 : "Raising button press signal";            
+            signal.signal_raise();
+            signal.signal_lower();
+        } else {
+            log info, 3 : "No object to signal to (%s)", this.qname;
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// The button control interface
+// 
+//----------------------------------------------------------------------
+port control {
+    implement p_control_button {
+
+        // Is this a hit in this button?
+        method hit(int px, int py) -> (bool) {
+            if(px < x.val) return false;
+            if(py < y.val) return false;            
+            if(px >= x.val + width.val) return false;
+            if(py >= y.val + height.val) return false;            
+            log info, 3 : "Hit in this button (coordinate %d,%d)!", px, py;            
+            return true;
+        }
+
+        // Set up the initial state of the button
+        method initial_state() {  
+            log info, 3 : "initial state called";                        
+            output_image.set_idle_state();
+        }
+
+        // A button press process is starting targeting this button.
+        // Set button graphics to active
+        method start_press() {  
+            log info, 3 : "start press called";                        
+            output_image.set_active_state();
+        }
+
+        // The press ended and we take action!
+        method end_press() {
+            log info, 3 : "End press called";            
+            output_image.set_idle_state();        // look to idle
+            output.signal_button_pressed(); // kick it!  
+        }   
+
+        // The press was cancelled
+        method cancel_press() {
+            log info, 3 : "Cancel press called";            
+            output_image.set_idle_state();        // look to idle
+        }
+
+        // Still pressed, but mouse pointer moved outside 
+        method down_outside() {
+            log info, 3 : "Outside the button";                       
+            output_image.set_idle_state();        // set to idle
+        }
+
+        // Still pressed, and inside the button
+        method down_in() {
+            log info, 3 : "Inside the button";                       
+            output_image.set_active_state();        // set to active
+        }
+
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// post_init
+// - Called after all attributes have been set
+//   in this and other objects.  Safe to fetch size from
+//   output_image object.
+// 
+//----------------------------------------------------------------------
+
+method post_init () {
+    output_image.get_output_image_extents();
+}

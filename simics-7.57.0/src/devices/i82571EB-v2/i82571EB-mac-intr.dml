@@ -1,0 +1,29 @@
+/*
+  i82571EB-mac-intr.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+param ITR_UNIT = 2.56e-7; /* 256 ns */
+
+param INTR_TXDW   = 1 << 0;  // Transmit Descriptor Written Back
+param INTR_TXQE   = 1 << 1;  // Transmit Queue Empty
+param INTR_LSC    = 1 << 2;  // Link Status Change
+param INTR_RXDMT0 = 1 << 4;  // Receive Descriptor Minimum Threshold Hit
+param INTR_RXO    = 1 << 6;  // Receive Overrun
+param INTR_RXT0   = 1 << 7;  // Receive Timer Interrupt
+param INTR_MDAC   = 1 << 9;  // MDI/O Access Complete
+param INTR_TXD_LOW = 1 << 15; // Transmit Descriptor Low Threshold Hit
+param INTR_SRPD   = 1 << 16; // Small Receive Packet Detected
+param INTR_ACK    = 1 << 17; // Receive ACK Frame Detected

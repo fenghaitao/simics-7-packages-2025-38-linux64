@@ -1,0 +1,1535 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "utility.dml";
+import "io-memory.dml";
+import "pci/pci-capabilities.dml";
+import "pci/pcix-capabilities.dml";
+import "pci/pcie-capabilities.dml";
+import "pci/msi-capabilities.dml";
+import "pci/pcie-common.dml";
+
+import "simics-api.dml";
+import "simics/devs/pci.dml";
+import "simics/devs/map-demap.dml";
+import "simics/devs/memory-space.dml";
+import "simics/devs/ram.dml";
+import "simics/util/bitcount.dml";
+
+import "simics/model-iface/transaction.dml";
+
+header %{
+    static const char *const irq_pin_name[] = {
+        "INT#A",
+        "INT#B",
+        "INT#C",
+        "INT#D"
+    };
+
+    #include <simics/util/bitcount.h>
+    #define convert_le64 CONVERT_LE64
+%}
+
+extern uint32 convert_le64(uint64 x);
+
+/* Constants and names used for raising/lowering interrupts via e.g.,
+   pci_raise_interrupt_pin. Not for use as values to the interrupt_pin
+   register, as they are off-by-one (i.e., INT#A is represented by 1). */
+extern const char *const *irq_pin_name;    //< Indexed by IRQ_PIN_[A-D]
+constant IRQ_PIN_A = 0;
+constant IRQ_PIN_B = 1;
+constant IRQ_PIN_C = 2;
+constant IRQ_PIN_D = 3;
+
+loggroup PCI_config;
+loggroup PCI_DMA;
+loggroup PCI_IRQ;
+
+template pci_common {
+    /* Set the pci_hotplug parameter to true if the device should support
+       hot-plugging. Setting pci_hotplug to true changes the configuration
+       parameter of the pci_bus from required to optional */
+    parameter pci_hotplug default false;
+
+    /* Should be set to true for PCI Express devices
+       (see also pcie_device template) */
+    parameter pcie_device default false;
+
+if ($pcie_device && $dev.simics_api_version != "6") {
+    error "The PCIe part of this library is deprecated, please use the new library dml-lib/pcie/*";
+}
+
+    /* list of config banks, for bus_reset */
+    parameter pci_config_bank default $pci_config;
+
+    is providing_pci_bus_connect;
+    is providing_expansion_rom_connect;
+    is providing_dma_methods;
+    is providing_legacy_interrupts;
+    is providing_pci_device_interface;
+
+    attribute config_registers {
+        parameter documentation
+            = "The PCI configuration registers, each 32 bits in size.";
+        parameter type = "[i*]";
+        parameter configuration = "pseudo";
+        parameter pci_config_size default 64;    /* not valid for PCI Express */
+
+        method get -> (attr_value_t value) {
+            local uint64 val;
+            local uint32 i;
+
+            value = SIM_alloc_attr_list($pci_config_size);
+
+            for (i = 0; i < $pci_config_size; ++i) {
+                inline $pci_config_bank.get(i * 4, 4) ->  (val);
+                SIM_attr_list_set_item(&value, i, SIM_make_attr_uint64(val));
+            }
+        }
+    }
+
+    attribute is_pcie_device {
+        parameter documentation = "Is this a PCIe device (or a PCI device)";
+        parameter configuration = "pseudo";
+        parameter type = "b";
+        parameter internal = true;
+        method get() -> (attr_value_t value) {
+            value = SIM_make_attr_boolean($pcie_device);
+        }
+    }
+}
+
+template pci_device {
+    is pci_common;
+    bank pci_config {
+        is pci_config_type_0;
+    }
+}
+
+template pcie_device {
+    is pci_device;
+    parameter pcie_device = true;
+}
+
+template pci_mf_device {
+    is pci_common;
+    parameter mf_banks;
+    parameter pci_config_bank = $mf_banks[0];
+
+    method pci_bus_disconnected() {
+        foreach bank in ($mf_banks) {
+            call bank.bus_reset();
+        }
+    }
+
+    implement pci_multi_function_device {
+        // Declared 'default' defensively, for compatibility (previously the
+        // interface had to be implemented manually). No reason to override.
+        method supported_functions() -> (attr_value_t list) default {
+            local int len = 0;
+            foreach _ in ($mf_banks) ++len;
+            list = SIM_alloc_attr_list(len);
+            local int i = 0;
+            foreach pf in ($mf_banks) {
+                local attr_value_t elem =
+                    SIM_make_attr_list(
+                        2,
+                        SIM_make_attr_uint64(pf.mf_fun), 
+                        SIM_make_attr_object(pf._non_anonymous_bank_obj()));
+                SIM_attr_list_set_item(&list, i, elem);
+                i++;
+            }
+        }
+    }
+}
+
+// Template to connect the device to a PCI bus, used by connect statements
+template pci_bus_connect {
+    interface pci_bus;
+    interface io_memory;
+    interface pci_upstream_operation {
+        // TODO: new interface is preferred over io_memory, but cannot be
+        // required right now as lots of python tests depend on io_memory
+        parameter required = false;
+    }
+}
+
+// Define the main PCI bus
+template providing_pci_bus_connect {
+    parameter pci_hotplug;
+    parameter pcie_device;
+    parameter pci_config_bank;
+
+    method require_pci_bus() {
+        if ($pci_hotplug && !$pci_bus.obj) {
+            log info, 2, PCI_config: 
+                "Trying to access the PCI bus of a hot-pluggable object that "
+                + " has not yet been plugged in";
+            throw;
+        }
+    }
+
+    method pci_bus_connected() default {
+        log info, 2, PCI_config: "connected to bus";
+    }
+
+    method pci_bus_disconnected() default {
+        inline $pci_config_bank.bus_reset();
+    }
+
+    connect pci_bus {
+        is pci_bus_connect;
+        parameter configuration = $pci_hotplug ? "optional" : "required";
+        parameter documentation = "The PCI bus this device is connected to,"
+            + " implementing the <tt>pci-bus</tt> interface.";
+
+        data map_target_t *upstream;
+
+if ($dev.simics_api_version == "6") {
+        // deprecated since 7, please use the new library dml-lib/pcie/*
+        interface pci_express {
+            parameter required = $pcie_device ? true : false; }
+}
+
+        method legacy_before_set() default {
+            // for existing 4.6 models that have added logic to the before_set
+            // method and don't want to re-write it in terms of
+            // pci_bus_disconnected (see pex86xx for example)
+        }
+
+        method before_set() {
+            inline $legacy_before_set();
+            if ($obj) {
+                log info, 2, PCI_config: "disconnected from bus";
+                call $pci_bus_disconnected();
+            }
+        }
+
+        method after_set() {
+            SIM_free_map_target($upstream);
+            $upstream = NULL;
+            if ($obj) {
+                if ($pcie_device) {
+                    local conf_object_t *upo =
+                        SIM_object_descendant($obj, "port.upstream");
+                    if (upo)
+                        $upstream = SIM_new_map_target(upo, NULL, NULL);
+                }
+                call $pci_bus_connected();
+            }
+        }
+    }
+}
+
+// Expansion ROM
+template providing_expansion_rom_connect {
+    connect expansion_rom {
+        parameter configuration = "optional";
+        interface rom;
+    }
+
+    attribute expansion_rom_size {
+        parameter documentation = "The size of the expansion ROM mapping.";
+        parameter configuration = "optional";
+        parameter allocate_type = "uint64";
+    }
+}
+
+// Allow writing the same value as the current value to a read only register.
+// This seems to be common practice (maybe this is because the software
+// makes 4 bytes accesses).
+template read_only_write_same_ignore {
+    is _reg_or_field;
+
+    method write(value) {
+        static uint8 log_level = 1;
+
+        if ($allocate) {
+            if (value != $this) {
+                log spec_viol, log_level, Register_Write:
+                    "Write to read-only register %s (value written = %#x,"
+                    + " contents = %#x).", $qname, value, $this;
+                log_level = 2;
+            }
+        } else {
+            local typeof(value) fval;
+            inline $get() -> (fval);
+            if (value != fval) {
+                log spec_viol, log_level, Register_Write:
+                    "Write to read-only register %s (value written = %#x,"
+                    + " contents = %#x).", $qname, value, fval;
+                log_level = 2;
+            }
+        }
+    }
+}
+
+// This template is intended to allow the firmware to customize proper
+// subsystem_id, subsystem_vendor_id etc. read-only registers value sometime,
+// e.g. during POST, by overriding their default writing behaviors.
+// Note that it only supports registers without fields definition.
+template read_only_custom_write {
+    method can_write(value) -> (bool yes) default {
+        if ($allocate) {
+            if (value == $this) {
+                yes = true;
+            } else {
+                yes = false;
+            }
+        } else {
+            local typeof(value) fval;
+            inline $get() -> (fval);
+            if (value == fval) {
+                yes = true;
+            } else {
+                yes = false;
+            }
+        }
+    }
+    method do_write(value) default {
+        if ($allocate) {
+            $this = value;
+        } else {
+            inline $set(value);
+        }
+    }
+    method write(value) {
+        local bool writable;
+        inline $can_write(value) -> (writable);
+        if (!writable) {
+            static uint8 log_level = 1;
+            local typeof(value) fval;
+            if ($allocate) {
+                fval = $this;
+            } else {
+                inline $get() -> (fval);            
+            }
+            log spec_viol, log_level, Register_Write:
+                "Write to read-only register %s (value written = %#x,"
+                + " contents = %#x).", $qname, value, fval;
+            log_level = 2;
+            return;
+        }
+        inline $do_write(value);
+    }
+}
+
+// Configuration register bank
+template pci_config_generic {
+    is _pci_config_generic;
+    parameter function = 255;
+}
+
+// This internal template is intended for multi-function devices 
+// _without_ bank function parameter set
+template _pci_config_generic {
+    parameter documentation = "The PCI configuration space.";
+    parameter overlapping = true;
+    parameter partial = true;
+
+    parameter byte_order = "little-endian";
+
+    parameter pci_miss_pattern default 0;
+    parameter miss_pattern = $pci_miss_pattern;
+
+    // Override if the device is not a busmaster
+    parameter busmaster           default true;
+
+    // Override if the device does not support I/O or mem access.
+    parameter io_capable          default true;
+    parameter mem_capable         default true;
+
+    // Override with correct list of enabled address base registers
+    parameter base_address_registers default [];
+
+    register vendor_id           size 2 @ 0x00 is (read_only_custom_write) {
+        parameter documentation = "Vendor ID";
+    }
+    register device_id           size 2 @ 0x02 is (read_only_custom_write) {
+        parameter documentation = "Device ID";
+    }
+    register command             size 2 @ 0x04 {
+        parameter documentation = "Command Register";
+        field io  [0:0]   is (read_write) "I/O Space Enable"; 
+        field mem [1:1]   is (read_write) "Memory Space Enable";
+        field m   [2:2]   is (read_write) "Bus Master Enable";
+        // TODO(ah): in PCIe, this bit must be 0 and RO (ignore_write)
+        field sc  [3:3]   is (read_write) "Special Cycle Enable";
+        // TODO(ah): in PCIe, this bit must be 0 and RO (ignore_write)
+        field mwi [4:4]   is (read_write) "Memory Write and Invalidate";
+        // TODO(ah): in PCIe, this bit must be 0 and RO (ignore_write)
+        field vga [5:5]   is (read_write) "VGA Palette Snoop";
+        field pe  [6:6]   is (read_write) "Parity Error Response";
+        // TODO(ah): in PCIe, this bit must be 0 and RO (ignore_write)
+        field wc  [7:7]   is (read_write) "IDSEL Steppin/Wait Cycle Control";
+        field se  [8:8]   is (read_write) "SERR# Enable";
+        // TODO(ah): in PCIe, this bit must be 0 and RO (ignore_write)
+        field fb  [9:9]   is (read_write) "Fast Back-to-Back Transactions Enable";
+        field id  [10:10] is (read_write) "Interrupt Disable";
+    }
+    register status              size 2 @ 0x06 {
+        parameter documentation = "Status Register";
+        field ir  [0:0]   is (ignore_write)   "Immediate Readiness";
+        field ins [3:3]   is (ignore_write)   "Interrupt Status";
+        field c   [4:4]   is (ignore_write)   "Capabilities List";
+        field mhz [5:5]   is (ignore_write)   "66 MHz Capable";
+        field fbb [7:7]   is (ignore_write)   "Fast Back-to-Back Transactions Capable";
+        field pe  [8:8]   is (write_1_clears) "Master Data Parity Error";
+        field ds  [10:9]  is (ignore_write)   "DEVSEL timing";
+        field sta [11:11] is (write_1_clears) "Signaled Target Abort";
+        field rta [12:12] is (write_1_clears) "Received Target Abort";
+        field rma [13:13] is (write_1_clears) "Received Master Abort";
+        field ssa [14:14] is (write_1_clears) "Signaled System Abort";
+        field dpe [15:15] is (write_1_clears) "Detected Parity Error";
+    }
+    register revision_id         size 1 @ 0x08 is (read_only_custom_write) {
+        parameter documentation = "Revision ID";
+    }
+    register class_code          size 3 @ 0x09 is (read_only_custom_write) {
+        parameter documentation = "Class Code";
+    }
+    register cache_line_size     size 1 @ 0x0c is (read_write) {
+        parameter documentation = "CacheLine Size";
+    }
+    register latency_timer       size 1 @ 0x0d is (read_write) {
+        parameter documentation = "Latency Timer";
+    }
+    register header_type         size 1 @ 0x0e {
+        parameter documentation = "Header Type";
+        field type [6:0] is (ignore_write) "Header Layout";
+        field mf   [7:7] is (ignore_write) "Multi-Function Device";
+    }
+    register bist                size 1 @ 0x0f is (read_write) {
+        parameter documentation = "Build-in Self Test";
+        // TODO(ah): for backwards compatibility, we cannot add the fields for
+        // this register
+        /*
+        field cc [3:0] is (ignore_write) "Completion Code";
+        field sb [6:6] is (read_write)   "Start BIST";
+        field bc [7:7] is (ignore_write) "BIST Capable";
+        */
+    }
+    register expansion_rom_base is (base_address) "Expansion ROM base address";
+    register capabilities_ptr    size 1 @ 0x34 is (constant) {
+        parameter documentation = "Capabilities Pointer";
+    }
+    register interrupt_line      size 1 @ 0x3c is (read_write) {
+        parameter documentation = "Interrupt Line";
+    }
+    register interrupt_pin       size 1 @ 0x3d is (read_only_custom_write) {
+        parameter documentation = "Interrupt Pin";
+    }
+
+    register interrupts size 1 {
+        parameter documentation = "Raised _internal_ interrupts";
+        parameter offset = undefined;
+        method hard_reset() {
+               call $pci_lower_all_pins();
+               call default;
+        }
+        method soft_reset() {
+               call $pci_lower_all_pins();
+               call default;
+        }
+    }
+
+    method irq_bridge_count(pin) -> (count) default {
+        // only used by bridges, default to 0
+        count = 0;
+    }
+
+    // Topological device ID used for memory transactions
+    register bus_address size 4 {
+        parameter offset = undefined;
+        parameter configuration = "pseudo";
+        parameter hard_reset_value = 0xffff_ffff;
+
+        method update() default {
+            // Set if not already set
+            if ($this == $hard_reset_value) {
+                if ($pci_bus.obj != NULL)
+                    $this = $pci_bus.pci_bus.get_bus_address($dev.obj);
+                else
+                    log info, 2, PCI_config:
+                        "Trying to access bus_address with the PCI bus"
+                        + " disconnected";
+            }
+        }
+    }
+
+    method remove_mappings(space_type) default {
+        log info, 3, PCI_config: "Removing %s mappings", space_type;
+        foreach reg in ($mapped_registers) {
+            foreach name in ($base_address_registers) {
+                if (reg.name == name)
+                    if (reg.map_type == space_type)
+                        call reg.remove_map();
+            }
+            if (reg.name == "expansion_rom_base")
+                if (reg.map_type == space_type)
+                    call reg.remove_map();
+        }
+    }
+
+    method update_mappings(space_type) default {
+        log info, 3, PCI_config: "Updating %s mappings", space_type;
+        foreach reg in ($mapped_registers) {
+            foreach name in ($base_address_registers) {
+                if (reg.name == name)
+                    if (reg.map_type == space_type)
+                        call reg.update_mapping();
+            }
+            if (reg.name == "expansion_rom_base")
+                if (reg.map_type == space_type)
+                    call reg.update_mapping();
+        }
+    }
+
+    method remove_all_mappings() default {
+        inline $remove_mappings("I/O");
+        inline $remove_mappings("memory");
+    }
+
+    method update_all_mappings() default {
+        inline $update_mappings("I/O");
+        inline $update_mappings("memory");
+    }
+
+    method bus_reset() default {
+        log info, 2, PCI_config: "Bus reset";
+        call $dev.soft_reset;
+        inline $update_all_mappings();
+        inline $secondary_bus_reset();
+    }
+
+    method secondary_bus_reset() default {
+        // only implemented by bridges that has a secondary bus to reset
+    }
+
+    // register implementation
+    register command {
+        parameter allocate = true;
+        // Disable writes to unimplemented bits (even if a device is io/mem capable)
+        parameter io_bit_implemented  default true;
+        parameter mem_bit_implemented default true;
+        parameter m_bit_implemented   default true;
+        parameter id_bit_implemented  default true;
+
+        field io {
+            method write(uint1 enable) {
+                if ($io_capable && $io_bit_implemented) {
+                    if ($this != enable) {
+                        $this = enable;
+                        inline $bank.update_mappings("I/O");
+                    }
+                }
+            }
+        }
+        field mem {
+            method write(uint1 enable) {
+                if ($mem_capable && $mem_bit_implemented) {
+                    if ($this != enable) {
+                        $this = enable;
+                        inline $bank.update_mappings("memory");
+                    }
+                }
+            }
+        }
+        field m {
+            method write(uint1 enable) {
+                if ($m_bit_implemented) {
+                    if (!$busmaster && enable) {
+                        log spec_viol, 1, PCI_config:
+                            "Enabling bus master, but this device doesn't support it";
+                        return;
+                    }
+                    $this = enable;
+                }
+            }
+        }
+        field id {
+            method write(uint1 value) {
+                if ($id_bit_implemented) {
+                    if ($this != value) {
+                        if (value == 1) {
+                            /* INTx interrupts disabled */
+                            $pci_lower_all_pins();
+                        }
+                        $this = value;
+                    }
+                }
+            }
+        }
+    }
+
+    register bist {
+        parameter allocate = false;
+        method get -> (value) {
+            value = 0;
+        }
+        method set(value) {
+            if (value != 0)
+                log unimpl, 1, PCI_config: "BIST is not implemented";
+        }
+        method read -> (value) {
+            value = 0;
+        }
+        method write(value) {
+            if (value != 0)
+                log unimpl, 1, PCI_config: "BIST is not implemented";
+        }
+    }
+    
+    register expansion_rom_base {
+        parameter enabled = true;
+        parameter min_size_bits default 1;
+        parameter map_type = "memory";
+        parameter size = 4;
+        parameter map_func = 0;
+
+        method update_mapping() default {
+            local bool enabled;
+
+            inline $this.remove_map;
+
+            inline $pci_mapping_enabled() -> (enabled);
+            if ($command.mem && enabled) {
+                inline $this.add_map;
+            }
+        }
+
+        field base[$base_msb:$min_size_bits] {
+            parameter documentation = "The base address";
+            method read() -> (value) {
+                if ($expansion_rom.obj && $expansion_rom_size != 0) {
+                    inline $get_base() -> (value);
+                } else {
+                    value = 0;
+                }
+            }
+            method write(value) {
+                if ($expansion_rom.obj && $expansion_rom_size != 0) {
+                    if ($this != value) {
+                        $this = value;
+                        inline $update_mapping();
+                    }
+                }
+            }
+        }
+
+        field e [0:0] {
+            parameter documentation = "Address decode enable";
+            method read() -> (value) {
+                if ($expansion_rom.obj && $expansion_rom_size != 0) {
+                    value = $this;
+                } else {
+                    value = 0;
+                }
+            }
+            method write(value) {
+                if ($expansion_rom.obj && $expansion_rom_size != 0) {
+                    if ($this != value) {
+                        $this = value;
+                        inline $update_mapping();
+                    }
+                }
+            }
+        }
+
+        method pci_bar_size_bits() -> (int bits) {
+            bits = log2_64($expansion_rom_size);
+        }
+
+        method pci_mapping_enabled() -> (bool enabled) {
+            enabled = $e && $expansion_rom.obj && $expansion_rom_size != 0;
+        }
+
+        method pci_mapping_object() -> (conf_object_t *obj) {
+            obj = $expansion_rom.obj;
+        }
+    }
+
+    method get_bytes(uint32 offset, uint32 size) -> (uint64 value) {
+        inline $get(offset, size) -> (value);
+    }
+
+    method pci_raise_interrupt() default {
+        call $pci_raise_interrupt_pin($interrupt_pin - 1);
+    }
+
+    method pci_lower_interrupt() default {
+        call $pci_lower_interrupt_pin($interrupt_pin - 1);
+    }
+
+    method pci_system_error() default {
+        /* only if SERR# enable in the command register */
+        if ($command.se == 1) {
+            if ($pci_bus.obj != NULL)
+                $pci_bus.pci_bus.system_error();
+            else
+                log info, 2, PCI_config:
+                    "Attempt to access system error with the PCI bus"
+                    + " disconnected";
+            $status.ssa = 1;
+        }
+    }
+}
+
+/* Type 0 base/internal template used below */
+template _pci_config_type_0 {
+    register cardbus_cis_ptr     size 4 @ 0x28 is (read_only_custom_write) {
+        parameter documentation = "Cardbus CIS Pointer";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+    }
+    register subsystem_vendor_id size 2 @ 0x2c is (read_only_custom_write) {
+        parameter documentation = "Subsystem Vendor ID";
+    }
+    register subsystem_id        size 2 @ 0x2e is (read_only_custom_write) {
+        parameter documentation = "Subsystem ID";
+    }
+    register min_gnt             size 1 @ 0x3e is (read_only_custom_write) {
+        parameter documentation = "MIN_GNT";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+    }
+    register max_lat             size 1 @ 0x3f is (read_only_custom_write) {
+        parameter documentation = "MAX_LAT";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+    }
+    register expansion_rom_base @ 0x30;
+}
+
+/* Type 0 Configuration (single function, or one PF per object instance) */
+template pci_config_type_0 {
+    is pci_config_generic; // with function number set
+    is _pci_config_type_0;
+}
+
+/* Type 0 Configuration (multi function, more than one PF per object instance) */
+template pci_config_type_0_mf {
+    is _pci_config_generic; // without function number set
+    is _pci_config_type_0;
+
+    parameter mf_fun default undefined;
+
+    register header_type {
+        field mf { parameter hard_reset_value = 1; }
+    }
+
+    register bus_address {
+        method update() {
+            if ($this == $this.hard_reset_value) {
+                if ($pci_bus.obj != NULL)
+                    $this = $pci_bus.pci_bus.get_bus_address($dev.obj)
+                    | ($dev.pcie_device ? $mf_fun << 12 : $mf_fun << 8);
+                else
+                    log info, 2, PCI_config:
+                        "Attempt to access bus_address with the PCI bus"
+                        + " disconnected";
+            }
+        }
+    }
+}
+
+/* Type 1 Configuration */
+template pci_config_type_1 {
+    is pci_config_generic;
+
+    register class_code {
+        // TODO: fix SIMICS-9271, remove these parameters
+        parameter class_code default 0x06;
+        parameter sub_class_code default 0x04;
+        parameter interface default 0x0;
+        parameter hard_reset_value = ($class_code << 16
+                                      | $sub_class_code << 8 | $interface);
+    }
+
+    register header_type {
+        field type { parameter hard_reset_value = 0x1; } // bridge header type
+    }
+
+    register primary_bus_number        size 1 @ 0x18 is (read_write) {
+        parameter documentation = "Primary Bus Number";
+    }
+    register secondary_bus_number      size 1 @ 0x19 is (read_write) {
+        parameter documentation = "Secondary Bus Number";
+    }
+    register subordinate_bus_number    size 1 @ 0x1a is (read_write) {
+        parameter documentation = "Subordinate Bus Number";
+    }
+    register secondary_latency_timer   size 1 @ 0x1b is (read_write) {
+        parameter documentation = "Secondary Latency Timer";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+    }
+    register io_base                   size 1 @ 0x1c {
+        parameter documentation = "I/O Base";
+        field type  [3:0] is (silent_constant);
+        field addr  [7:4] is (read_write);
+    }
+    register io_limit                  size 1 @ 0x1d {
+        parameter documentation = "I/O Limit";
+        field type [3:0] is (silent_constant);
+        field addr [7:4] is (read_write);
+    }
+
+    register secondary_status          size 2 @ 0x1e {
+        parameter documentation = "Secondary Status";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field mhz [5:5]   is (ignore_write)   "66 MHz Capable";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field fbb [7:7]   is (ignore_write)   "Fast Back-to-Back Transactions Capable";
+        field pe  [8:8]   is (write_1_clears) "Master Data Parity Error";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field ds  [10:9]  is (ignore_write)   "DEVSEL timing";
+        field sta [11:11] is (write_1_clears) "Signaled Target Abort";
+        field rta [12:12] is (write_1_clears) "Received Target Abort";
+        field rma [13:13] is (write_1_clears) "Received Master Abort";
+        // TODO(ah): rename field as 'rsa' if it's possible to create field aliases
+        field ssa [14:14] is (write_1_clears) "Received System Abort";
+        field dpe [15:15] is (write_1_clears) "Detected Parity Error";
+    }
+
+    register memory_base               size 2 @ 0x20 {
+        parameter documentation = "Memory Base";
+        field type  [3:0] is (silent_constant);
+        field addr [15:4] is (read_write);
+    }
+    register memory_limit              size 2 @ 0x22 {
+        parameter documentation = "Memory Limit";
+        field type  [3:0] is (silent_constant);
+        field addr [15:4] is (read_write);
+    }
+
+    register prefetchable_base         size 2 @ 0x24 {
+        parameter documentation = "Prefetchable Memory Base";
+        field sf    [3:0] is (silent_constant);
+        field addr [15:4] is (read_write);
+    }
+    register prefetchable_limit        size 2 @ 0x26 {
+        parameter documentation = "Prefetchable Memory Limit";
+        field sf    [3:0] is (silent_constant);
+        field addr [15:4] is (read_write);
+    }
+
+    register prefetchable_base_upper   size 4 @ 0x28 {
+        parameter documentation = "Prefetchable Memory Base Upper 32 Bits";
+    }
+    register prefetchable_limit_upper  size 4 @ 0x2c {
+        parameter documentation = "Prefetchable Memory Limit Upper 32 Bits";
+    }
+    register io_base_upper             size 2 @ 0x30 {
+        parameter documentation = "I/O Base Upper 16 Bits";
+    }
+    register io_limit_upper            size 2 @ 0x32 {
+        parameter documentation = "I/O Limit Upper 16 Bits";
+    }
+
+    register expansion_rom_base               @ 0x38;
+
+    register bridge_control            size 2 @ 0x3e {
+        parameter documentation = "Bridge Control";
+        field pere [0:0]   is (read_write) "Parity Error Response Enable";
+        field serr [1:1]   is (read_write) "SERR# Enable";
+        field isae [2:2]   is (read_write) "ISA Enable";
+        field vgae [3:3]   is (read_write) "VGA Enable";
+        field vga16d [4:4] is (read_write) "VGA 16-bit Decode";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field mam  [5:5]   is (read_write) "Master Abort Mode";
+        field sbr  [6:6]   is (read_write) "Secondary Bus Reset";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field fbbe [7:7]   is (read_write) "Fast Back-to-Back Transactions Enable";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field pdt  [8:8]   is (read_write) "Primary Discard Timer";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field sdt  [9:9]   is (read_write) "Secondary Discard Timer";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field dts  [10:10] is (read_write) "Discard Timer Status";
+        // TODO(ah): in PCIe, this register must be 0 and RO (ignore_write)
+        field dtse [11:11] is (read_write) "Discard Timer SERR# Enable";
+    }
+
+    register irq_pin_count[4] size 1 {
+        parameter documentation = "Forwarded interrupt count for bridges";
+        parameter offset = undefined;
+    }
+
+    method irq_bridge_count(pin) -> (count) {
+        count = $irq_pin_count[pin];
+    }
+}
+
+template base_address {
+    parameter enabled default false;         /* is this register used? */
+    parameter base_msb = $size == 8 ? 63 : 31;
+    parameter size_bits default $min_size_bits;
+    parameter map_type default undefined;
+    parameter map_bit = $map_type == "memory" ? 0 : 1;
+    parameter map_func default undefined;
+    parameter allocate = $enabled;
+    parameter configuration = $enabled ? "optional" : "pseudo";
+    parameter _resizable default false;
+
+    method pci_bar_size_bits() -> (int bits) default {
+        bits = $size_bits;
+    }
+
+    method pci_mapping_enabled() -> (bool enabled) default {
+        // default is always enabled
+        enabled = true;
+    }
+
+    method pci_mapping_object() -> (conf_object_t *obj) default {
+        // default is the PCI object itself
+        obj = $dev.obj;
+    }
+
+    method _get_bank_obj(conf_object_t *obj)
+        -> (conf_object_t *bank_obj, int function) {
+        // Before we had bank objects, we were forced to map the device itself
+        // into the memory space once for each BAR, distinguishing mappings by
+        // function numbers.  Therefore, our API for selecting bank uses the
+        // 'function' parameter to distinguish between banks.  However, since
+        // Simics 6 it is more natural to map the bank object directly.
+
+        // A BAR specifies target through the map_func parameter and
+        // pci_mapping_object() method; this method tries to re-interpret this
+        // to a bank object (with function 0) if possible.  The API allows the
+        // user to specify a non-zero function of a different object. This is
+        // not an intended use case, and we handle it defensively by leaving
+        // the mapping unchanged.
+        if (!defined($map_func)) {
+            // arbitrary fallback
+            bank_obj = obj;
+            function = 0;
+        } else if (obj == $dev.obj) {
+            select b in ($dev.banks) where (
+                defined b.function && b.function == $map_func && b.mappable) {
+                local int len = strlen(b.qname);
+                local char name[5 + len + 1];
+                memcpy(name, "bank.", 5);
+                memcpy(name + 5, b.qname, len + 1);
+                bank_obj = SIM_object_descendant(obj, name);
+                assert bank_obj != NULL;
+                function = 0;
+            } else {
+                bank_obj = obj;
+                function = $map_func;
+            }
+        } else {
+            bank_obj = obj;
+            function = $map_func;
+        }
+    }
+
+    method pci_mapping_target() -> (conf_object_t *target) default {
+        // default target is NULL
+        target = NULL;
+    }
+
+    method pci_mapping_customize(map_info_t *info) default {
+        // default is not to change anything
+    }
+
+    method pci_mapping_base() -> (map_base) default {
+        inline $get_base() -> (map_base);
+        map_base <<= $base.lsb;
+    }
+
+    method pci_mapping_length() -> (map_length) default {
+        local int size_bits;
+
+        inline $pci_bar_size_bits() -> (size_bits);
+        map_length = 1 << size_bits;
+    }
+
+    /* Calculates the value of the base field, taking into account current
+       setting of size-bits */
+    method get_base() -> (base_val) default {
+        local int size_bits;
+
+        inline $pci_bar_size_bits() -> (size_bits);
+        base_val = $base & ~((1 << (size_bits - $base.lsb)) - 1);
+    }
+
+    method remove_map() default {
+        if (!defined $map_func) {
+            log info, 3, PCI_config: 
+                "Removing mapping for unknown base address %s", $qname;
+        } else {
+            local conf_object_t *map_obj;
+            if ($pci_bus.obj == NULL) {
+                log info, 2, PCI_config:
+                    "Attempt to remove mapping with the PCI bus disconnected";
+                return;
+            }
+            inline $pci_mapping_object() -> (map_obj);
+            if (map_obj) {
+                log info, 3, PCI_config: 
+                    "Removing %s space mapping for %s (function %d)",
+                    $map_type, $qname, $map_func;
+                local addr_space_t type = $map_type == "memory"
+                    ? Sim_Addr_Space_Memory : Sim_Addr_Space_IO;
+                // Unmap *both* by function and by bank object:
+                // The default implementation of add_map maps
+                // bank object, but in Simics 5, add/remove only operated
+                // on function mappings. One supported use case was
+                // to override add_map to add a tweaked function mapping,
+                // and rely on the default remove_map implementation to
+                // remove it. We must unmap both to retain compatibility
+                // with that use case.
+                $pci_bus.pci_bus.remove_map(map_obj,
+                                            type,
+                                            $map_func);
+                local conf_object_t *bank_obj;
+                local int func;
+                call $_get_bank_obj(map_obj) -> (bank_obj, func);
+                if (bank_obj != map_obj)
+                    $pci_bus.pci_bus.remove_map(bank_obj, type, func);
+            }
+        }
+    }
+
+    method add_map() default {
+        if (!defined $map_func) {
+            log error, 1, PCI_config: 
+                "Adding mapping for unknown base address %s", $qname;
+            throw;
+        } else {
+            local map_info_t info;
+            local conf_object_t *map_obj;
+            local conf_object_t *map_target;
+            if ($pci_bus.obj == NULL) {
+                log info, 2, PCI_config:
+                    "Attempt to add mapping with the PCI bus"
+                    + " disconnected";
+                return;
+            }
+
+            // add this new mapping
+            inline $pci_mapping_base() -> (info.base);
+            inline $pci_mapping_length() -> (info.length);
+            info.function = $map_func;
+
+            // let the implementer customize the mapping as necessary
+            // and here map_obj, map_target and info will be used as parameters
+            // when calling map_demap:add_map() in pci_bus.add_map()
+            inline $pci_mapping_object() -> (map_obj);
+            inline $pci_mapping_target() -> (map_target);
+            inline $pci_mapping_customize(&info);
+
+            // but prevent the function number from being changed
+            if (info.function != $map_func) {
+                log error, 1, PCI_config:
+                    "Function number should not be changed when mapping %s", 
+                    $qname;
+            }
+            // map the bank object instead, but only for API=6 and newer. This
+            // is for compatibility: bank objects are new to Simics 6, and
+            // devices that are cross-compiled for both 5 and 6 from the same
+            // source (thus using API < 6) may have tests that check mappings.
+            // It is then easier to have the same expectation for both 5 and 6.
+            if ($simics_api_version != "4.8" && $simics_api_version != "5") {
+                call $_get_bank_obj(map_obj) -> (map_obj, info.function);
+            }
+
+            if (info.base == 0)
+                log info, 3, PCI_config: "Zero %s mapping", $qname;
+
+            log info, 3, PCI_config:
+                "New %s space mapping for %s (obj %s, target %s, fn %d):"
+                + " base = %#x, length = %#x",
+                $map_type, $name, SIM_object_name(map_obj), 
+                map_target ? SIM_object_name(map_target) : "(none)",
+                info.function, info.base, info.length;
+
+            $pci_bus.pci_bus.add_map(
+                map_obj,
+                $map_type == "memory" ? Sim_Addr_Space_Memory 
+                                      : Sim_Addr_Space_IO,
+                map_target, info);
+        }
+    }
+}
+
+template memory_base_address_generic {
+    parameter enabled = true;
+    parameter map_type = "memory";
+    parameter min_size_bits default 4;
+    is base_address;
+
+    method update_mapping() default {
+        local bool enabled;
+
+        inline $this.remove_map;
+
+        inline $pci_mapping_enabled() -> (enabled);
+        if ($command.mem && enabled) {
+            inline $this.add_map;
+        }
+    }
+
+    /* Overridden from base_address; needed to handle 64-bit BARs configured
+       as 32-bit BAR */
+    method pci_mapping_base() -> (map_base) {
+        inline $get_base() -> (map_base);
+
+        map_base <<= $base.lsb;
+
+        if ($type == 0b00)
+            map_base &= 0xffffffff;
+    }
+
+    field base[$base_msb:$min_size_bits] {
+        parameter documentation = "The base address";
+        method read() -> (value) {
+            inline $get_base() -> (value);
+
+            if ($type == 0b00)
+                value &= 0xffffffff >> $base.lsb;
+
+        }
+        method write(value) {
+            if ($this != value) {
+                $this = value;
+                if ($command.mem) {
+                    // no effect unless decoding is enabled
+                    inline $update_mapping();
+                }
+            }
+        }
+    }
+
+    field p [3:3] is (ignore_write) {
+        parameter documentation = "Prefetchable";
+    }
+
+    field type [2:1] is (ignore_write) {
+        parameter documentation = "Type (00: anywhere in 32-bit space;"
+            + " 10: anywhere in 64-bit space)";
+        method set(value) {
+            if (value == 0b01 || value == 0b11) {
+                log spec_viol, 1, PCI_config:
+                    "Setting %s to reserved value %d ignored",
+                    $qname, value;
+                return;
+            }
+
+            // only 64-bit BAR can be changed to behave like a 32-bit BAR
+            if (value != $this && $size == 4) {
+                log spec_viol, 1, PCI_config:
+                    "Unable to change type of 32-bit BAR.";
+                return;
+            }
+
+            $this = value;
+        }
+    }
+
+    field s [0:0] is (ignore_write) {
+        parameter documentation = "Memory Space Indicator";
+        parameter override_map_bit default undefined;
+        parameter hard_reset_value = (defined $override_map_bit)
+            ? $override_map_bit : $map_bit;
+    }
+}
+
+template memory_base_address_32 {
+    parameter size = 4;
+    is memory_base_address_generic;
+    field type { parameter hard_reset_value = 0b00; }
+}
+
+template memory_base_address_64 {
+    parameter size = 8;
+    is memory_base_address_generic;
+    field type { parameter hard_reset_value = 0b10; }
+}
+
+template io_base_address {
+    parameter enabled = true;
+    parameter map_type = "I/O";
+    parameter min_size_bits default 2;
+    parameter size = 4;
+    is base_address;
+
+    method update_mapping() default {
+        local bool enabled;
+
+        inline $this.remove_map;
+
+        inline $pci_mapping_enabled() -> (enabled);
+        if ($command.io && enabled) {
+            inline $this.add_map;
+        }
+    }
+
+    field base [31:$min_size_bits] {
+        parameter documentation = "The base address";
+        method read() -> (value) {
+            inline $get_base() -> (value);
+        }
+        method write(value) {
+            if ($this != value) {
+                $this = value;
+                if ($command.io) {
+                    // no effect unless decoding is enabled
+                    inline $update_mapping();
+                }
+            }
+        }
+    }
+
+    field p [1:1] is (silent_constant) "Reserved" {
+        parameter value = 0;
+    }
+
+    field s [0:0] is (ignore_write) {
+        parameter documentation = "I/O Space Indicator";
+        parameter override_map_bit default undefined;
+        parameter hard_reset_value = (defined $override_map_bit)
+            ? $override_map_bit : $map_bit;
+    }
+}
+
+template _no_base_address {
+    parameter map_type = "none";
+    parameter size default undefined;
+    field ignore [$size * 8 - 1:0] is (silent_constant) {
+        parameter value = 0;
+    }
+}
+
+template no_base_address_32 {
+    is _no_base_address;
+    parameter size = 4;
+}
+
+template no_base_address_64 {
+    is _no_base_address;
+    parameter size = 8;
+}
+
+import "simics/base/memory.dml"; /* for SIM_describe_pseudo_exception */
+
+// DMA methods
+template providing_dma_methods {
+    parameter pci_config_bank;
+    data uint32 _tlp_prefix;
+
+    // Sets the TLP Prefix for the _next_ transaction. The Prefix will be
+    // cleared by the transaction and must be set again for the next
+    // transaction.
+    // NOTE: this method is considered internal and may change in future
+    // versions to support multiple prefixes
+    method pci_set_tlp_prefix(uint32 tlp_prefix) nothrow {
+        $_tlp_prefix = tlp_prefix;
+    }
+
+    // (internal) helper method for pci_[value,data]_[from,to]_memory  methods
+    method _set_tlp_prefix(pci_memory_transaction_t *trans) nothrow {
+        if ($_tlp_prefix >> 29 == 4) {
+            VT_set_pci_mem_op_tlp_prefix(trans, $_tlp_prefix);
+            $_tlp_prefix = 0;
+        }
+    }
+    
+    method pci_data_from_memory(addr_space_t space, void *buffer,
+                                 uint64 address, uint64 size)
+            -> (exception_type_t ex) default {
+        if ($pci_bus.obj == NULL) {
+            log info, 2, PCI_config:
+               "Attempt to perform DMA read with the PCI bus disconnected";
+            ex = Sim_PE_IO_Not_Taken;
+            return;
+        }
+
+        if (!$pci_config_bank.command.m && space != Sim_Addr_Space_Conf) {
+            log spec_viol, 1, PCI_DMA:
+                "trying to access PCI bus, but Bus Master Enable bit"
+                + " in Command register is not set";
+            ex = Sim_PE_IO_Not_Taken;
+            return;
+        }
+
+        log info, 4, PCI_DMA:
+            "reading %d bytes from %s %s space",
+            size, $dev.pcie_device ? "PCIe" : "PCI",
+            (space == Sim_Addr_Space_Memory) ?
+            "memory" : (space == Sim_Addr_Space_Conf) ?
+            "config" : "io";
+
+        // TODO: make this interface required and deprecate io_memory
+        // TODO: disabled entirely for now until we have a clear migration path
+        // for existing devices
+        if (false) {  // $pci_bus.pci_upstream_operation) {
+            inline $pci_config_bank.bus_address.update;
+            local int rid = $pci_config_bank.bus_address;
+            // simics supports PCI devices on pcie-bus/link and we currently
+            // don't have a way for devices to ask the bus about the current
+            // bus number. The pci_bus::get_bus_address() returns the address
+            // in config space, which needs a context (PCI or PCIe) in order to
+            // be correctly translated into a Requester ID. The assumption for
+            // now is that PCI devices does not support Requester ID and can
+            // set this value to 0.
+            rid = $pcie_device ? rid >> 12 : 0;
+            local buffer_t buf;
+            buf.data = buffer;
+            buf.len = size;
+            ex = $pci_bus.pci_upstream_operation.read($dev.obj, rid, space, address, buf);
+        } else {
+            // legacy/backwards compatibility implementation using io_memory
+            local pci_memory_transaction_t trans;
+            local map_info_t info;
+            SIM_set_mem_op_physical_address(&trans._internal_s, address);
+            SIM_set_mem_op_type(&trans._internal_s, Sim_Trans_Load);
+            trans._internal_s.size = size;
+            trans._internal_s.block_STC = 1;
+            trans._internal_s.may_stall = 0;
+            SIM_set_mem_op_initiator(&trans._internal_s,
+                                     Sim_Initiator_PCI_Device, $dev.obj);
+            trans._internal_s.real_address = buffer;
+            inline $pci_config_bank.bus_address.update;
+            trans._internal_bus_address = $pci_config_bank.bus_address;
+            info.function = space;
+            $_set_tlp_prefix(&trans);
+            ex = $pci_bus.io_memory.operation(&trans._internal_s, info);
+        }
+
+        if (ex == Sim_PE_IO_Not_Taken) {
+            // master abort
+            log info, 2, PCI_DMA: "Master Abort received";
+            $pci_config_bank.status.rma = 1;
+        } else if (ex == Sim_PE_IO_Error) {
+            // target abort
+            log info, 2, PCI_DMA: "Target Abort received";
+            $pci_config_bank.status.rta = 1;
+        } else if (ex != Sim_PE_No_Exception) {
+            log error, 1, PCI_DMA:
+                "Unknown exception received on PCI bus: %s (%d)", 
+                SIM_describe_pseudo_exception(ex), cast(ex, int);
+        } else {
+            log info, 4, PCI_DMA: "Reading %d bytes from address 0x%x", 
+                size, address;
+        }
+    }
+
+    method pci_value_from_memory(addr_space_t space, uint64 address, uint8 size)
+        -> (uint64 value, exception_type_t ex) default {
+        local uint64 buf = 0;
+
+        if (size > 8)
+            log error, 1, PCI_DMA: "Too large size of DMA access";
+
+        call $pci_data_from_memory(space, &buf, address, size) -> (ex);
+        value = convert_le64(buf);
+    }
+
+    method pci_data_to_memory(addr_space_t space, const void *buffer,
+                              uint64 address, uint64 size)
+        -> (exception_type_t ex) default {
+        if ($pci_bus.obj == NULL) {
+            log info, 2, PCI_config:
+               "Attempt to perform DMA write with the PCI bus disconnected";
+            ex = Sim_PE_IO_Not_Taken;
+            return;
+        }
+
+        if (!$pci_config_bank.command.m && space != Sim_Addr_Space_Conf) {
+            log spec_viol, 1, PCI_DMA:
+                "trying to access PCI bus, but Bus Master Enable bit"
+                + " in Command register is not set";
+            ex = Sim_PE_IO_Not_Taken;
+            return;
+        }
+
+        log info, 4, PCI_DMA:
+            "writing %d bytes to %s %s space",
+            size, $dev.pcie_device ? "PCIe" : "PCI",
+            (space == Sim_Addr_Space_Memory) ?
+            "memory" : (space == Sim_Addr_Space_Conf) ?
+            "config" : "io";
+
+        // TODO: make this interface required and deprecate io_memory
+        // TODO: disabled entirely for now until we have a clear migration path
+        // for existing devices
+        if (false) {  // $pci_bus.pci_upstream_operation) {
+            inline $pci_config_bank.bus_address.update;
+            local int rid = $pci_config_bank.bus_address;
+            // simics supports PCI devices on pcie-bus/link and we currently
+            // don't have a way for devices to ask the bus about the current
+            // bus number. The pci_bus::get_bus_address() returns the address
+            // in config space, which needs a context (PCI or PCIe) in order to
+            // be correctly translated into a Requester ID. The assumption for
+            // now is that PCI devices does not support Requester ID and can
+            // set this value to 0.
+            rid = $pcie_device ? rid >> 12 : 0;
+            local bytes_t buf;
+            buf.data = buffer;
+            buf.len = size;
+            ex = $pci_bus.pci_upstream_operation.write($dev.obj, rid, space, address, buf);
+        } else {
+            // legacy/backwards compatibility implementation using io_memory
+            local pci_memory_transaction_t trans;
+            local map_info_t info;
+            SIM_set_mem_op_physical_address(&trans._internal_s, address);
+            SIM_set_mem_op_type(&trans._internal_s, Sim_Trans_Store);
+            trans._internal_s.size = size;
+            trans._internal_s.block_STC = 1;
+            trans._internal_s.may_stall = 0;
+            SIM_set_mem_op_initiator(&trans._internal_s,
+                                     Sim_Initiator_PCI_Device, $dev.obj);
+            trans._internal_s.real_address = cast(buffer, void *);
+            inline $pci_config_bank.bus_address.update;
+            trans._internal_bus_address = $pci_config_bank.bus_address;
+            info.function = space;
+            $_set_tlp_prefix(&trans);
+            ex = $pci_bus.io_memory.operation(&trans._internal_s, info);
+        }
+
+        if (ex == Sim_PE_IO_Not_Taken) {
+            // master abort
+            log info, 2, PCI_DMA: "Master Abort received";
+            $pci_config_bank.status.rma = 1;
+        } else if (ex == Sim_PE_IO_Error) {
+            // target abort
+            log info, 2, PCI_DMA: "Target Abort received";
+            $pci_config_bank.status.rta = 1;
+        } else if (ex != Sim_PE_No_Exception) {
+            log error, 1, PCI_DMA:
+                "Unknown exception received on PCI bus: %s (%d)",
+                SIM_describe_pseudo_exception(ex), cast(ex, int);
+        } else {
+            log info, 4, PCI_DMA: "Writing %d bytes to address 0x%x", 
+                size, address;
+        }
+    }
+
+    method pci_value_to_memory(addr_space_t space, uint64 value, uint64 address, 
+                               uint8 size)
+        -> (exception_type_t ex) default {
+        local uint64 buf;
+
+        if (size > 8)
+            log error, 1, PCI_DMA: "Too large size of DMA access";
+
+        buf = value;
+        buf = convert_le64(buf);
+        call $pci_data_to_memory(space, &buf, address, size) -> (ex);
+    }
+}
+
+// Interrupts
+template providing_legacy_interrupts {
+    parameter pci_config_bank;
+
+    method pci_lower_all_pins() default {
+         log info, 3, PCI_IRQ: "Lowering all active pins";
+         local int pin = 0;
+         for (pin = 0 ; pin < 4; ++pin) {
+             if ($pci_config_bank.interrupts[pin] == 1) {
+                 $pci_lower_interrupt_pin(pin);
+             }
+         }
+    }
+
+    method pci_raise_interrupt_pin(int pin) default {
+        assert 0 <= pin && pin < 4;
+        /* always set status bit */
+        $pci_config_bank.status.ins = 1;
+
+        /* but only raise signal if not already raised or disabled */
+        local int bridge_count;
+        inline $pci_config_bank.irq_bridge_count(pin) -> (bridge_count);
+        if ($pci_config_bank.interrupts[pin] == 0 &&
+            bridge_count == 0) {
+            if ($pci_config_bank.command.id == 0) {
+                if ($pci_bus.obj == NULL) {
+                    log info, 2, PCI_config: "Attempt to raise legacy"
+                        + " interrupt with the PCI bus disconnected";
+                    return;
+                }
+                log info, 4, PCI_IRQ: "Raising interrupt pin %d (%s)",
+                    pin, irq_pin_name[pin];
+                $pci_bus.pci_bus.raise_interrupt($dev.obj, pin);
+                $pci_config_bank.interrupts[pin] = 1;
+            } else {
+                log info, 3, PCI_IRQ:
+                    "Interrupts disabled, no interrupt raised";
+            }
+        } else {
+            log info, 4, PCI_IRQ: "Signal already raised for pin %d (%s)",
+                pin, irq_pin_name[pin];
+        }
+    }
+
+    method pci_lower_interrupt_pin(int pin) default {
+        assert 0 <= pin && pin < 4;
+        /* only lower signal if raised */
+        local int bridge_count;
+        inline $pci_config_bank.irq_bridge_count(pin) -> (bridge_count);
+        if ($pci_config_bank.interrupts[pin] == 1) {
+            $pci_config_bank.interrupts[pin] = 0;
+            if (bridge_count == 0) {
+                if ($pci_bus.obj == NULL) {
+                    log info, 2, PCI_config: "Attempt to lower legacy"
+                        + " interrupt with the PCI bus disconnected";
+                } else {
+                    log info, 4, PCI_IRQ: "Lowering interrupt pin %d (%s)",
+                        pin, irq_pin_name[pin];
+                    $pci_bus.pci_bus.lower_interrupt($dev.obj, pin);
+                }
+            } else {
+                log info, 4, PCI_IRQ:
+                    "Forwarded interrupts still pending acknowledgement,"
+                    + " interrupt pin %d (%s) not lowered",
+                    pin, irq_pin_name[pin];
+            }
+        } else {
+            log info, 4, PCI_IRQ: "Signal already lowered for pin %d (%s)",
+                pin, irq_pin_name[pin];
+        }
+
+        /* clear status bit when _all_ interrupts have been lowered */
+        if ($pci_config_bank.interrupts == 0)
+            $pci_config_bank.status.ins = 0;
+    }
+}
+
+// Interface
+template providing_pci_device_interface {
+    parameter pci_config_bank;
+
+    implement pci_device {
+        method bus_reset() default {
+            call $pci_bus_disconnected();
+        }
+    }
+}
+
+/* PCIe devices have an extended configuration space. The capabilities listed
+   here are separate from the normal capability list in the normal conf space.
+   Thus, software must try reading the first extended capability ID at 0x100.
+
+   If the device doesn't implement any extended capabilities, we can use this
+   template to avoid getting read accesses "outside registers" errors. */
+template defining_empty_pcie_extended_conf_space {
+    register exp_ext_no_capability_id size 2 @ 0x100
+        is (noalloc, read_zero, ignore_write) {
+        parameter configuration = "none";
+    }
+    register exp_ext_next_ptr         size 2 @ 0x102
+        is (noalloc, read_zero, ignore_write) {
+        parameter configuration = "none";
+    }
+}

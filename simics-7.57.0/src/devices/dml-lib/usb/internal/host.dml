@@ -1,0 +1,179 @@
+/*
+  host.dml - Generic USB host code
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "simics/devs/usb.dml";
+
+parameter NUM_PORTS default undefined;
+
+connect usb_devices[$NUM_PORTS] {
+    parameter documentation = "Internal, should not be used directly.";
+    parameter configuration = "optional";
+    parameter internal = true;
+    interface usb_device {
+        parameter required = true;
+    }
+}
+
+implement usb {
+    method connect_device(conf_object_t *usb_device, usb_speed_t speed)
+        -> (int port) {
+        local int p;
+        local int empty = -1;
+        local int first_port;
+        local int port_count;
+
+        call $get_port_range(speed) -> (first_port, port_count);
+
+        port = -1;
+        for (p = first_port; p < first_port + port_count; p++) {
+            if ($usb_devices[p].obj == usb_device) {
+                port = p;
+                break;
+            } else if (empty == -1 && $usb_devices[p].obj == NULL) {
+                empty = p;
+            }
+        }
+
+        if (port == -1 && empty != -1) {
+            /* new connection */
+            local set_error_t err;
+            local attr_value_t attr = SIM_make_attr_object(usb_device);
+
+            port = empty;
+            $usb_ctrl_speed[port] = speed;
+            call $usb_devices[port].set_attribute(attr) -> (err);
+            call $usb_host_connect_device(port);
+            log info, 3, log_usb_common: "USB device %s connected to port %d",
+                SIM_object_name(usb_device), port;
+        } else if (port == -1) {
+            /* new connection but no free ports */
+            log error, 1, log_usb_common:
+                "USB device %s tried to connect but there are no empty ports",
+                SIM_object_name(usb_device);
+        } else {
+            /* already connected */
+            log info, 3, log_usb_common: "USB device %s already connected",
+                SIM_object_name(usb_device);
+        }
+    }
+
+    method disconnect_device(conf_object_t *usb_device) -> (int res) {
+        local int p;
+
+        inline $usb_device_to_port(usb_device) -> (p);
+        if (p == -1) {
+            res = 1;
+            log info, 3, log_usb_common:
+                "%s can not be disconnected as it has never been connected",
+                    SIM_object_name(usb_device);
+        } else {
+            local set_error_t err;
+            local attr_value_t attr = SIM_make_attr_object(NULL);
+
+            call $usb_host_disconnect_device(p) -> (res);
+            call $usb_set_device_address(p, 0);
+            call $usb_devices[p].set_attribute(attr) -> (err);
+            call $usb_host_after_disconnect_device(p);
+        }
+    }
+
+    method complete_transfer(conf_object_t *usb_device,
+                             usb_transfer_t *tf) default {
+        log error, 1, log_usb_common:
+            "USB host does not support delayed transfers";
+    }
+}
+
+bank usb_ctrl {
+    parameter mappable = false;
+    parameter register_size = 4;
+    register addr[$NUM_PORTS] @ undefined;
+
+    // This flag is show which of ehci or uhci device connected to port
+    register own_device[$NUM_PORTS] @ undefined;
+}
+
+attribute usb_ctrl_speed[$NUM_PORTS] {
+    parameter allocate_type = "uint32";
+}
+
+method usb_host_reset() default {
+    // Reset the state of the USB part of the device, but do not reset PCI
+    // registers, etc.
+    log info, 2, log_usb_common: "resetting host";
+    call $usb_ctrl.hard_reset();
+}
+
+method usb_host_disconnect_device(int p) -> (int result) default {
+    result = 0;
+}
+
+method usb_host_after_disconnect_device(int p) default {
+}
+
+method usb_set_device_address(int port, uint8 addr) {
+    $usb_ctrl.addr[port] = addr;
+}
+
+method usb_get_device_speed(int port) -> (usb_speed_t speed) {
+    speed = $usb_ctrl_speed[port];
+}
+
+//when usb port can switch between uhci/ehci, prevent connect ehci to busy uhci port
+method usb_ehci_uhci_address_to_port(uint8 addr) -> (int p) {
+    local int i;
+
+    p = -1;
+    for (i = 0; i < $NUM_PORTS; i++) {
+        if ($usb_devices[i].obj != NULL && addr == $usb_ctrl.addr[i]
+            && $usb_ctrl.own_device[i] != 0) {
+            p = i;
+            break;
+        }
+    }
+}
+
+//left for compatibility with non combined echi/uhci ports
+method usb_device_address_to_port(uint8 addr) -> (int p) {
+    local int i;
+
+    p = -1;
+    for (i = 0; i < $NUM_PORTS; i++) {
+        if ($usb_devices[i].obj != NULL && addr == $usb_ctrl.addr[i]) {
+            p = i;
+            break;
+        }
+    }
+}
+
+method usb_device_to_port(conf_object_t *usb_device) -> (int p) {
+    local int i;
+
+    p = -1;
+    for (i = 0; i < $NUM_PORTS; i++) {
+        if ($usb_devices[i].obj == usb_device) {
+            p = i;
+            break;
+        }
+    }
+}
+
+method get_port_range(usb_speed_t speed) -> (int first_port,
+                                             int port_count) default {
+    first_port = 0;
+    port_count = $NUM_PORTS;
+}

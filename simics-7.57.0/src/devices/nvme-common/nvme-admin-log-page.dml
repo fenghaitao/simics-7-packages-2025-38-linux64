@@ -1,0 +1,351 @@
+
+/*
+  nvme-admin-log-page.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+param STATUS_INVALID_LOG_PAGE = 0x9;
+
+// Log page identifiers
+param LID_SUPPORTED_LOG_PAGES = 0x00;
+param LID_ERROR_INFORMATION = 0x01;
+param LID_SMART_HEALTH_INFORMATION = 0x02;
+param LID_FIRMWARE_SLOT_INFORMATION = 0x03;
+param LID_COMMANDS_SUPPORTED_AND_EFFECTS = 0x05;
+param LID_FEATURE_IDENTIFIERS_SUPPORTED_AND_EFFECTS = 0x12;
+param LID_NVME_MI_COMMANDS_SUPPORTED_AND_EFFECTS = 0x13;
+
+typedef bitfields 32 {
+    uint16 numdl @ [31:16];
+    uint1 rae @ [15];
+    uint7 lsp @ [14:8];
+    uint8 lid @ [7:0];
+} cdw10_get_log_page_t;
+
+typedef bitfields 32 {
+    uint16 log_specific_identifier @ [31:16];
+    uint16 numdu @ [15:0];
+} cdw11_get_log_page_t;
+
+typedef bitfields 32 {
+    uint16 lidsp @ [31:16];
+    uint1 ios @ [1];
+    uint1 lsupp @ [0];
+} lid_supported_and_effects_t;
+
+typedef layout "little-endian" {
+    uint64 error_count;
+    uint16 sqid;
+    uint16 cid;
+    uint16 status;
+    bitfields 16 {
+        uint3 bit_location @ [10:8];
+        uint8 byte_location @ [7:0];
+    } parameter_error_location;
+    uint64 lba;
+    uint32 nsid;
+    uint8 vendor_specific_information_available;
+    uint8 trtype;
+    uint16 rsvd30;
+    uint64 command_specific_information;
+    uint16 trtype_specific_information;
+    uint8 rsvd42[22];
+} error_information_log_entry_t;
+
+typedef layout "little-endian" {
+    uint8 critical_warning;
+    uint16 composite_temperature;
+    uint8 available_spare;
+    uint8 available_spare_threshold;
+    uint8 percentage_used;
+    uint8 endurance_group_critical_warning_summary;
+    uint8 rsvd07[25];
+    uint64 data_units_read[2];
+    uint64 data_units_written[2];
+    uint64 host_read_commands[2];
+    uint64 host_write_commands[2];
+    uint8 controller_busy_time[16];
+    uint8 power_cycles[16];
+    uint8 power_on_hours[16];
+    uint8 unsafe_shutdowns[16];
+    uint8 media_and_data_integrity_errors[16];
+    uint64 number_of_error_information_log_entries[2];
+    uint32 warning_composite_temperature_time;
+    uint32 critical_composite_temperature_time;
+    uint16 temperature_sensor[8];
+    uint32 thermal_management_temperature_transition_count[2];
+    uint32 total_time_for_thermal_management_temperature[2];
+    uint8 rsvd232[280];
+}  smart_health_information_log_page_t;
+
+typedef layout "little-endian" {
+    uint8 afi;
+    uint8 rsvd01[8];
+    uint64 frs[7];
+    uint8 rsvd64[448];
+} firmware_slot_information_log_page_t;
+
+typedef bitfields 32 {
+    bitfields 12 {
+        uint1 nvm_subsystem_scope @ [5];
+        uint1 domain_scope @ [4];
+        uint1 endurance_group_scope @ [3];
+        uint1 nvm_set_scope @ [2];
+        uint1 controller_scope @ [1];
+        uint1 namespace_scope @ [0];
+    } csp @ [31:20];
+    uint1 uuid_selection_supported @ [19];
+    uint3 cse @ [18:16];
+    uint1 ccc @ [4];
+    uint1 nic @ [3];
+    uint1 ncc @ [2];
+    uint1 lbcc @ [1];
+    uint1 csupp @ [0];
+} commands_supported_and_effects_t;
+
+typedef bitfields 32 {
+    bitfields 12 {
+        uint6 rsvd06 @ [11:6];
+        uint1 nvm_subsystem_scope @ [5];
+        uint1 domain_scope @ [4];
+        uint1 endurance_group_scope @ [3];
+        uint1 nvm_set_scope @ [2];
+        uint1 controller_scope @ [1];
+        uint1 namespace_scope @ [0];
+    } fsp @ [31:20];
+    uint1 uuid_selection_supported @ [19];
+    uint1 ccc @ [4];
+    uint1 nic @ [3];
+    uint1 ncc @ [2];
+    uint1 udcc @ [1];
+    uint1 fsupp @ [0];
+} fid_supported_and_effects_data_t;
+
+method check_page_boundaries(uint64 offset, uint32 n_dwords,
+                             uint64 log_page_size) -> (bool) {
+    if (offset > log_page_size) {
+        return false;
+    }
+
+    if ((offset + n_dwords * 4) > log_page_size) {
+        return false;
+    }
+    return true;
+}
+
+template log_page_group {
+    saved uint64 error_count = 0;
+    saved error_information_log_entry_t error_log_page;
+
+    method write_lid_error_entry(const common_command_format_t *cmd,
+                                const common_completion_entry_t *rsp) {
+        if (log_pages.error_count == 0xFFFFFFFFFFFFFFFF) {
+            log_pages.error_count = 1;
+        } else {
+            log_pages.error_count++;
+        }
+
+        log_pages.error_log_page = { .error_count = log_pages.error_count,
+                                     .sqid = rsp->sqid,
+                                     .cid = rsp->cid,
+                                     .status = rsp->dw3,
+                                     .nsid = cmd->nsid,
+                                     ...
+        };
+    }
+}
+
+template nvme_log_page {
+    param lid : uint8;
+    shared method handle_log_page(const common_command_format_t *cmd,
+                                  common_completion_entry_t *rsp,
+                                  error_information_log_entry_t *err,
+                                  uint64 n_dwords, uint64 offset);
+}
+
+template log_pages {
+
+    group error_information is nvme_log_page {
+        param lid = LID_ERROR_INFORMATION;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            if (!check_page_boundaries(offset, n_dwords,
+                                       sizeof(log_pages.error_log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&log_pages.error_log_page, uint8*)[offset],
+                   PRP_OP_WRITE);
+        }
+    }
+
+    group supported_log_pages is nvme_log_page {
+        param lid = LID_SUPPORTED_LOG_PAGES;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            local lid_supported_and_effects_t log_page[256];
+
+            if (!check_page_boundaries(offset, n_dwords, sizeof(log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            foreach lp in (each nvme_log_page in (this.parent)) {
+                log_page[lp.lid].lsupp = 1;
+            }
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&log_page, uint8*)[offset], PRP_OP_WRITE);
+        }
+    }
+
+    group firmware_slot_information is nvme_log_page {
+        param lid = LID_FIRMWARE_SLOT_INFORMATION;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            local firmware_slot_information_log_page_t log_page;
+
+            if (!check_page_boundaries(offset, n_dwords, sizeof(log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&log_page, uint8*)[offset], PRP_OP_WRITE);
+        }
+    }
+
+    group commands_supported_and_effects is nvme_log_page {
+        param lid = LID_COMMANDS_SUPPORTED_AND_EFFECTS;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            local layout "little-endian" {
+                commands_supported_and_effects_t admin_commands_supported[256];
+                commands_supported_and_effects_t io_commands_supported[256];
+                uint8 rsvd2048[2048];
+            } log_page;
+
+            if (cmd->nsid != 0x0 && cmd->nsid !=0xFFFFFFFF) {
+                log spec_viol: "Bit 0 in LPA not set, nsid should be 0 or"
+                             + " 0xFFFFFFFF";
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 4, 0, rsp,
+                          err);
+                return;
+            }
+
+            if (!check_page_boundaries(offset, n_dwords, sizeof(log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            foreach cmd in (each nvme_admin_command_handler in (this.parent)) {
+                log_page.admin_commands_supported[cmd.opc].csupp = 0b1;
+            }
+
+            foreach cmd in (each nvme_io_command_handler in (this.parent)) {
+                log_page.io_commands_supported[cmd.opc].csupp = 0b1;
+            }
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&log_page, uint8*)[offset], PRP_OP_WRITE);
+        }
+    }
+
+    group fid_supported_and_effects is nvme_log_page {
+        param lid = LID_FEATURE_IDENTIFIERS_SUPPORTED_AND_EFFECTS;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            local fid_supported_and_effects_data_t log_page[256];
+
+            if (!check_page_boundaries(offset, n_dwords, sizeof(log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            foreach feature in (each nvme_feature in (this.parent)) {
+                log_page[feature.fid].fsupp = 0b1;
+            }
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&log_page, uint8*)[offset], PRP_OP_WRITE);
+        }
+    }
+
+    group nvme_mi_cmds_supported_and_effect is nvme_log_page {
+        param lid = LID_NVME_MI_COMMANDS_SUPPORTED_AND_EFFECTS;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            // No NVME-MI commands are implemented
+            local uint8 empty_log_page[4096];
+
+            if (!check_page_boundaries(offset, n_dwords,
+                                       sizeof(empty_log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&empty_log_page, uint8*)[offset], PRP_OP_WRITE);
+        }
+    }
+
+    group smart_health_information is nvme_log_page {
+        param lid = LID_SMART_HEALTH_INFORMATION;
+        method handle_log_page(const common_command_format_t *cmd,
+                              common_completion_entry_t *rsp,
+                              error_information_log_entry_t *err,
+                              uint64 n_dwords, uint64 offset) {
+            local smart_health_information_log_page_t log_page;
+            memset(&log_page, 0, sizeof(log_page));
+
+            if (!check_page_boundaries(offset, n_dwords, sizeof(log_page))) {
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 48, 0, rsp,
+                          err);
+                return;
+            }
+
+            memcpy(log_page.host_read_commands, stats.host_read_commands,
+                   2 * sizeoftype(uint64_le_t));
+            memcpy(log_page.host_write_commands, stats.host_write_commands,
+                   2 * sizeoftype(uint64_le_t));
+            memcpy(log_page.number_of_error_information_log_entries,
+                   stats.number_of_error_information_log_entries,
+                   2 * sizeoftype(uint64_le_t));
+
+            prp_op(cmd->dptr_prp1, cmd->dptr_prp2, n_dwords * 4,
+                   &cast(&log_page, uint8*)[offset], PRP_OP_WRITE);
+        }
+    }
+}

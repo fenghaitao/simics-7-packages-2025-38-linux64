@@ -1,0 +1,203 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i_counter;
+
+param desc = "device to regularly post events";
+
+param documentation = "Post events at a given rate.";
+
+import "utility.dml";
+
+session notifier_type_t ntfy_id;
+
+method init() {
+    ntfy_id=SIM_notifier_type("i-counter-increment");
+    SIM_register_notifier(SIM_object_class(obj),
+                          ntfy_id, 
+                          "Triggers when an event is fired.");
+}
+
+attribute notifier_id is (pseudo_attr, read_only_attr) {
+    param type = "i";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(ntfy_id);
+    }
+}
+
+//
+// Time-event-posting backdoor
+// - This should checkpoint OK. 
+// - Since it only takes effect when events are re-posted
+// - If a checkpoint is brought back with a non-zero value, 
+//   it will take effect on the next event triggering
+// - Writing it has no immediate effect on existing events! 
+attribute post_in_picoseconds is (uint64_attr) "Post events in picoseconds" {
+    param description = "If set to a non-zero value, post events " +
+                        "after that number of picoseconds instead of " +
+                        "the programmed cycles interval.";
+}
+
+
+//
+// Callback method
+//
+group callback {
+    method post_next() {
+        // Check for picoseconds override. 
+        local uint64 ps = post_in_picoseconds.val;
+        if(ps!=0) {
+            local double secs = ps * 1.0e-12;
+            log info, 3: "Time override active. Posting event in %d ps", ps;
+            log info, 4: "                      Which is %f s", secs;
+            after secs s: tick();
+            // Once DML supports ps posting in after, switch to ps 
+            // and remove the conversion to seconds. 
+            return;
+        }
+
+        // Default: post using cycles 
+        local uint64 t = regs.event_interval.val;
+        if(t==0) {
+            log spec_viol, 1: "Callback interval of zero is ignored.";
+        } else {
+            log info, 3: "Posting event in %d cycles", t;
+            after t cycles: tick();
+        }
+    }
+
+    method stop() {
+        callback.cancel_after();
+    }
+
+    method tick() {
+      regs.event_counter.val += 1;
+      log info, 2: "Tick (new counter value=%d)", regs.event_counter.val;
+      SIM_notify(obj, ntfy_id);
+      post_next();
+    }    
+}
+
+bank regs "software-visible programming registers" {
+    register event_interval size 4 @ 0x0000 is (read, write) "Event Interval";
+
+    register start_stop     size 4 @ 0x0004 is (read, write) "Start!=0; Stop=0"{
+        method write(uint64 value) {
+            if (val != value) {
+                if ((value != 0) && (val == 0)) {
+                    log info, 2: "Beginning to post events";
+                    event_counter.val = 0;
+                    callback.post_next();
+                } else if (value == 0) {
+                    log info, 2: "Events stopping";          
+                    callback.stop();
+                }
+                default(value);
+            }
+        }
+    }
+    register event_counter  size 8 @ 0x0008 is (read_only) "Number of events since last start";
+    register time_ps        size 8 @ 0x0010 is (read, read_only) "Picoseconds from the device's clock" {
+        // Reading pulls the current value from the attached clock. 
+        // There is no independent state stored in the device itself
+        param configuration = "pseudo";
+        method get() -> (uint64) {
+            // Get is needed to supply values to print-device-regs etc. 
+            local conf_object_t * psclock = SIM_picosecond_clock(dev.obj);
+            local uint64 picoseconds = SIM_cycle_count(psclock);
+            log info, 3: "get - Pulling picoseconds from %s -> %d", SIM_object_name(psclock), picoseconds;
+            return picoseconds;
+        }
+        method read() -> (uint64) {
+            // Defining reads in terms of get
+            log info, 3: "read - Forwarding to get()";
+            return get();
+        }
+    }
+}
+
+// Second register bank, for manual event posting from the
+// CLI during the lab.  Put into its own bank in order to make
+// inspection of the counter control registers as seen by software
+// separate and easy to explain. 
+
+// 
+// First register type:
+// - Writing a value N posts an event in N cycles
+// - The log message on event triggering is based on the register
+//   name. 
+//
+template extra_posting_cycle_reg {
+    is write;
+    is read;
+    is desc;
+    param desc default "Post on cycle queue";    
+    method write (uint64 c) {
+        log info, 3: "Posting event from %s in %d cycles", this.name, c;
+        after c cycles: event();
+        // Note: no cancelling of other events, just add events to the queue
+        this.val = c;  // just report back the written value
+    }
+    method event() {
+        log info, 2: "Event callback for %s", this.name;
+        // No reposting. 
+    }
+}
+
+//
+// Second register type:
+// - Same as above, but posts on the picosecond queue
+//
+template extra_posting_ps_reg {
+    is write;
+    is read;
+    is desc;
+    param desc default "Post on picosecond queue";
+    param actualname = name;
+    method write(uint64 p) {
+        log info, 3: "Posting event from %s in %d picoseconds", this.name, p;
+        // Posting on ps queue requires some manual work
+        // and the "manual" event declared right below
+        local conf_object_t *ps_clock = SIM_picosecond_clock(dev.obj);
+        SIM_event_post_cycle(ps_clock,
+                                event.evclass,  // undocumented internal feature
+                                dev.obj,
+                                p,
+                                NULL);
+        // You cannot do "event.post(p)", unfortunately 
+        this.val = p;
+    }
+    // To post on the picosecond queue, need an explicit event
+    // (at the time of coding no better solution exists)
+    event event is (simple_cycle_event) {
+        method event() {
+            log info, 2: "Event callback for %s", actualname;
+        }
+    }
+}
+
+//
+// Declaring the extra registers:
+//
+bank extras "extra registers for manual event posting" {
+    param register_size = 8;
+    register alfa    @ 0x00 is (extra_posting_cycle_reg) ;
+    register bravo   @ 0x08 is (extra_posting_cycle_reg) ;
+    register charlie @ 0x10 is (extra_posting_cycle_reg) ;
+    register delta   @ 0x18 is (extra_posting_cycle_reg) ;
+    register papa    @ 0x20 is (extra_posting_ps_reg);
+    register quebec  @ 0x28 is (extra_posting_ps_reg);    
+}

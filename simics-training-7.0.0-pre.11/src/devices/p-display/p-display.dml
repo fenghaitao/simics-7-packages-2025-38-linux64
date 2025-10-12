@@ -1,0 +1,564 @@
+/*
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  p-display : Display unit that lets the simulator draw images in a graphics
+            : console in order to enable putting a target "panel" into a 
+            : graphics console.  
+
+            : Contains a display buffer. 
+            : Can draw to it using a custom interface. 
+            : Input is handled using a different object.
+*/
+
+
+dml 1.4;
+
+device p_display;
+
+param desc = "display unit for simulated panel";
+
+param documentation = "Simple display unit specialized for simulated panels";
+
+import "utility.dml";
+import "simics/simulator-api.dml";
+import "simics/devs/memory-space.dml";
+import "simics/model-iface/gfx-console.dml";  
+import "simics/model-iface/video-interface.dml";
+import "simics/model-iface/vga-text-interface.dml";
+
+import "p-display-draw-interface.dml";
+
+loggroup display;
+loggroup drawing;
+loggroup buffer_memory;
+
+// Interop with C
+header %{
+#include "manage-png-images.h"
+%}
+// Have to repeat the function prototypes used here in DML form
+extern uint64 load_png_image_impl(conf_object_t *obj, char * filename);
+extern int    get_loaded_image_height(conf_object_t *obj, uint64 id);
+extern int    get_loaded_image_width(conf_object_t *obj, uint64 id);
+extern uint32 *get_loaded_image_data(conf_object_t *obj, uint64 id);
+
+//----------------------------------------------------------------------
+//
+// Configure the size of the display.  
+// Do not allow changes post-creation, or rather only one set away from
+// the default 0 size. 
+// 
+//----------------------------------------------------------------------
+
+// Clip a value to [0,dimension-1] - since coordinates are zero-based
+template value_clip {
+    method clip(int v) -> (int) {
+        if(v >= this.val -1) {
+            return this.val -1;
+        }
+        if(v < 0) {
+            return 0;
+        }
+        return v;
+    }
+}
+
+attribute width is (uint64_attr, value_clip) "Display width" {
+    param configuration = "required";
+    method set(attr_value_t value) throws {
+        if(this.val==0) {
+            default(value); 
+        } else {
+            if (!SIM_is_restoring_state(obj)) {
+              log error : "Cannot change display size once set";
+              throw;
+            }
+        }
+    }
+}
+
+attribute height is (uint64_attr, value_clip) "Display height" {
+    param configuration = "required";
+    method set(attr_value_t value) throws {
+        if(this.val==0) {
+            default(value); 
+        } else {
+            if (!SIM_is_restoring_state(obj)) {
+              log error : "Cannot change display size once set";
+              throw;
+            }
+        }
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Connects   
+// - Reference to the graphics console to display on.
+//
+//----------------------------------------------------------------------
+connect console  {
+    param desc = "Graphics console to display results on";
+    param configuration = "optional";
+    param internal = false;       // = list-attributes shows it by default
+    interface gfx_con;
+
+    // Data about the current display buffer.  Temporary data only 
+    // known internally in this device.  Checkpointed via a custom
+    // attribute.  The size is already checkpointed as part of the
+    // configuration attributes.  
+    //
+    // The data type is also "uint32_le_t" to clearly indicate that the 
+    // data is stored as little endian. Since this is handled kind of 
+    // as memory from the perspective of the graphics console. 
+    session uint32_le_t  * display_contents;
+
+    // Allocate a new display buffer based on the current
+    // screen size. 
+    method allocate_display_buffer() {
+        assert(width.val!=0);
+        assert(height.val!=0);
+
+        // Deallocate old display contents 
+        if(display_contents != NULL) {
+            log info, 3, buffer_memory: "Deallocating old display contents";
+            delete display_contents;
+        }
+
+        // Allocate new buffer
+        log info, 3, buffer_memory: "Allocating new display contents, for %d x %d pixels",
+                                    width.val, height.val;        
+        local size_t   px_count = width.val * height.val;
+        display_contents = new uint32_le_t [px_count];
+    }
+
+    // Call this method to update the connected display
+    method refresh_display() {
+        // Sanity checking
+        if(this.obj == NULL) {
+            log info, 2, display: "No display configured, nothing drawn";
+            return;
+        }
+
+        // And do not draw if the contents are NULL 
+        if(display_contents == NULL) {
+            log info, 2, display: "No contents to draw";
+            return;
+        }
+
+        log info, 3, display: "Refreshing display";
+
+
+        // Update the size 
+        this.gfx_con.set_size(width.val, height.val);
+
+        // Create a temporary bytes_t data 
+        // that gives the graphics console what it needs
+        local bytes_t temp_bytes;
+        temp_bytes.data = cast(display_contents, const uint8 *);
+        temp_bytes.len = width.val * height.val * 4;
+
+        // Pass over the pixels
+        this.gfx_con.put_block(
+            temp_bytes,
+            0, 
+            0,
+            width.val-1, 
+            height.val-1,
+            32,                      // Number of bits per pixel
+            4 * width.val,          // src_stride
+        );
+
+        // And redraw
+        this.gfx_con.redraw();
+    }
+
+    // Fill the console with a single color, useful for initial state
+    // plus the "color_it_all" pseudo attribute
+    method single_color_display(uint32 rgb) {
+        log info, 2, display: "Coloring complete display with 0x%x", rgb;
+
+        // Check consistency
+        assert(width.val!=0);
+        assert(height.val!=0);
+        assert(console.display_contents!=NULL);
+
+        // Fill with color
+        local int i;
+        local int px_count = width.val * height.val;
+
+        for(i=0;i<px_count;i++){
+            console.display_contents[i] = rgb;
+        }
+    }
+
+    // Set a single pixel
+    method set_pixel_rgb(int x, int y, uint32 rgb) {
+        console.display_contents[ ((y * width.val) + x) ] = rgb;
+    }
+
+    // Blend a pixel with current background
+    method blend_pixel_argb(int x, int y, uint32 argb) {
+        local int     offset = ((y * width.val) + x);
+        local uint32  crgb = console.display_contents[offset];
+        local uint32  final_rgb = 0; 
+        local int alpha = (argb & 0xff00_0000) >> 24;                
+        
+        // Per-channel blending - "in place" in the word
+        final_rgb = ((crgb & 0xff0000) + (((argb & 0xff0000) - (crgb & 0xff0000)) * alpha)/255) & 0xff0000;
+        final_rgb |= ((crgb & 0x00ff00) + (((argb & 0x00ff00) - (crgb & 0x00ff00)) * alpha)/255) & 0x00ff00;
+        final_rgb |= ((crgb & 0x0000ff) + (((argb & 0x0000ff) - (crgb & 0x0000ff)) * alpha)/255)  & 0x0000ff;
+
+        // Update
+        console.display_contents[offset] = final_rgb;
+    }
+
+    // Fill a rectangle in the display with a single color, 
+    // with a given alpha value
+    // This function WILL check its arguments to make sense of thing
+    method set_rect_argb(int x, int y, int w, int h, uint32 argb) {
+        assert(console.display_contents!=NULL);
+
+        // Clip coordinates
+        local int left  = width.clip(x);
+        local int right = width.clip(x + w - 1);
+
+        local int top = height.clip(y);
+        local int bottom = height.clip(y + h - 1);
+
+        log info, 2, display: "Color rectangle actual (%d,%d) to (%d,%d), ARGB=0x%x", 
+                               left, top, right, bottom, argb;
+
+        if( (bottom-top==0) || (right-left==0)) {
+            log info, 3, display: "That was empty, do nothing";
+            return;
+        }
+
+        // Check for Alpha value trivial cases
+        local int a = (argb & 0xff00_0000) >> 24;                
+        if(a == 0x00) {
+            log info, 3, display: "Alpha value is zero, do nothing";
+            return;
+        }
+
+        local uint32 rgb = argb & 0x00ffffff;
+        if(a == 0xFF) {
+            log info, 3, display: "Alpha value is max, no blending";
+
+            // Fill with color, no alpha compute needed
+            local int i;
+            local int j;
+
+            for(i=top;i<=bottom;i++){
+                for(j=left;j<=right;j++){
+                    set_pixel_rgb(j,i,rgb);
+                }
+            }
+            return;
+        } 
+
+        // Non-trivial alpha value
+        log info, 3, display: "Alpha value 0x%x, RGB 0x%x", a, rgb;
+
+        // Iterate over image
+        local int i;
+        local int j;
+
+        for(i=top;i<=bottom;i++){
+            for(j=left;j<=right;j++){
+                blend_pixel_argb(j,i,argb);
+            }
+        }
+    }
+
+    // Draw an image, provided as a series of ARGB pixel values
+    // wrapped inside a bytes_t function 
+    method draw_image_alpha(int x, int y, int w, int h, 
+                            uint32* argb_ptr) {
+
+        // Iterate in the given coordinates
+        // This is wasteful in case we have part of the 
+        // image off-screen, but no need to optimize 
+        local int     xi;
+        local int     yi;
+
+        for(yi=0;yi<h;yi++){
+            // Check if this is a sane Y coordinate
+            if((yi+y)<0) continue;
+            if((yi+y)>=height.val) continue;
+
+            for(xi=0;xi<w;xi++){
+                // Check if this is a sane X coordinate
+                if((xi+x)<0) continue;
+                if((xi+x)>=width.val) continue;
+
+                // Find pixel to use in image
+                local uint32 argb = argb_ptr[ yi*w + xi ];
+                //log info, 3, display: "Pixel %d,%d: image=0x%x. Plot to %d,%d", xi,yi,argb,xi+x, yi+y;                
+                blend_pixel_argb(xi+x,yi+y,argb);
+            }
+        }
+
+    }
+
+}
+
+attribute display_data {
+    param type = "d";
+    param documentation = "Saves the internal model display buffer for checkpointing";
+    // The attribute is marked internal to not show in list-attributes 
+    // by default, since it is not a configuration attribute. 
+    param internal = true; 
+
+    // Get: Convert the display buffer to a data-type attribute
+    // This does create another copy of the data, but it is not 
+    // all that big.  And a checkpointing operation will take time
+    // anyway.  
+    // 
+    // But an argument could be made that this shows that design is
+    // a bit too simple.  Maybe it would be better to put the data 
+    // into an image. 
+    method get() -> (attr_value_t) {
+        assert(console.display_contents!=NULL);
+        local size_t       s = width.val * height.val * 4; 
+        local attr_value_t a;
+        a=SIM_make_attr_data( s, 
+                              cast(console.display_contents, const void *));
+        return a;
+    }
+    // And getting data from the attribute
+    method set(attr_value_t value) throws {
+        // If there already was some content in the 
+        // display, delete it.  When opening a checkpoint, 
+        // this will be the monocolor display contents set up
+        // by the init method. 
+        if(console.display_contents!=NULL) {
+            delete console.display_contents;
+        }
+        local size_t incoming_size = SIM_attr_data_size(value);
+
+        // We assume that the data size from the attribute value
+        // is correct.  The set of the display data can happen
+        // in any order with respect to the display_height and
+        // display_width attributes, so we cannot use them
+        // to compute the data size.  
+        //
+        // Size is in bytes, convert to uint32 chunks for allocation
+        console.display_contents = new uint32_le_t[incoming_size/4];
+
+        // Make a copy of the data in the attribute
+        // The attribute will be deallocated by the caller
+        memcpy(console.display_contents, 
+               SIM_attr_data(value), 
+               incoming_size);
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Pseudo-attribute used when connecting to a console. Via components. 
+// Sets the "real" console attribute, and also forces a redraw.
+//
+// Which is necessary in order to handle hot-plugging between
+// instantiated components.  
+//
+// Putting this logic into the console attribute would trigger 
+// redraws during checkpoint restores, which might be unordered
+// with respect to restoring the actual state of the console. 
+//
+//----------------------------------------------------------------------
+
+attribute connect_console is write_only_attr {
+    param type = "o";   // only an object is OK, do not support legacy ports
+    param documentation = "Set this attribute to change console and trigger redraw";
+    param internal = true;
+
+    // Override the set method to do a redraw on connect
+    method set(attr_value_t attr) throws {
+        // We can assume we have a valid object thanks to the attribute type
+        local conf_object_t * con_object;
+        con_object = SIM_attr_object(attr);
+
+        log info, 2, display: "Console_connect set to %s and doing redraw.", 
+                               SIM_object_name(con_object);
+
+        // Set the console contents 
+        console.set(con_object);
+        // Refresh
+        console.refresh_display();
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Incoming ports and implements, called by the graphics console
+// object in Simics.  Also, attributes read by the graphics console.
+//
+//----------------------------------------------------------------------
+
+implement vga_update {
+    // The VGA update interface is used to ask this device to 
+    // provide a redraw of the contents of the console
+    method refresh() {
+        log info, 4, display: "Display refresh requested by console";
+        console.refresh_display();
+    }
+    method refresh_all() {
+        log info, 4, display: "Display refresh_all requested by console";
+        console.refresh_display();
+    }
+}
+
+implement vga_text_info {
+    method text_mode () -> (bool) {
+        // Log at 2 then 5 == hide logs after the first time printed
+        log info, 2 then 5, display: "VGA text mode is not used";
+        return false;
+    }
+    method font_size(int *width, int *height) -> (bool) {
+        log info, 2 then 5, display: "VGA text mode is not used";
+        return false;
+    }
+    method screen_size(int *columns, int *rows) -> (bool) {
+        log info, 2 then 5, display: "VGA text mode is not used";
+        return false;
+    }
+    method text(uint8 *text, uint8 *line_lengths) -> (bool) {
+        log info, 2 then 5, display: "VGA text mode is not used";
+        return false;
+    }
+}
+
+attribute refresh_rate is (uint64_attr) {
+    param documentation = "Set by console component on connection";
+    param configuration = "optional";
+}
+ 
+
+
+//----------------------------------------------------------------------
+//
+// Drawing interface. Used by external code to put things into the 
+// display unit. 
+// 
+//----------------------------------------------------------------------
+port draw {
+    param desc = "draw things in the panel display";
+
+    implement p_display_draw {
+        // Query functions
+        method get_width() -> (int) {
+            log info, 3, drawing: "Query for width";
+            return width.val;
+        }
+        method get_height() -> (int) {
+            log info, 3, drawing: "Query for height";
+            return height.val;
+        }
+
+        // Color a rectangle, with mandatory alpha channel
+        method color_rect(int x, int y, int width, int height, uint32 argb) -> () {
+            log info, 2, drawing: "Color rectangle @(%d,%d) (%d x %d px) 0x%x", 
+                                   x,y,width,height,argb;
+            console.set_rect_argb(x,y,width,height,argb);
+        }
+
+        // Draw a rectangle from a pixel buffer with alpha channel
+        method draw_image_alpha(int x, int y, 
+                                int width, int height, bytes_t pixels) {
+            log info, 2, drawing: "Image with alpha to rectangle @(%d,%d) (%d x %d px)", 
+                                   x,y,width,height;
+            local uint32 *argb_ptr = cast(pixels.data,uint32 *); 
+            console.draw_image_alpha(x,y,width,height,argb_ptr);
+        }
+
+        // Load an image, calling out into C
+        method load_png_image(char * filename) -> (uint64) {
+            local uint64 id;
+            id = load_png_image_impl(dev.obj, filename);
+            log info, 2, drawing: "Loaded image from file %s -> 0x%x", 
+                                   filename,id;
+            return id;
+        }
+
+        // Draw a loaded image
+        method draw_png_image(int x, int y, uint64 id) {
+            local int     width  = get_loaded_image_width(dev.obj, id);
+            local int     height = get_loaded_image_height(dev.obj, id);            
+            local uint32 *pixels = get_loaded_image_data(dev.obj, id);
+            log info, 2, drawing: "Drawing cached PNG (0x%x) @(%d,%d) (%d x %d px)", 
+                                   id,x,y,width,height;
+            console.draw_image_alpha(x,y,width,height,pixels);
+        }
+
+        method get_png_image_width(uint64 id) -> (uint64) {
+           local int width  = get_loaded_image_width(dev.obj, id);
+           return width;
+
+        }
+
+        method get_png_image_height(uint64 id) -> (uint64) {
+            return get_loaded_image_height(dev.obj, id);
+        }
+
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// stop_callback
+// - Runs whenever the simulation stops to ensure the Panel shows
+//   the actual state at stop.
+//
+//----------------------------------------------------------------------
+method stop_callback(conf_object_t* trigger_obj, int64 unused,
+                     char* unused_as_well)
+{
+    console.refresh_display();
+}
+
+//----------------------------------------------------------------------
+//
+// Post_Init
+// - Runs after the object is created, and after attributes are set.
+//
+// The order is init() -> attributes.set() -> post_init()
+//
+//----------------------------------------------------------------------
+method post_init() {
+
+    // This will run after a checkpoint has been opened
+    // As well as after all attributes have been set on creation
+    
+    // If this is a fresh object, we have to create the display
+    // buffer contents 
+    if(console.display_contents==NULL) {
+        log info, 3, drawing: "post-init called - clearing display";
+        console.allocate_display_buffer();
+        console.single_color_display(0x8080a0);
+    }
+
+    // Do a redraw here so that we get the console updated
+    // when opening a checkpoint.  No component connectors are 
+    // set on checkpoint opening, so the connect_console attribute
+    // will not be set. 
+    //
+    // Nor can we redraw in the console attribute itself.  
+    console.refresh_display();
+
+    SIM_hap_add_callback("Core_Simulation_Stopped", cast(&stop_callback,obj_hap_func_t), obj);
+}
+

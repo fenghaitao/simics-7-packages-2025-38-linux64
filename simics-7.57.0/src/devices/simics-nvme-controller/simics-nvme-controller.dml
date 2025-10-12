@@ -1,0 +1,43 @@
+
+/*
+  simics-nvme-controller.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device simics_nvme_controller;
+
+param desc = "A generic NVMe I/O controller over PCIe";
+
+param documentation = "A generic NVMe I/O controller over PCIe with support"
+                    + " multiple namespaces. Implements all mandatory features,"
+                    + " commands and registers with the following limitations:"
+                    + "<ul>"
+                    + "<li>Command count in SMART/Health logs are not"
+                    + " persistent when power cycled</li>"
+                    + "<li>Only MSI-X is supported for interrupts</li>"
+                    + "<li>Aborting commands mid through processing is"
+                    + " currently unsupported</li>"
+                    + "</ul>"
+                    + "The following optional registers are implemented:"
+                    + "<ul>"
+                    + "<li>NSSR</li>"
+                    + "</ul>";
+
+import "nvme-pcie.dml";
+
+is nvme_pcie_io_controller;
+
+param VENDOR_ID = 0x8086;   // Intel
+param DEVICE_ID = 0x11EB;   // Simics NVMe Controller

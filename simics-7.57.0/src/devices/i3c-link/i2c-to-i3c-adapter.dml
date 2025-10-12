@@ -1,0 +1,99 @@
+/*
+  © 2017 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device i2c_to_i3c_adapter;
+
+import "simics/devs/i2c.dml";
+import "simics/devs/i3c.dml";
+
+parameter desc = "model of I2C to I3C adapter";
+parameter documentation = "The <class>i2c_to_i3c_adapter</class> allows to "
+                        + "attach an I2C device to I3C bus.";
+
+connect i2c_link_v2 {
+    parameter documentation = "Connect to I2C slave device";
+    interface i2c_slave_v2;
+}
+
+connect i3c_link {
+    parameter documentation =
+        "Connect to I3C master device or <class>i3c_link</class>";
+    interface i3c_master;
+}
+
+implement i2c_master_v2 {
+    method acknowledge(i2c_ack_t ack) {
+        if (!$i3c_link.obj)
+            return;
+        log info, 4:
+            "forwarding %sACK to i3c master", ack == I3C_ack ? "" : "N";
+        $i3c_link.i3c_master.acknowledge(ack == I2C_ack ? I3C_ack : I3C_noack);
+    }
+
+    method read_response(uint8 value) {
+        if (!$i3c_link.obj)
+            return;
+        log info, 4: "forwarding read data (0x%x) to i3c master", value;
+        $i3c_link.i3c_master.read_response(value, true);
+    }
+}
+
+implement i3c_slave {
+    method start(uint8 address) {
+        if (!$i2c_link_v2.obj) {
+            log info, 4: "No slave connected nacking start (0x%x) to i2c slave", address;
+            $i2c_master_v2.acknowledge(I2C_noack);
+            return;
+        }
+        log info, 4: "forwarding start (0x%x) to i2c slave", address;
+        $i2c_link_v2.i2c_slave_v2.start(address);
+    }
+
+    method write(uint8 value) {
+        if (!$i2c_link_v2.obj) {
+            log info, 4: "No slave connected nacking write to i2c slave";
+            $i2c_master_v2.acknowledge(I2C_noack);
+            return;
+        }
+        log info, 4: "forwarding write data (0x%x) to i2c slave", value;
+        $i2c_link_v2.i2c_slave_v2.write(value);
+    }
+
+    method sdr_write(bytes_t buf) {
+        log error: "received unexpected i3c write request from master";
+    }
+
+    method ibi_start() {
+        log error: "received unexpected IBI start from master";
+    }
+
+    method ibi_acknowledge(i3c_ack_t ack) {
+        log error: "received unexpected IBI acknowledge from master";
+    }
+
+    method read() {
+        if (!$i2c_link_v2.obj)
+            return;
+        log info, 4: "forwarding read request to i2c slave";
+        $i2c_link_v2.i2c_slave_v2.read();
+    }
+
+    method stop() {
+        if (!$i2c_link_v2.obj)
+            return;
+        log info, 4: "forwarding stop to i2c slave";
+        $i2c_link_v2.i2c_slave_v2.stop();
+    }
+}

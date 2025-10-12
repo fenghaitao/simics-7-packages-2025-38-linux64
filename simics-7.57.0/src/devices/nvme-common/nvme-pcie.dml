@@ -1,0 +1,150 @@
+
+/*
+  nvme-pcie.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "nvme.dml";
+import "pcie/common.dml";
+import "pcie/capabilities.dml";
+
+param TRANSPORT_OFFSET = 0x1000;
+
+template doorbell is register {}
+
+template no_access is (read, write) {
+    method write(uint64 value) {
+        log spec_viol: "Illegal access to %s", this.qname;
+    }
+    method read() -> (uint64) {
+        log spec_viol: "Illegal access to %s", this.qname;
+        return 0;
+    }
+}
+
+// This implementation of an NVM Express IO controller uses MSI-X for
+// interrupts. It places the MSI-X data at the start of the vendor specific
+// section of the controller properties.
+template nvme_pcie_io_controller is (pcie_endpoint, nvme_io_controller) {
+    param VENDOR_ID : uint24;
+    param DEVICE_ID : uint16;
+
+    bank pcie_config {
+        register vendor_id { param init_val = VENDOR_ID; }
+        register device_id { param init_val = DEVICE_ID; }
+        register class_code { param init_val = 0x010802; }
+        register bar0_1 @ 0x10 is (memory_base_address_64) {
+            param map_obj = properties.obj;
+            param size_bits = 14;
+        }
+        register capabilities_ptr { param init_val = 0x40; }
+
+        is defining_pm_capability;
+        param pm_offset = 0x40;
+        param pm_next_ptr = pm_offset + 0x08;
+
+        is defining_msix_capability;
+        param msix_offset = pm_next_ptr;
+        param msix_next_ptr = msix_offset + 0x0C;
+        param msix_num_vectors = 32;
+        param msix_table_offset_bir = 0x1300;
+        param msix_pba_offset_bir = msix_table_offset_bir +
+            (0x10 * msix_num_vectors);
+        param msix_data_bank = msix_data;
+
+        is defining_exp_capability;
+        param exp_offset = msix_next_ptr;
+        param exp_next_ptr = 0x0;
+        param exp_dp_type = PCIE_DP_Type_EP;
+    }
+
+    bank properties {
+        // These registers should not be accessed by the NVME host when the
+        // target is implemented using MSI-X.
+        register INTMS is no_access;
+        register INTMC is no_access;
+
+        group doorbells[y < (max_ioqpairs + 1)] {
+            register SQyTDBL size 4 @
+                TRANSPORT_OFFSET + (2 * y * 4) is
+                doorbell {
+                field SQT @ [15:0] is write {
+                    method write(uint64 value) {
+                        log info, 4: "old SQT: %d. new SQT: %d", this.val, value;
+                        default(value);
+                        doorbell_event(y);
+                    }
+                }
+            }
+            register CQyHDBL size 4 @
+                TRANSPORT_OFFSET + ((2 * y + 1) * 4) is
+                doorbell {
+                field CQH @ [15:0];
+            }
+        }
+    }
+
+    bank msix_data is msix_table {
+        param msix_bank = pcie_config;
+    }
+
+    method interrupt(uint16 iv) {
+        pcie_config.msix.raise(iv);
+    }
+
+    method reset_doorbells() {
+        foreach r in (each doorbell in (this)) {
+            r.val = 0;
+        }
+    }
+
+    method get_submission_q_tail(uint16 q_id) -> (uint32) {
+        return properties.doorbells[q_id].SQyTDBL.SQT.val;
+    }
+
+    method get_completion_q_head(uint16 q_id) -> (uint32) {
+        return properties.doorbells[q_id].CQyHDBL.CQH.val;
+    }
+
+    method transport_read(uint64 addr, size_t len, void *buf) -> (bool) {
+        local buffer_t buffer  = {
+            .data = cast(buf, uint8*),
+            .len = len
+        };
+        local pcie_error_t pcie_err = pcie_config.memory.read_bytes(addr,
+            buffer);
+        if (pcie_err != PCIE_Error_No_Error) {
+            log error, 2: "PCIe memory read failed with error code %d",
+                       pcie_err;
+            return false;
+        }
+        return true;
+    }
+
+    method transport_write(uint64 addr, size_t len, void *buf) -> (bool) {
+        local bytes_t bytes  = {
+            .data = cast(buf, uint8*),
+            .len = len
+        };
+        local pcie_error_t pcie_err = pcie_config.memory.write_bytes(addr,
+            bytes);
+        if (pcie_err != PCIE_Error_No_Error) {
+            log error, 2: "PCIe memory write failed with error code %d",
+                       pcie_err;
+            return false;
+        }
+        return true;
+    }
+}

@@ -1,0 +1,104 @@
+/*
+  ns16x50-dma.dml - Defines UART DMA signaling.
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "simics/devs/serial-device.dml";
+
+attribute RXRDYn_high "Internal: Monitors RXRDYn signal state.";
+connect RXRDYn "DMA signal that device can use to monitor reception.";
+attribute TXRDYn_high "Internal: Monitors TXRDYn signal state.";
+connect TXRDYn "DMA signal that device can use to monitor transmission.";
+
+attribute RXRDYn_high {
+    parameter allocate_type = "bool";
+}
+connect RXRDYn {
+    parameter ishigh = $RXRDYn_high;
+    is signal_control;
+}
+attribute TXRDYn_high {
+    parameter allocate_type = "bool";
+}
+connect TXRDYn {
+    parameter ishigh = $TXRDYn_high;
+    is signal_control;
+}
+attribute multiple_transfer {
+    parameter allocate_type = "bool";
+}
+
+method set_dma_signaling(bool multi)
+{
+    $multiple_transfer = multi;
+    call $check_recv_dma();
+    call $check_xmit_dma();
+}
+
+method uart_after_int_reevaluate() {
+    inline $check_recv_dma();
+}
+
+method check_recv_dma()
+{
+    if ($multiple_transfer && $in_fifo_mode) {
+        if ($regs.ii.rd == 1 || $regs.ii.ct == 1)
+            call $RXRDYn.go_low();
+        else if ($recv_fifo.len == 0)
+            call $RXRDYn.go_high();
+    } else {
+        if ($recv_fifo.len > 0)
+            call $RXRDYn.go_low();
+        else if ($recv_fifo.len == 0)
+            call $RXRDYn.go_high();
+    }
+}
+
+method check_xmit_dma()
+{
+    if ($multiple_transfer && $in_fifo_mode) {
+        if ($xmit_fifo.len == 0)
+            call $TXRDYn.go_low();
+        else if ($xmit_fifo.len == $fifo_depth)
+            call $TXRDYn.go_high();
+    } else {
+        if ($xmit_fifo.len == 0)
+            call $TXRDYn.go_low();
+        else if ($xmit_fifo.len > 0)
+            call $TXRDYn.go_high();
+    }
+}
+
+template signal_control {
+    interface signal;
+    is optional;
+    method go_high()
+    {
+        if ($obj && !$ishigh) {
+            log info, 4: "SIG: '%s' now raised.", $qname;
+            $signal.signal_raise();
+            $ishigh = true;
+        }
+    }
+    method go_low()
+    {
+        if ($obj && $ishigh) {
+            log info, 4: "SIG: '%s' now lowered.", $qname;
+            $signal.signal_lower();
+            $ishigh = false;
+        }
+    }
+}
+

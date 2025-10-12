@@ -1,0 +1,115 @@
+/*
+  NS16450.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device NS16450;
+parameter desc = "model of NS 16450 UART";
+
+import "ns16x50-common.dml";
+import "ns16x50-reset.dml";
+
+bank regs {
+    is uart_bank;
+    parameter function = 0;
+    parameter iir_offset = 0x0002;
+}
+
+parameter dev_bank = $regs;
+
+attribute recv_buffer {
+    parameter allocate_type = "int32";
+}
+attribute xmit_buffer {
+    parameter allocate_type = "int32";
+}
+
+method uart_init() {
+    $recv_buffer = -1;
+    $xmit_buffer = -1;
+}
+
+method recv_buffer_length() -> (length) {
+    length = ($recv_buffer != -1) ? 1 : 0;
+}
+
+method recv_buffer_read() -> (empty, value)
+{
+    if ($recv_buffer != -1) {
+        empty = false;
+        value = $recv_buffer;
+        $recv_buffer = -1;
+        inline $regs.ii.rd.put(0);
+    } else {
+        empty = true;
+    }
+}
+
+method recv_buffer_write(value)
+{
+    if ($recv_buffer == -1) {
+        $recv_buffer = value;
+        log info, 3: "RECV: Data %#x pushed on buffer.", value;
+        inline $regs.ii.rd.put(1);
+    } else {
+        log info, 3: "RECV: Recv buffer not empty, overrun raised!";
+        inline $regs.ii.rs.put(1);
+    }
+}
+
+method xmit_buffer_length() -> (length) {
+    length = ($xmit_buffer != -1) ? 1 : 0;
+}
+
+method xmit_buffer_read() -> (empty, value)
+{
+    if ($xmit_buffer != -1) {
+        empty = false;
+        value = $xmit_buffer;
+        $xmit_buffer = -1;
+        inline $regs.ii.te.put(1);
+    } else {
+        empty = true;
+    }
+}
+
+method xmit_buffer_write(value)
+{
+    if ($xmit_buffer == -1) {
+        $xmit_buffer = value;
+        inline $regs.ii.te.put(0);
+        inline $transmit.soon();
+    }
+}
+
+method should_throttle() -> (bool throttle) {
+    throttle = ($recv_buffer != -1);
+}
+
+bank regs {
+    register rtb {
+        method hard_reset()
+        {
+            $recv_buffer = -1;
+            $xmit_buffer = -1;
+            $regs.ii.rd = 0;
+            $regs.ii.te = 1;
+            call $regs.ii.reevaluate();
+        }
+        method soft_reset() {
+            // Soft reset won't clear the buffer.
+        }
+    }
+}

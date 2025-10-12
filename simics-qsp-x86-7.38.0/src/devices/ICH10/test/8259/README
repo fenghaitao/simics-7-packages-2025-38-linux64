@@ -1,0 +1,19 @@
+ICH10 8259A Interrupt Controller Test Description
+================================================
+
+Included Cases
+--------------
+The ICH10 8259A interrupt controller test totally includes 6 cases:
+(1) s-8259-reset.py: tests default states of 8259A
+(2) s-8259-intr.py: tests 15 interrupts of 8259A
+(3) s-8259-mask.py: tests interrupt masking of 8259A
+(4) s-8259-eoi.py: tests end-of-interrupt commands to 8259A
+(5) s-8259-trig-mode.py: tests triggering mode of interrupts in 8259A
+(6) s-8259-nested-mode.py: tests nested interrupts in 8259A
+
+
+
+Not Tested Features
+-------------------
+(1) Only fully-nested mode is tested, other modes as special fully-nested, 
+    automatic rotation, specific rotation, poll modes are not tested. 

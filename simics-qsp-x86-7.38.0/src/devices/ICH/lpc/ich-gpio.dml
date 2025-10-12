@@ -1,0 +1,56 @@
+/*
+  ich-gpio.dml
+
+  © 2011 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter gpio_function default undefined;
+
+bank pci_config {
+    register gpiobase @ 0x48 is (io_base_address) {
+        parameter desc = "GPIO Base Address Register";
+        parameter map_func = $gpio_function;
+        method pci_mapping_enabled()->(bool enabled) {
+            enabled = $gc.en;
+        }
+    }
+    register gpiobase { parameter size_bits = 6; }
+    register gc size 1 @ 0x4C "GPIO Control Register" {
+        field en  [4] "GPIO Enable";
+        field gle [0] "GPIO Lockdown Enable";
+        method after_write(mop) {
+            call $gpiobase.update_mapping();
+        }
+    }
+}
+
+bank gpio_conf {
+    parameter documentation = "GPIO Configuration registers";
+    parameter limitations = "This is a dummy implementation";
+    parameter function = $gpio_function;
+    parameter register_size = 4;
+
+    register gpio_use_sel  @ 0x00 "GPIO Use Select";
+    register gp_io_sel     @ 0x04 "GPIO Input/Output Select";
+    register gp_lvl        @ 0x0c "GPIO Lvl for Input/Output";
+    register gpo_blink     @ 0x18 "GPIO Blink Enable";
+    register gp_ser_blink  @ 0x1c "GP Serial Blink";
+    register gp_sb_cmdsts  @ 0x20 "GP Serial Blink Cmd Status";
+    register gp_sb_data    @ 0x24 "GP Serial Blink Data";
+    register gp_inv        @ 0x2c "GPIO Signal Invert";
+    register gpio_use_sel2 @ 0x30 "GPIO Use Select 2";
+    register gpio_sel2     @ 0x34 "GPIO Input/Output Select 2";
+    register gp_lvl_2      @ 0x38 "GPIO Lvl for Input/Output 2";
+}
+

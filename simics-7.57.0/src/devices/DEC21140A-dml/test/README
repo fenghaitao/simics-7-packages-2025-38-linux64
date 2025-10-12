@@ -1,0 +1,7 @@
+This is a sample test of the DEC21140A Ethernet controller.
+
+The tests only cover a very small part of this complex device, but
+they are written to illustrate various testing methods. In particular,
+they show how to test a device that interacts with its environment in
+various ways: network packet transmission, memory access (DMA), PCI
+bus configuration, and interrupts.

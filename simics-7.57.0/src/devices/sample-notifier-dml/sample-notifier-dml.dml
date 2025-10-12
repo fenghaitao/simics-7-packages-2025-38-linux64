@@ -1,0 +1,155 @@
+/*
+ * sample-notifier-dml -- sample DML device subscribing to and publishing
+   notifiers
+
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_notifier_dml;
+
+import "simics/devs/frequency.dml";
+import "simics/simulator/sim-get-class.dml";
+
+param desc = "example device using notifiers";
+
+param documentation =
+    "Example of a device both subscribing to and publishing notifiers";
+
+// This connect is not only used for its 'frequency' interface, but also
+// to provide a Sim_Notify_Frequency_Change notifier to subscribe to.
+connect frequency_provider {
+    param configuration = "required";
+    param documentation = "upstream frequency provider, whose frequency and"
+        + " frequency change notification is forwarded through the device, with"
+        + " the frequency being modulated according to multiplier";
+
+    // Handle to the notifier that the device subscribes to. Restored upon
+    // checkpoint restoration via set().
+    session notifier_handle_t *handle;
+
+    // Provides a single method get() -> (double) which retrieves the frequency
+    // of the connected device.
+    interface frequency;
+
+    method validate(conf_object_t *new_obj) -> (bool) {
+        return SIM_has_notifier(new_obj, Sim_Notify_Frequency_Change);
+    }
+
+    method set(conf_object_t *new_obj) {
+        if (new_obj == obj) {
+            return;
+        }
+
+        if (handle) {
+            assert obj;
+            SIM_delete_notifier(obj, handle);
+            handle = NULL;
+        }
+
+        default(new_obj);
+
+        // Subscribe to the new object's Sim_Notify_Frequency_Change
+        // notifier, and provide on_notify_frequency_change as the callback
+        // with no auxiliary data.
+        handle = SIM_add_notifier(obj, Sim_Notify_Frequency_Change, dev.obj,
+                                  &on_notify_frequency_change, NULL);
+        assert handle;
+
+        // This is to support the frequency provider being swapped
+        // after instantiation, as that would mean the frequency being
+        // changed.
+        // This isn't necessary if the multiplier is never changed after
+        // instantiation
+        notify_downstream();
+    }
+}
+
+method notify_downstream() {
+    // frequency_provider.obj can be NULL if the device has not yet been
+    // configured, and we don't want to publish the notifier if so.
+    // One issue this avoids is SIM_notify being called due to the multiplier
+    // being set before frequency_provider has been set
+    if (frequency_provider.obj) {
+        log info, 4: "Notifying downstream devices of frequency change";
+        // Publish to the device's frequency-change notifier,
+        // causing all objects subscribed to it to be notified
+        SIM_notify(dev.obj, frequency_change_notifier());
+    }
+}
+
+attribute multiplier is (double_attr, init) "frequency multiplier" {
+    param documentation = "frequency forwarded through the device from the "
+        + "frequency provider is multiplied by this amount";
+
+    method init() {
+        // default multiplier is 1
+        this.val = 1;
+    }
+
+    method set(attr_value_t val) throws {
+        local double new_multiplier = SIM_attr_floating(val);
+        local double old_multiplier = this.val;
+
+        default(val);
+
+        // This check is to support the multiplier being changed
+        // after instantiation, as that would mean the frequency being
+        // changed.
+        // This isn't necessary if the connected object is never changed
+        // after instantiation.
+        if (new_multiplier != old_multiplier) {
+            log info, 4: "multiplier changed: %f -> %f",
+                old_multiplier, new_multiplier;
+            notify_downstream();
+        }
+    }
+}
+
+implement frequency {
+    method get() -> (double) {
+        return frequency_provider.frequency.get() * multiplier.val;
+    }
+}
+
+// The callback used for the subscription to frequency_provider.obj's
+// frequency-change notifier.
+// The two unused parameters are to fit the required signature for
+// SIM_add_notifier: &on_notify_frequency_change will be of type
+// 'void (*)(conf_object_t *obj, conf_object_t *notifier, void *data)'
+method on_notify_frequency_change(conf_object_t *_notifier, void *_data) {
+    // Forward the frequency-change notification to any objects subscribed to
+    // this device
+    notify_downstream();
+}
+
+// Independent startup methods are called when the Simics module is loaded.
+// Independent startup memoized means after that first call, all subsequent
+// calls skip the definition and return the original return value(s).
+// This can be used to register custom notifier types on module load, and then
+// retrieve that notifier type by calling the method again.
+independent startup memoized method frequency_change_notifier()
+    -> (notifier_type_t) {
+    // This is unnecessary, as SIM_notifier_type("frequency-change")
+    // is the same as Sim_Notify_Frequency_Change, but this shows how to
+    // register custom notifier types and remember them for later use
+    local notifier_type_t notifier = SIM_notifier_type("frequency-change");
+
+    // Register frequency-change as a notifier type that the device class
+    // supports.
+    // The device class is retrieved through SIM_get_class(dev.classname);
+    // the more common pattern of SIM_object_class(dev.obj) is not valid as
+    // dev.obj is not available within independent methods
+    SIM_register_notifier(SIM_get_class(dev.classname), notifier, NULL);
+    return notifier;
+}

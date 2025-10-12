@@ -1,0 +1,124 @@
+/*
+  virtio-mmio-entropy.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device virtio_mmio_entropy;
+param classname = "virtio-mmio-entropy";
+
+param desc = "model of virtio MMIO entropy source";
+
+param documentation = "virtio MMIO entropy source";
+
+import "utility.dml";
+import "virtio-mmio-common.dml";
+import "simics/util/genrand.dml";
+
+is mmio_virtio_device;
+
+attribute seed is (int64_attr) {
+    param documentation = "Seed for entropy generator";
+    param configuration = "required";
+
+    param max = (1 << 32) - 1;
+    method set(attr_value_t val) throws {
+        if (SIM_attr_integer(val) <= 0
+            || SIM_attr_integer(val) > max) {
+            SIM_c_attribute_error("value %llu is outside valid range [%lld, %lld]",
+                                  SIM_attr_integer(val), 1, max);
+            throw;
+        }
+        default(val);
+    }
+}
+
+attribute total_entropy_bytes is (int64_attr) {
+    param documentation = "Total number of entropy bytes generated";
+}
+
+method destroy() {
+    genrand_destroy(entropy.rs);
+}
+
+group entropy is (post_init) {
+    session rand_state_t* rs;
+    attribute state {
+        param internal = true;
+        param type = "d";
+
+        method set(attr_value_t val) throws {
+            local bytes_t blob = { .data = SIM_attr_data(val),
+                                   .len = SIM_attr_data_size(val) };
+            if (rs != NULL) {
+                SIM_c_attribute_error("%s Unexpected set of attribute", qname);
+                throw;
+            }
+            rs = genrand_init(0);
+            if (!genrand_restore(rs, blob)) {
+                SIM_c_attribute_error("%s attribute value is not a valid serialization", qname);
+                throw;
+            }
+        }
+        method get() -> (attr_value_t) {
+            local bytes_t blob = genrand_serialization(rs);
+            return SIM_make_attr_data_adopt(blob.len, cast(blob.data, void *));
+        }
+    }
+    method post_init() {
+        if (!SIM_is_restoring_state(dev.obj)) {
+            if (rs)
+                genrand_destroy(rs);
+            rs = genrand_init(seed.val);
+        }
+    }
+    method generate(buffer_t buf) {
+        log info, 3: "%d random bytes", buf.len;
+        total_entropy_bytes.val += buf.len;
+
+        local int words = (buf.len + 3) / 4;
+        local uint32 rand_vals[words];
+        for (local int i = 0; i < words; i++) {
+            rand_vals[i] = genrand_uint32(rs);
+        }
+        memcpy(buf.data, rand_vals, buf.len);
+    }
+}
+
+param device_id_val = VIRTIO_ID_RNG;
+param NUM_QUEUES = 1;
+
+bank mmio {
+    param config_regs_offset = parent.config_regs_offset;
+}
+method handle_notify(uint16 virtq_idx) throws {
+    assert(virtq_idx == 0);
+    request_q_handler.handle_notify(virtq_idx);
+}
+
+group request_q_handler is virtq_request_handler {
+    param max_request_size = 1000;
+    method process_request(virtq_desc_list_t *desc_list) -> (uint32) throws {
+        local uint32 used = umin(max_request_size, desc_list->len);
+        local uint8 bounce_buf[used];
+
+        local buffer_t buf = { .data = bounce_buf, .len = used };
+
+        entropy.generate(buf);
+
+        virtq_desc_data_write(desc_list, 0, buf.len, buf.data);
+
+        return used;
+    }
+}

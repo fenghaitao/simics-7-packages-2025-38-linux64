@@ -1,0 +1,389 @@
+/*
+  e1000-mac-types.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+/*************************************************************************
+ * Rx Descriptor Types
+ */
+typedef layout "little-endian" {
+    uint64 buf_addr;
+    bitfields 64 {
+        uint3  pri    @ [63:61]; // VLAN: Priority
+        uint1  cfi    @ [60:60]; // VLAN: Canonical Form Indicator
+        uint12 vlan   @ [59:48]; // VLAN: Identifier
+        uint1  rxe    @ [47:47]; // Error: Rx Data Error
+        uint1  ipe    @ [46:46]; // Error: IPv4 Checksum Error
+        uint1  tcpe   @ [45:45]; // Error: TCP/UDP Checksum Error
+        uint1  cxe    @ [44:44]; // Error: Carrier Extension Error
+        uint1  seq    @ [42:42]; // Error: Sequence Error
+        uint1  se     @ [41:41]; // Error: Symbol Error
+        uint1  ce     @ [40:40]; // Error: CRC or alignment Error
+        uint1  pif    @ [39:39]; // Status: Passed In-Exact Filter
+        uint1  ipcs   @ [38:38]; // Status: IPv4 checksum calculated on packet
+        uint1  tcpcs  @ [37:37]; // Status: TCP checksum calculated on packet
+        uint1  udpcs  @ [36:36]; // Status: UPD Checksum Calculated on Packet
+        uint1  vp     @ [35:35]; // Status: Packet is 802.31Q
+        uint1  ixsm   @ [34:34]; // Status: Ignore Checksum Indication
+        uint1  eop    @ [33:33]; // Status: End of Packet
+        uint1  dd     @ [32:32]; // Status: Descriptor Done
+        uint16 fcs    @ [31:16]; // Packet Checksum
+        uint16 length @ [15:0];  // Length
+    } desc;
+} legacy_rx_desc_t; //RCTL.DTYP == 0 and RFCTL.EXSTEN == 0
+
+
+// Extended Rx Descriptor Read Format
+typedef layout "little-endian" {
+    uint64 buf_addr;
+    uint64 rsv;
+} ext_rd_rx_desc_t;//RCTL.DTYP == 0 and RFCTL.EXSTEN == 1
+
+typedef bitfields 64 {
+    uint32 rss_info @ [63:32]; // RSS_Hash[63:32] or CS[63:48]IP_ID[47:32]
+    uint8  link_sec @ [31:24];
+    uint5  queue    @ [12:8];  // Receive Queue
+    uint4  rss_type @ [3:0];   // RSS Type
+} ext_word0_t;
+
+typedef bitfields 64 {
+    uint3  pri    @ [63:61]; // VLAN Tag: Priority
+    uint1  cfi    @ [60:60]; // VLAN Tag: Canonical Form Indicator
+    uint12 vlan   @ [59:48]; // VLAN Tag: Identifier
+    uint16 length @ [47:32];
+    uint1  rxe    @ [31:31]; // Extended Errors: Rx data error
+    uint1  ipe    @ [30:30]; // Extended Errors: IPv4 checksum error
+    uint1  tcpe   @ [29:29]; // Extended Errors: TCP/UDP checksum error
+    uint1  cxe    @ [28:28]; // Extended Errors: CXE extension error
+    uint1  seq    @ [26:26]; // Extended Errors: Sequence error
+    uint1  se     @ [25:25]; // Extended Errors: Symbol error
+    uint1  ce     @ [24:24]; // Extended Errors: CRC Error or Alignment error
+
+    uint4  pkttype @ [19:16];// Extended Status: Packet type
+
+    uint1  ack    @ [15:15]; // Extended Status: ACK packet identification
+    uint1  udpv   @ [10:10]; // Extended Status: Valid UDP XSUM
+    uint1  ipidv  @ [9:9];   // Extended Status: IP identification valid
+    uint1  tst    @ [8:8];   // Extended Status: Timestamp taken
+
+    uint1  pif    @ [7:7];   // Extended Status: Passed In-Exact Filter
+
+    uint1  ipcs   @ [6:6];   // Extended Status: IPv4 checksum calculated
+    uint1  tcpcs  @ [5:5];   // Extended Status: TCP checksum calculated
+    uint1  udpcs  @ [4:4];   // Extended Status: UDP checksum calculated
+    uint1  vp     @ [3:3];   // Extended Status: Packet is 802.1q
+    uint1  eop    @ [1:1];   // Extended Status: End of packet
+    uint1  dd     @ [0:0];   // Extended Status: Descriptor done
+} ext_word1_t;
+
+// Extended Rx Descriptor Write Format
+typedef layout "little-endian" {
+    ext_word0_t desc0;
+    ext_word1_t desc1;
+} ext_wb_rx_desc_t;//RCTL.DTYP == 0 and RFCTL.EXSTEN == 1
+
+typedef layout "little-endian" {
+    uint64 buf_addr[4];//buf_addr[1] |= 1, when descriptor done
+} split_rd_rx_desc_t;//RCTL.DTYP == 1 and RFCTL.EXSTEN == 1
+
+typedef layout "little-endian" {
+    ext_word0_t desc0;
+    ext_word1_t desc1;
+    bitfields 64 {
+        uint16 length3 @ [63:48];
+        uint16 length2 @ [47:32];
+        uint16 length1 @ [31:16];
+        uint1  hdrsp   @ [15:15]; //header/data receive split
+        uint10 hlen    @ [9:0];
+    } desc2;
+    uint64 rsv;
+} split_wb_rx_desc_t;//RCTL.DTYP == 1 and RFCTL.EXSTEN == 1
+
+
+// Advanced Rx Descriptor Read Format
+typedef layout "little-endian" {
+    uint64 buf_addr;
+    uint64 head_addr;
+} adv_rd_rx_desc_t;//RCTL.DTYP == 1-5 and RFCTL.EXSTEN == 1
+
+
+// Advanced Rx Descriptor Write Format
+typedef layout "little-endian" {
+    adv_word0_t desc0;
+    adv_word1_t desc1;
+} adv_wb_rx_desc_t;//RCTL.DTYP == 0 and RFCTL.EXSTEN == 1
+
+typedef bitfields 64 {
+    uint32 rss_info @ [63:32];//RSS_Hash[63:32] or CS[63:48]IP_ID[47:32]
+    uint1  sph      @ [31:31]; //split header
+    uint10 hdr_len  @ [30:21];
+    // reserved @ [20:17]
+    uint1  vpkt     @ [16:16];
+    uint1  l2p      @ [15:15];
+    uint11 packet_type @ [14:4];
+    uint4  rss_type @ [3:0];  //RSS Type
+} adv_word0_t;
+
+typedef bitfields 64 {
+    uint3  pri    @ [63:61];//VLAN tag: Priority
+    uint1  cfi    @ [60:60];//VLAN tag: Canonical Form Indicator
+    uint12 vlan   @ [59:48];//VLAN tag: VLAN Identifier
+    uint16 length @ [47:32];
+    uint1  rxe    @ [31:31];//Errors: Rx Data Error
+    uint1  ipe    @ [30:30];//Errors: IP Checksum Error
+    uint1  l4e    @ [29:29];//Errors: L4 error indication
+    uint2  secerr @ [28:27];//Errors: security error
+    // reserved   @ [26:24]
+    uint1  hbo    @ [23:23];//Errors: header buffer overflow
+    // reserved   @ [22:20]
+    uint1  ce     @ [24:24];//Errors: CRC Error or Alignment Error
+    // reserved   @ [23:20]
+    // reserved   @ [19:19]
+    uint1  lb     @ [18:18];//Status: LB
+    uint1  secp   @ [17:17];//Status: SECP
+    uint1  ts     @ [16:16];//Status: Time Stamped Packet
+    // reserved   @ [15:13]
+    uint1  scrc   @ [12:12];//Status: strip CRC
+    uint1  llint  @ [11:11];//Status: LLINT
+    uint1  udpv   @ [10:10];//Status: UDPV
+    uint1  vext   @ [9:9];  //Status: vext
+    // reserved   @ [8:8]
+    uint1  pif    @ [7:7];  //Status: Passed In-Exact Filter
+    uint1  ipcs   @ [6:6];  //Status: ipv4 checksum calculated on packet
+    uint1  l4i    @ [5:5];  //Status: L4 integrity check
+    uint1  udpcs  @ [4:4];  //Status: UPD Checksum Calculated on Packet
+    uint1  vp     @ [3:3];  //Status: Packet is 802.31Q
+    // reserved   @ [2:2]
+    uint1  eop    @ [1:1];  //Status: End of Packet
+    uint1  dd     @ [0:0];  //Status: Descriptor Done
+} adv_word1_t;
+
+typedef layout "little-endian" {
+    uint64 buf_addr[4];//buf_addr[1] |= 1, when descriptor done
+} adv_split_rd_rx_desc_t;//RCTL.DTYP == 1 and RFCTL.EXSTEN == 1
+
+typedef layout "little-endian" {
+    adv_word0_t desc0;
+    adv_word1_t desc1;
+    bitfields 64 {
+        uint16 length3 @ [63:48];
+        uint16 length2 @ [47:32];
+        uint16 length1 @ [31:16];
+        uint1  hdrsp   @ [15:15]; //header/data receive split
+        uint10 hlen    @ [9:0];
+    } desc2;
+    uint64 rsv;
+} adv_split_wb_rx_desc_t; //RCTL.DTYP == 1 and RFCTL.EXSTEN == 1
+
+
+/*************************************************************************
+ * Tx Descriptor Types
+ */
+typedef layout "little-endian" {
+    uint64 desc0;
+    bitfields 64 {
+        uint1  dext   @ [29:29]; // Command: Extension
+        uint1  eop    @ [24:24]; // Command: End of Packet
+        uint4  dtyp   @ [23:20]; // Descriptor type
+    } desc1;
+} generic_ext_desc_t;
+
+typedef layout "little-endian" {
+    bitfields 64 {
+        uint16 tucse @ [63:48]; //TCP/UDP checksum ending
+        uint8  tucso @ [47:40]; //TCP/UDP checksum offset
+        uint8  tucss @ [39:32]; //TCP/UDP checksum start
+        uint16 ipcse @ [31:16]; //IP checksum ending
+        uint8  ipcso @ [15:8];  //IP checksum offset
+        uint8  ipcss @ [7:0];   //IP checksum start
+    } desc0;
+    bitfields 64 {
+        uint16 mss    @ [63:48]; //max segment size
+        uint8  hdrlen @ [47:40]; //header length
+        uint1  dd     @ [32:32]; //Status: Descriptor Done
+        uint1  ide    @ [31:31]; //Command: Interrupt Delay Enable
+        uint1  snap   @ [30:30]; //Command: SNAP
+        uint1  dext   @ [29:29]; //Command: Extension: 1
+        uint1  rs     @ [27:27]; //Command: Report Status
+        uint1  tse    @ [26:26]; //Command: TCP Segmentation Enable
+        uint1  ip     @ [25:25]; //Command: 0 IPv4, 1 IPv6
+        uint1  tcp    @ [24:24]; //Command: 0 non-TCP, 1 TCP
+        uint4  dtyp   @ [23:20]; //0b0000
+        uint20 paylen @ [19:0];
+    } desc1;
+} tcp_ip_ctx_desc_t;
+
+typedef layout "little-endian" {
+    uint64 buf_addr;
+    bitfields 64 {
+        uint3  pri    @ [63:61]; //Special: Priority
+        uint1  cfi    @ [60:60]; //Special: Canonical Form Indicator
+        uint12 vlan   @ [59:48]; //Special: VLAN Identifier
+        uint1  txsm   @ [41:41]; //Option: Insert TCP/UDP checksum
+        uint1  ixsm   @ [40:40]; //Option: Insert IP checksum
+        uint1  ts     @ [36:36]; //Extended command: Time Stamp
+        uint1  dd     @ [32:32]; //Status: Descriptor Done
+        uint1  ide    @ [31:31]; //Command: Interrupt Delay Enable
+        uint1  vle    @ [30:30]; //Command: VLAN Packet Enable
+        uint1  dext   @ [29:29]; //Command: Extension: 1
+        uint1  ilsec  @ [28:28]; //Command: Includes LinkSec encapsulation
+        uint1  rs     @ [27:27]; //Command: Report Status
+        uint1  tse    @ [26:26]; //Command: TCP Segmentation Enable
+        uint1  ifcs   @ [25:25]; //Command: Insert FCS
+        uint1  eop    @ [24:24]; //Command: End of Packet
+        uint4  dtyp   @ [23:20]; //0b0001
+        uint20 dtalen @ [19:0];
+    } desc;
+} tcp_ip_data_desc_t;
+
+typedef layout "little-endian" {
+    bitfields 64 {
+        uint8  ipsec @ [39:32];
+        uint3  pri   @ [31:29]; //priority
+        uint1  cfi   @ [28:28]; //Canonical Form Indicator
+        uint12 vlan  @ [27:16]; //VLAN ID
+        uint7  maclen @ [15:9];  //IP checksum offset
+        uint9  iplen @ [8:0];   //IP checksum start
+    } desc0;
+    bitfields 64 {
+        uint16 mss    @ [63:48]; //max segment size
+        uint8  l4len @ [47:40];  //L4 header length
+        uint3  idx    @ [38:36]; 
+        uint1  dext   @ [29:29]; //Command: Extension: 1
+        uint4  dtyp   @ [23:20]; //0b0010
+        uint1  encrypt @ [14:14]; //Encryption - ESP encryption offload required
+        uint1  ipsec_t @ [13:13]; //Set for ESP, cleared for AH
+        uint2  l4t     @ [12:11]; //L4 packet type (00 UDP, 01 TCP, 10 SCTP, 11 RSV)
+        uint1  ipv4    @ [10:10]; //IP pkt type (1 IPv4, 0 IPv6)
+        uint1  snap    @ [9:9]; //snap indication
+        uint9 ips_esp_len @ [8:0];
+    } desc1;
+} advanced_ctx_desc_t;
+
+typedef layout "little-endian" {
+    uint64 buf_addr;
+    bitfields 64 {
+        uint18 paylen @ [63:46]; //Special: Priority
+        // reserved   @ [45:43]
+        uint1  ipsec  @ [42:42]; //IPSEC offload request
+        uint1  txsm   @ [41:41]; //Option: Insert TCP/UDP checksum
+        uint1  ixsm   @ [40:40]; //Option: Insert IP checksum
+    // reserved  @ [39:39]
+        uint3  idx    @ [38:36]; //Extended command: Time Stamp
+        // reserved   @ [35:33]
+        uint1  dd     @ [32:32]; //Status: Descriptor Done
+        uint1  tse    @ [31:31]; //Command: TCP/UDP Segmentation Enable
+        uint1  vle    @ [30:30]; //Command: VLAN Packet Enable
+        uint1  dext   @ [29:29]; //Command: Extension: 1
+        // reserved   @ [28:28]
+        uint1  rs     @ [27:27]; //Command: Report Status
+    // reserved @ [26:26]
+        uint1  ifcs   @ [25:25]; //Command: Insert FCS
+        uint1  eop    @ [24:24]; //Command: End of Packet
+        uint4  dtyp   @ [23:20]; //0b0001
+        uint2  mac    @ [19:18];
+    // reserved @ [17:16]
+        uint16 dtalen @ [15:0];
+    } desc;
+} advanced_data_desc_t;
+
+typedef layout "little-endian" {
+    uint64 buf_addr;
+    bitfields 64 {
+        uint3  pri    @ [63:61]; // VLAN: Priority
+        uint1  cfi    @ [60:60]; // VLAN: Canonical Form Indicator
+        uint12 vlan   @ [59:48]; // VLAN: Identifier
+        uint8  css    @ [47:40]; // Checksum Start (first descriptor)
+        uint1  dd     @ [32:32]; // Status: Descriptor Done
+        uint1  ide    @ [31:31]; // Command: Interrupt Delay Enable
+        uint1  vle    @ [30:30]; // Command: VLAN Packet Enable
+        uint1  dext   @ [29:29]; // Command: Extension: 0
+        uint1  rs     @ [27:27]; // Command: Report Status
+        uint1  ic     @ [26:26]; // Command: Insert Checksum
+        uint1  ifcs   @ [25:25]; // Command: Insert FCS
+        uint1  eop    @ [24:24]; // Command: End of Packet
+        uint8  cso    @ [23:16]; // Checksum Offset (last descriptor)
+        uint16 length @ [15:0];  //Length
+    } desc;
+} legacy_tx_desc_t;
+
+/*************************************************************************
+ * Frame info data structure
+ */
+typedef struct {
+    bool multi;
+    bool bcst;
+    bool ipv4;
+    bool ipv6;
+    bool tcp;
+    bool udp;
+    bool ipv4_ipv6; // Encapsulated IPv6
+    bool ipv4_ipv6_fragmented; // Encapsulated IPv6 fragmented
+
+    uint16 l2_index;//start of IP
+    uint16 l3_index;//start of TCP/UDP
+    uint16 l4_index;//start of L4 protocol
+    uint16 l5_index;//start of L5 protocol
+
+    /* L1 information */
+    bool vp;
+    bool drop_it;
+    bool l2_parse;
+    uint16 vlan;
+    uint16 length;
+    uint16 type;
+    uint16 packet_cs;
+    uint32 cal_crc;
+    uint32 rxd_crc;
+
+    /* L2 information */
+    bool ipe;
+    bool ipv6_ext;
+    bool l3_parse;
+    uint16 ip_id;
+    bool fragmented;
+
+    /* L3 information */
+    bool tupe;
+    uint8 l3_prot;
+    bool ack;
+
+    /* L4 information */
+    uint16 l4_prot; // TCP/UDP destination port
+    bool l4_udp;    // In case of encapsulated IPv6
+    bool l4_tcp;    // In case of encapsulated IPv6
+
+    /* L5 information */
+    uint16 l5_prot; // L5 protocol type
+
+    /* status */
+    uint1 rx_err;
+    uint1 pif;
+    uint32 hash;
+    uint5  cpu;
+    uint4  rss_type;
+    uint1  tst; // Time Stamp Taken
+    /* control struct */
+    void *desc;
+    uint64 buf_addr;
+} frame_info_t;
+
+template write_mask is write {
+    param mask default undefined;
+    method write(uint64 value) default {
+        this.val = value & mask;
+    }
+}
+

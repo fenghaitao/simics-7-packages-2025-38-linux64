@@ -1,0 +1,128 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/base/conf-object.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/base/sobject.dml";
+import "simics/base/attr-value.dml";
+import "simics/util/vect.dml";
+
+extern SIM_PYOBJECT *CORE_object_iterator(conf_object_t *obj);
+extern SIM_PYOBJECT *CORE_object_iterator_for_class(conf_class_t *cls);
+extern SIM_PYOBJECT *CORE_object_iterator_for_interface(attr_value_t ifaces);
+extern SIM_PYOBJECT *CORE_shallow_object_iterator(conf_object_t *obj, bool expand_arrays);
+extern void SIM_attribute_error(char const *msg);
+extern void SIM_c_attribute_error(char const *msg, ...);
+extern class_interface_t const *SIM_c_get_class_interface(conf_class_t const *cls, char const *name);
+extern class_interface_t const *SIM_c_get_class_port_interface(conf_class_t const *cls, char const *name, char const *portname);
+extern interface_t const *SIM_c_get_interface(conf_object_t const *obj, char const *name);
+extern interface_t const *SIM_c_get_port_interface(conf_object_t const *obj, char const *name, char const *portname);
+extern conf_class_t *SIM_copy_class(char const *name, conf_class_t const *src_cls, char const *desc);
+extern conf_class_t *SIM_create_class(char const *name, class_info_t const *class_info);
+extern void SIM_ensure_partial_attr_order(conf_class_t *cls, char const *attr1, char const *attr2);
+extern void SIM_extend_class(conf_class_t *cls, conf_class_t *ext);
+extern lang_void *SIM_extension_data(conf_object_t *obj, conf_class_t *cls);
+extern lang_void *SIM_get_class_data(conf_class_t *cls);
+extern class_interface_t const *SIM_get_class_interface(conf_class_t const *cls, char const *name);
+extern char const *SIM_get_class_name(conf_class_t const *class_data);
+extern class_interface_t const *SIM_get_class_port_interface(conf_class_t const *cls, char const *name, char const *portname);
+extern interface_t const *SIM_get_interface(conf_object_t const *obj, char const *name);
+extern interface_t const *SIM_get_port_interface(conf_object_t const *obj, char const *name, char const *portname);
+extern bool SIM_marked_for_deletion(conf_object_t const *obj);
+extern conf_class_t *SIM_object_class(conf_object_t const *obj);
+extern lang_void *SIM_object_data(conf_object_t *obj);
+extern conf_object_t *SIM_object_descendant(conf_object_t *obj, char const *relname);
+extern char const *SIM_object_id(conf_object_t const *obj);
+extern bool SIM_object_is_configured(conf_object_t const *obj);
+extern inner_object_iter_t SIM_object_iterator(conf_object_t *obj);
+extern object_iter_t SIM_object_iterator_for_class(conf_class_t *cls);
+extern object_iter_t SIM_object_iterator_for_interface(attr_value_t ifaces);
+extern conf_object_t *SIM_object_iterator_next(object_iter_t *iter);
+extern char const *SIM_object_name(conf_object_t const *obj);
+extern conf_object_t *SIM_object_parent(conf_object_t *obj);
+extern conf_object_t *SIM_port_object_parent(conf_object_t *obj);
+extern void SIM_register_attribute(conf_class_t *cls, char const *name, attr_value_t (*get_attr)(conf_object_t *), set_error_t (*set_attr)(conf_object_t *, attr_value_t *), attr_attr_t attr, char const *type, char const *desc);
+extern void SIM_register_attribute_with_user_data(conf_class_t *cls, char const *name, attr_value_t (*get_attr)(conf_object_t *, lang_void *), lang_void *user_data_get, set_error_t (*set_attr)(conf_object_t *, attr_value_t *, lang_void *), lang_void *user_data_set, attr_attr_t attr, char const *type, char const *desc);
+extern conf_class_t *SIM_register_class(char const *name, class_data_t const *class_data);
+extern void SIM_register_class_alias(char const *alias, char const *name);
+extern void SIM_register_class_attribute(conf_class_t *cls, char const *name, attr_value_t (*get_attr)(conf_class_t *), set_error_t (*set_attr)(conf_class_t *, attr_value_t *), attr_attr_t attr, char const *type, char const *desc);
+extern void SIM_register_class_attribute_with_user_data(conf_class_t *cls, char const *name, attr_value_t (*get_attr)(conf_class_t *, lang_void *), lang_void *user_data_get, set_error_t (*set_attr)(conf_class_t *, attr_value_t *, lang_void *), lang_void *user_data_set, attr_attr_t attr, char const *type, char const *desc);
+extern void SIM_register_compatible_interfaces(conf_class_t *cls, char const *name);
+extern int SIM_register_interface(conf_class_t *cls, char const *name, interface_t const *iface);
+extern void SIM_register_port(conf_class_t *cls, char const *name, conf_class_t *port_cls, char const *desc);
+extern int SIM_register_port_interface(conf_class_t *cls, char const *name, interface_t const *iface, char const *portname, char const *desc);
+extern conf_class_t *SIM_register_simple_port(conf_class_t *cls, char const *name, char const *desc);
+extern int SIM_register_typed_attribute(conf_class_t *cls, char const *name, get_attr_t get_attr, lang_void *user_data_get, set_attr_t set_attr, lang_void *user_data_set, attr_attr_t attr, char const *type, char const *idx_type, char const *desc);
+extern int SIM_register_typed_class_attribute(conf_class_t *cls, char const *name, get_class_attr_t get_attr, lang_void *user_data_get, set_class_attr_t set_attr, lang_void *user_data_set, attr_attr_t attr, char const *type, char const *idx_type, char const *desc);
+extern void SIM_require_object(conf_object_t *obj);
+extern void SIM_set_class_data(conf_class_t *cls, lang_void *data);
+extern void SIM_set_object_configured(conf_object_t *obj);
+extern inner_object_iter_t SIM_shallow_object_iterator(conf_object_t *obj);
+extern object_iter_t VT_object_iterator(conf_object_t *obj);
+extern int VT_register_port_array_interface(conf_class_t *cls, char const *name, interface_array_t const *iface_list, char const *portname, char const *desc);
+extern void VT_set_constructor_data(conf_class_t *cls, lang_void *data);
+extern void VT_set_cpu_offset(void const *arg, bool add);
+extern object_iter_t VT_shallow_object_iterator(conf_object_t *obj);
+extern typedef int attr_attr_t;
+constant Sim_Attr_Required = 0;
+constant Sim_Attr_Optional = 1;
+constant Sim_Attr_Pseudo = 4;
+constant Sim_Attr_Integer_Indexed = 4096;
+constant Sim_Attr_String_Indexed = 8192;
+constant Sim_Attr_List_Indexed = 16384;
+constant Sim_Attr_Persistent = 131072;
+constant Sim_Attr_Flag_Mask = 255;
+constant Sim_Init_Phase_Shift = 8;
+extern attr_attr_t Sim_Init_Phase_0;
+extern attr_attr_t Sim_Init_Phase_1;
+constant Sim_Init_Phase_Bits = 2;
+extern attr_attr_t Sim_Init_Phase_Mask;
+extern attr_attr_t Sim_Init_Phase_Pre1;
+constant Sim_Attr_Class = 32768;
+constant Sim_Attr_Internal = 65536;
+constant Sim_Attr_CB_Data = 2097152;
+constant Sim_Attr_Legacy = 4194304;
+constant Sim_Attr_Weak_Ref = 8388608;
+constant Sim_Attr_Read_Only = 262144;
+constant Sim_Attr_Write_Only = 524288;
+extern typedef int set_error_t;
+constant Sim_Set_Ok = 0;
+constant Sim_Set_Object_Not_Found = 1;
+constant Sim_Set_Interface_Not_Found = 2;
+constant Sim_Set_Illegal_Value = 3;
+constant Sim_Set_Illegal_Type = 4;
+constant Sim_Set_Illegal_Index = 5;
+constant Sim_Set_Attribute_Not_Found = 6;
+constant Sim_Set_Not_Writable = 7;
+constant Sim_Set_Error_Types = 8;
+extern typedef int class_kind_t;
+constant Sim_Class_Kind_Vanilla = 0;
+constant Sim_Class_Kind_Session = 1;
+constant Sim_Class_Kind_Pseudo = 2;
+constant Sim_Class_Kind_Extension = 3;
+extern typedef struct { conf_object_t *(*alloc_object)(lang_void *data); lang_void *(*init_object)(conf_object_t *obj, lang_void *data); void (*finalize_instance)(conf_object_t *obj); void (*pre_delete_instance)(conf_object_t *obj); int (*delete_instance)(conf_object_t *obj); char const *description; char const *class_desc; class_kind_t kind; } class_data_t;
+extern typedef struct { conf_object_t *(*alloc)(conf_class_t *cls); lang_void *(*init)(conf_object_t *obj); void (*finalize)(conf_object_t *obj); void (*objects_finalized)(conf_object_t *obj); void (*deinit)(conf_object_t *obj); void (*dealloc)(conf_object_t *obj); char const *description; char const *short_desc; class_kind_t kind; } class_info_t;
+extern typedef struct { conf_object_t *node; uint32 depth; uint32 kind; } inner_object_iter_t;
+extern typedef struct { inner_object_iter_t inner; struct { conf_class_t *cls; uint32 idx; } c; struct { interface_key_t keys[17]; uint32 idx; } iface; } object_iter_t;
+extern typedef struct { int size; int used; interface_t const **elements; } interface_array_t;
+extern typedef void class_interface_t;
+extern typedef attr_value_t (*get_attr_t)(lang_void *ptr, conf_object_t *obj, attr_value_t *idx);
+extern typedef attr_value_t (*get_class_attr_t)(lang_void *ptr, conf_class_t *c, attr_value_t *idx);
+extern typedef void interface_t;
+extern typedef set_error_t (*set_attr_t)(lang_void *ptr, conf_object_t *obj, attr_value_t *val, attr_value_t *idx);
+extern typedef set_error_t (*set_class_attr_t)(lang_void *ptr, conf_class_t *c, attr_value_t *val, attr_value_t *idx);

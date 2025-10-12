@@ -1,0 +1,379 @@
+/*
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device simics_uefi;
+param classname = "simics-uefi";
+param desc = "device with Simics meta-data";
+param documentation = "PCI Express device with Simics meta-data";
+param max_acpi_tables = 32;
+param invalid_bit = 0xffffffff;
+
+import "pcie/common.dml";
+import "simics/model-iface/image.dml";
+
+header %{
+#include <wchar.h>
+%}
+
+is pcie_endpoint;
+
+extern void VADD(...);
+extern uint64 VGET(...);
+extern uint64 VLEN(...);
+extern int sprintf(...);
+extern uint16 btowc(int c);
+
+session uint64 vect pkgs;
+session uint64 num_accesses;
+
+attribute caps_accesses is (uint64_attr, pseudo_attr) {
+    param documentation = "Number of accesses to capabilities data";
+    param writable = false;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(num_accesses);
+    }
+}
+
+attribute selected_boot_option {
+    param documentation = "Boot device that shall get maximum priority";
+    param type = "s|n";
+
+    session char* val = NULL;
+
+    method set(attr_value_t value) throws {
+        if (val != NULL)
+            MM_FREE(val);
+        if (SIM_attr_is_nil(value))
+            val = NULL;
+        else {
+            if (strlen(SIM_attr_string(value)) > 255) {
+                log error: "Selected boot option string must not have more" +
+                           " than 255 characters.";
+                throw;
+            }
+            val = MM_STRDUP(SIM_attr_string(value));
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_string(val);
+    }
+}
+
+attribute video_mode is (uint64_attr) {
+    param documentation = "Video mode to be set during boot";
+}
+
+attribute detected_video_modes is (pseudo_attr) {
+    param type = "[s*]|s";
+    param documentation = "Video modes that were detected during BIOS run";
+
+    // max 64 modes
+    // one mode needs four UINT16: index, width, height, color depth
+    // efi writes it out in that order to this device
+    saved uint16 mode_data[64*4];
+    saved uint16 last_mode_data_index = 0;
+    method get() -> (attr_value_t) {
+        local char buffer[256];
+        local uint32 i;
+        local attr_value_t rv = SIM_make_attr_list(0);
+        for (i = 0; i < last_mode_data_index; i+= 4) {
+            local uint16 index  = mode_data[i];
+            local uint16 width  = mode_data[i+1];
+            local uint16 height = mode_data[i+2];
+            local uint16 depth  = mode_data[i+3];
+            if (width == 0 || height == 0 || depth == 0)
+                break;
+            SIM_attr_list_resize(&rv, i / 4 + 1);
+            sprintf(buffer, "%d:%dx%d@%d", index, width, height, depth);
+            SIM_attr_list_set_item(&rv, i / 4, SIM_make_attr_string(buffer));
+        }
+        if (i == 0)
+            rv=SIM_make_attr_string("None detected yet. Please run the UEFI BIOS once.");
+        return rv;
+    }
+    method set(attr_value_t unused) throws {
+        log info, 1: "Setting read-only attribute detected_video_modes is ignored.";
+    }
+    method add_entry(uint16 val) {
+        if (last_mode_data_index > 255)
+            return;
+        mode_data[last_mode_data_index] = val;
+        last_mode_data_index++;
+    }
+}
+
+
+attribute package_data is (pseudo_attr, read_only_attr) {
+    param documentation = "Package data stored in capabilities";
+    param type = "[i*]";
+    
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(pkgs));
+        for (local int i = 0; i < SIM_attr_list_size(value); ++i) {
+            SIM_attr_list_set_item(&value, i,
+                                   SIM_make_attr_uint64(VGET(pkgs, i)));
+        }
+        return value;
+    }
+}
+
+connect additional_acpi_tables[i < max_acpi_tables] {
+    interface image;
+}
+
+attribute legacy_bios_rom_offset is (uint64_attr) {
+    param documentation = "Offset at which to start writing";
+    param init_val = 0xF0000;
+}
+
+connect legacy_bios_rom_image {
+    interface image;
+}
+
+bank pcie_config is (type_0_bank) {
+    param function = 7;
+
+    register vendor_id { param init_val = 0xffff; }
+    register device_id { param init_val = 0xffff; }
+    register class_code { param init_val = 0xff; }
+    register subsystem_vendor_id { param init_val = 0x8086; }
+    register subsystem_id { param init_val = 0x8086; }
+    register status {
+        field c { param init_val = 1; }
+    }
+    register capabilities_ptr { param init_val = 0x40; }
+
+    group caps is capability {
+        param base = 0x40;
+        param id = 0xff;
+        param next_ptr = 0;
+
+        saved uint64 last_offset = 0;
+
+        method sanity_check_selected_bit(uint32 val) -> (uint32) {
+            local uint32 rv = 0;
+            local uint32 count = 0;
+            local uint32 i = 0;
+            for (i = 0; i < max_acpi_tables; i++) {
+                if (((1 << (max_acpi_tables - 1 - i)) & val) != 0) {
+                    count++;
+                    rv = i;
+                }
+            }
+            if (count != 1) {
+                if (count == 0)
+                    log info, 2: "No table selected. Will not do anything.";
+                else
+                    log info, 2: "More than one table selected. Will not do anything.";
+                return invalid_bit;
+            }
+            return rv;
+        }
+
+        register video_mode_reg size 2 @ (base + 0x2) is (read, write)
+            "VGA Video Mode to select at boot" {
+            method get() -> (uint64) {
+                num_accesses++;
+                return video_mode.val;
+            }
+            method write(uint64 val) {
+                num_accesses++;
+                detected_video_modes.add_entry(val);
+            }
+        }
+
+        register added_tbls size 4 @ (base + 0x4) is (read, write)
+            "Read: bit mask of available tables; Write: select table" {
+            param configuration = "pseudo";
+
+            method read() -> (uint64) {
+                num_accesses++;
+                return get();
+            }
+
+            method get() -> (uint64) {
+                local uint32 i;
+                local uint32 tbls = 0;
+                for (i = 0; i < max_acpi_tables; i++) {
+                    if (additional_acpi_tables[i].image.val != NULL)
+                        tbls|= (1 << (max_acpi_tables - 1 - i));
+                }
+                return tbls;
+            }
+
+            method write(uint64 val) {
+                num_accesses++;
+                set(val);
+                last_offset = 0;
+            }
+
+            method set(uint64 val) {
+                selected_bit = sanity_check_selected_bit(val);
+                if (selected_bit != invalid_bit &&
+                    additional_acpi_tables[selected_bit].image.val == NULL)
+                    selected_bit = invalid_bit;
+            }
+            saved uint32 selected_bit = invalid_bit;
+
+        }
+
+        register tbl_size size 4 @ (base + 0x8) is (read, read_only)
+            "Table size" {
+            param configuration = "pseudo";
+
+            method read() -> (uint64) {
+                num_accesses++;
+                return get();
+            }
+            method get() -> (uint64) {
+                if (added_tbls.selected_bit == invalid_bit)
+                    return 0;
+                return additional_acpi_tables[added_tbls.selected_bit].image.size();
+            }
+        }
+
+
+        register tbl_data size 1 @ (base + 0xC) is (read, read_only)
+            "Table content" {
+            param configuration = "pseudo";
+
+            method read() -> (uint64) {
+                num_accesses++;
+                local uint64 rv = get();
+                last_offset+=1;
+                if (last_offset == tbl_size.get())
+                    last_offset = 0;  // wrap around
+                return rv;
+            }
+
+            method get() -> (uint64) {
+                local uint64 rv;
+                if (added_tbls.selected_bit == invalid_bit)
+                    return 0;
+                additional_acpi_tables[added_tbls.selected_bit].image.read(&rv, last_offset, 1);
+                return rv;
+            }
+        }
+
+        register legacy_bios_data size 1 @ (base + 0xD) is (read, write)
+            "Legacy BIOS data" {
+            param configuration = "pseudo";
+
+            saved uint8 wr_index;
+
+            method read() -> (uint64) {
+                wr_index = 0;
+                return get();
+            }
+
+            method get() -> (uint64) {
+                if (legacy_bios_rom_image.obj)
+                    return 42;
+                else
+                    return 0;
+            }
+
+            method set(uint64 v) {
+                if (legacy_bios_rom_image.obj) {
+                    local uint8 tmp = cast(v, uint8);
+                    legacy_bios_rom_image.image.write(&tmp, legacy_bios_rom_offset.val + wr_index, 1);
+                } else {
+                    log info, 2: "Write to the legacy BIOS data without a connected image.";
+                }
+            }
+
+            method write(uint64 v) {
+                set(v);
+                wr_index +=  1;
+            }
+        }
+
+
+        register boot_option_data size 2 @ (base + 0xE) is (read, write)
+            "Byte-by-byte read of boot option. Write to reset to first byte." {
+            param configuration = "pseudo";
+
+            // separate indices to ensure using get does not corrupt
+            // target SW reading this
+            saved uint8 rd_index;
+            session uint8 get_index;
+
+            method write(uint64 value) {
+                rd_index = 0;
+            }
+
+            method set(uint64 value) {
+                get_index = 0;
+            }
+
+            method extract_byte_from_boot_option(uint8* p_index) -> (uint64) {
+                if (selected_boot_option.val == NULL)
+                    return 0;
+                local uint64 rv = selected_boot_option.val[*p_index];
+                if (rv != 0)
+                    *p_index = *p_index + 1;
+                else
+                    *p_index = 0;
+                return btowc(rv);
+            }
+
+            method read() -> (uint64) {
+                return extract_byte_from_boot_option(&rd_index);
+            }
+
+            method get() -> (uint64) {
+                return extract_byte_from_boot_option(&get_index);
+            }
+        }
+
+        /* Maximum number of data that fits in caps */
+        param num_dwords = 43;
+        
+        register num_pkgs size 4 @ (base + 0x10) is (read, read_only)
+            "Number of packages" {
+            method read() -> (uint64) {
+                num_accesses++;
+                return VLEN(pkgs);
+            }
+        }
+
+        register pkg_num[i < num_dwords] size 4 @ (base + 4 * (i + 5))
+            is (read, read_only) "Package number" {
+            method read() -> (uint64) {
+                if (i < VLEN(pkgs)) {
+                    num_accesses++;
+                    return VGET(pkgs, i);
+                } else  {
+                    log spec_viol, 2: "Out-of-bounds package index %d", i;
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+method init() {
+    video_mode.val = 5;
+}
+
+method post_init() {
+    local conf_object_t *sim = SIM_get_object("sim");
+    local attr_value_t pkgs_data = SIM_get_attribute(sim, "package_info");
+    for (local int i = 0; i < SIM_attr_list_size(pkgs_data); i++) {
+        VADD(pkgs, SIM_attr_integer(
+                 SIM_attr_list_item(SIM_attr_list_item(pkgs_data, i), 2)));
+    }
+}

@@ -1,0 +1,48 @@
+/*
+  © 2019 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+// NOTE: Remove these workarounds when they are no longer needed. Kept for
+// backwards compatibility.
+
+dml 1.2;
+
+
+template defining_pcie_mc_capability_v2 {
+    // TODO(ah): introduced in 2.1, not available in 2.0.
+    is defining_pcie_mc_capability_v21;
+}
+
+template defining_pcie_rbar_capability_v2 {
+    // TODO(ah): introduced in 2.1, not available in 2.0.
+    is defining_pcie_rbar_capability_v21;
+}
+
+template defining_pcie_ari_capability_v2 {
+    // TODO(ah): introduced in 2.1, not available in 2.0.
+    is defining_pcie_ari_capability_v21;
+}
+
+template defining_pcie_dpa_capability_v2 {
+    // TODO(ah): introduced in 2.1, not available in 2.0.
+    is defining_pcie_dpa_capability_v21;
+}
+
+template defining_pcie_ltr_capability_v2 {
+    // TODO(ah): introduced in 2.1, not available in 2.0.
+    is defining_pcie_ltr_capability_v21;
+}
+
+template defining_pcie_tph_capability_v2 {
+    // TODO(ah): introduced in 2.1, not available in 2.0.
+    is defining_pcie_tph_capability_v21;
+}

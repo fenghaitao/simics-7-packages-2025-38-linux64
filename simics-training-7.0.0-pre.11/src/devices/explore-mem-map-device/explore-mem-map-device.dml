@@ -1,0 +1,243 @@
+/*
+  © 2020 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  explore-memory-map-device : Device to use to explore how Simics memory mappings work
+                            : Part of Simics training materials 
+*/
+
+
+dml 1.4;
+
+device explore_mem_map_device;
+
+param classname = "explore-mem-map-device";  // use - in the classname 
+
+param desc = "memory map exploration";       // short desc starts with lower case
+
+param documentation = "Device to use in training to explore Intel Simics simulator memory mappings";
+
+param byte_order = "little-endian";    // this default, but better to be specific
+
+loggroup Mirroring;    // log group for the mirroring register B
+
+import "utility.dml";
+
+
+// 
+//  logger - 
+//
+// Bank that just receives memory operations and logs them
+//
+// The implementation is rather different in DML 1.4 compared
+// to DML 1.2.  In 1.2, you overrode the access() method.  In
+// DML 1.4, it makes more sense to override each specific type
+// of operation.
+//
+// size_from_enabled: 
+//          turn a byte mask (assuming packed bits to the right)  
+//          which seems to be safe for this purpose, even though
+//          there are cases where an arbitrary byte enable mask
+//          is being used. 
+//
+method size_from_enabled(uint64 enabled_bytes) -> (uint64) {
+   local uint64 sz = 0;
+   if(enabled_bytes >= 0xFFFFFFFF) {
+       enabled_bytes >>= 32;
+       sz+=4;
+   }
+   if(enabled_bytes >= 0xFFFF) {
+       enabled_bytes >>= 16;
+       sz+=2;
+   }
+   if(enabled_bytes >= 0xFF) {
+       enabled_bytes >>= 8;
+       sz+=1;
+   }
+   if(enabled_bytes >= 0xFF) {
+       sz+=1;
+   }   
+   return sz; 
+}
+
+//
+// Logging bank that reflects the memory operations sent to it. 
+// Used to explore how memory operations look like when they hit a bank. 
+//
+bank logger {
+    param desc = "bank logging all accesses without storing data";
+    param documentation = "Register bank that logs all accesses but does not actually " +
+                          "store any data";
+    
+    
+    // Write is called for actual write operations
+    method write(uint64 offset, uint64 value, uint64 enabled_bytes,void *aux) throws {
+        log info, 1: "Write access to offset 0x%llx, size=0x%llx, value=0x%llx", 
+                     offset, size_from_enabled(enabled_bytes), value; 
+    }
+
+    // Read is called for actual read operations
+    method read(uint64 offset, uint64 enabled_bytes, void *aux) -> (uint64) throws {
+        local uint64 value = 0xc001d00ddeadbeef & enabled_bytes;
+        log info, 1: "Read access to offset 0x%llx, size=0x%llx -> read value=0x%llx", 
+                     offset, size_from_enabled(enabled_bytes), value; 
+        return value;
+    }
+    
+}
+
+
+//
+// regs and regs_o_p banks
+//
+//  Show the effect of different forms of register declarations
+//
+//  Both banks have the same set of registers, which is conveniently 
+//  folded into a simple template. 
+template example_reg_set {
+     // Test registers of different sizes 
+    register a @ 0x00 "Register a, 32 bits at even offset" 
+      {param init_val=0x0a0a0a0a;}
+
+    // Register b is a bit special, mirroring values over to b_mirror
+    register b @ 0x04 "Register b, 32 bits at even offset"  {
+        is write;
+        param init_val=0x0b0b0b0b;
+        method write(uint64 value) {
+            log info, 2, Mirroring : "Write to %s, mirroring over to %s. Value=0x%.8x", this.qname, b_mirror.qname, value;
+            this.set(value);
+            b_mirror.set(value);
+        }
+      }
+
+    register c size 8 @ 0x08 "Register c, 64 bits at 64-bit-aligned offset"
+      {param init_val=0x0c0c0c0c_0c0c0c0c;}
+    
+    register d size 2 @ 0x10 "Register d, 16 bits at 16-bit-aligned offset"
+      {param init_val=0x0d0d;}
+    
+    register e size 2 @ 0x12 "Register e, 16 bits at 16-bit-aligned offset"
+      {param init_val=0x0e0e;} 
+      
+    register b_mirror @ 0x18 "Register mirroring values written to b, and pulling b on read" {
+        is read;
+        param init_val=0x00;
+        method read()->(uint64) {
+            local uint64 value = b.get();
+            this.set(value);
+            log info, 2, Mirroring : "Read from %s, pulling the value from %s. Value=0x%.8x", this.qname, b.qname, value;
+            return value;
+        }
+    }     
+}
+
+//
+// regs - no overlap, no partial
+//
+bank regs is example_reg_set {
+    param desc = "register bank with example register set";
+    param documentation = "Register bank with example register set. " +
+                          "No overlapping or partial accesses allowed.";
+    
+    param register_size = 4;
+    param overlapping = false;
+    param partial = false;
+}
+
+//
+// regs_o_p - overlap and partial both set
+// 
+bank regs_o_p is example_reg_set {
+    param desc = "little Endian (LE) example register bank";
+    param documentation = "Register bank with example register set, " +
+                          "overlapping and partial set to true.";
+    
+    param register_size = 4;
+    param overlapping = true;
+    param partial = true;
+}
+
+//
+// regs_o_p_be - overlap and partial both set, and with 
+//               BE byte order
+// 
+bank regs_o_p_be is example_reg_set {
+    param desc = "big Endian (LE) example register bank";
+    param documentation = "Register bank with example register set, " +
+                          "overlapping and partial set to true. " + 
+                          "Endianness set to Big Endian (BE).";
+    
+    param register_size = 4;
+    param overlapping = true;
+    param partial = true;
+    param byte_order = "big-endian";
+}
+
+
+//
+// This attribute has nothing to do with the rest of the device,
+// but we need the example
+//
+attribute example {
+    param documentation = "Example long doc...";
+    param configuration = "optional";
+    param type = "i|n";  
+    session uint64 num_val = 0xABBA;
+    session bool   no_val  = false;  // dumb way to note that it is NIL
+
+    method get() -> (attr_value_t) {
+      if(no_val) {
+        // Return a NIL value to the caller
+        return SIM_make_attr_nil();
+      } else {
+        // Make an integer attribute
+        return SIM_make_attr_uint64(num_val);
+      }
+    }
+
+    // Incoming value has been screened to be either an integer or nil by Simics
+    method set(attr_value_t value) throws {
+      if(SIM_attr_is_nil(value)) {
+        num_val = 0xABBA;
+        no_val  = true;
+      } else if (SIM_attr_is_uint64(value)) {
+        num_val = SIM_attr_integer(value);
+        no_val = false;
+      } else {
+        // report an error
+        SIM_c_attribute_error("That was not an unsigned 64-bit integer!" );	
+        throw;
+      }
+    }
+
+}
+
+
+
+#if(false) {
+//
+// UTF-8 for Emoji in code.  This compiles, but the Simics UI does not
+// succeed in showing the characters in any useful way.  You can uncomment
+// this bank, recompile it, and try to look at it in various CLI 
+// commands or GUI views where available. 
+// 
+bank atm "🏧" {
+    param register_size = 1;
+    register withdraw_euro @ 0x01  "💶  money";
+    register withdraw_usd @ 0x02   "💲  money";
+    register withdraw_cache @ 0x03 "💰 bag"; 
+}
+
+} // end #if false

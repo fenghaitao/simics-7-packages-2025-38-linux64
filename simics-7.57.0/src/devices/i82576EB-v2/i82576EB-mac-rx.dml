@@ -1,0 +1,195 @@
+/*
+  i82576EB-mac-rx.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter RA_CNT = 16;
+parameter RA_CNT2 = 8;
+
+parameter MTA_CNT = 128;       // 128regs * 32bits = 4096 bits
+
+bank csr {
+    /* --------------------------------------------------------------
+       RECEIVE REGISTERS
+       -------------------------------------------------------------- */
+
+    register rxpbs   @ 0x02404 "RX Packet buffer size";
+    register rlpml   @ 0x05004 "RX long packet max length";
+
+    // This group defines rdbal[] - rxdctl[]
+    group rx_queue [$NUM_RECEIVE_QUEUES] {
+        is rx_desc_queue;
+        is adv_rx_desc_queue;
+        parameter BA = 0x0c000 + $i * 0x40;
+        parameter rdmts  = $srrctl.rdmts;
+        parameter dtyp   = $srrctl.desctype;
+        parameter bsize  = $rctl.bsize;
+        parameter bsize_pkt  = $srrctl.bszpkt;
+        parameter bsize_header = $srrctl.bszhdr;
+        parameter ptype = $psrtype[$i/2];
+    }
+
+    group rx_queue_alias [4] {
+        is rx_desc_queue_alias;
+        is adv_rx_desc_queue_alias;
+        parameter BA = 0x02800 + $i * 0x100;
+        parameter reggroup = $rx_queue;
+    }
+
+    /* Each psrtype register controls two queues. PSRTYPE[0] controls
+       queue 0 and 1, PSRTYPE[1] controls queue 2 and 3, and so on. */
+    register psrtype[$NUM_RECEIVE_QUEUES/2] @ 0x5480 + $i * 4 "Packet Split Receive Type";
+
+    // This group defines the ral[0..15] and rah[0..15] registers, used to store receive MAC address
+    group ra [i in 0 .. ($RA_CNT-1)] {
+        is rx_mac_register;
+        register low  @ 0x05400 + $i * 8 "Receive Address Low";
+        register high @ 0x05404 + $i * 8 "Receive Address High";
+    }
+    group ra2 [i in 0 .. ($RA_CNT2-1)] {
+        is rx_mac_register;
+        register low  @ 0x054e0 + $i * 8 "Receive Address Low";
+        register high @ 0x054e4 + $i * 8 "Receive Address High";
+    }
+
+    register mrqc    @ 0x05818 "Multiple Receive Queues Command";
+
+    event rx_delay is (intr_delay_evt) { parameter INTR = INTR_RXTO; }
+
+    register rctl {
+        is rx_buffer_ctrl;
+        // reserved[0]
+        field en[1]     is (read_write) "Receiver Enable" {
+            method write(value) {
+                $this = value;
+                // according to 82576 datasheet, rxdctl que 0 is enabled
+                // whenever rctl.en bit is set
+                if (value) $rx_queue[0].rxdctl.en = 1;
+                else $rx_queue[0].rxdctl.en = 0;
+            }
+        }
+        field sbp[2]    is (read_write) "Store Bad Packets";
+        field upe[3]    is (read_write) "Unicast Promiscuous Enabled";
+        field mpe[4]    is (read_write) "Multicast Promiscuous Enabled";
+        field lpe[5]    is (read_write) "Long Packet Reception Enabled";
+        field lbm[7:6]  is (unimplemented) "Loopback Mode";
+        field mo[13:12] is (read_write) "Multicast Offset";
+        // reserved[14]
+        field bam[15]   is (read_write) "Broadcast Accept Mode";
+        field vfe[18]   is (read_write) "VLAN Filter Enable";
+        field cfien[19] is (read_write) "Canonical Form Indicator Enable";
+        field cfi[20]   is (read_write) "Canonical Form Indicator Bit Value";
+        field psp[21]   is (unimplemented) "Pad Small Receive Packets";
+        field dpf[22]   is (unimplemented) "Discard Pause Frames";
+        field pmcf[23]  is (unimplemented) "Pass MAC Control Frame";
+        // reserved[25:24]
+        field secrc[26] is (read_write) "Strip Ethernet CRC from incoming Packet";
+        // reserved[31:27]
+    }
+    register rxpbs {
+        parameter hard_reset_value = 0x40;
+    }
+    register rlpml is (unimplemented);
+
+    register psrtype[$NUM_RECEIVE_QUEUES/2] is (read_write);
+
+    register rxcsum {
+        field pcss[7:0]  is (read_write) "Packet Checksum Start";
+        field ipofld[8] "IP Checksum Off-load Enable" {
+            is read_write;
+            parameter hard_reset_value = 1;
+        }
+        field tuofld[9] "TCP/UDP Checksum Off-load Enable" {
+            is read_write;
+            parameter hard_reset_value = 1;
+        }
+        // reserved[31:10]
+    }
+
+    register rfctl {
+        field nfsw_dis[6]    is (read_write) "NFS Write Disable";
+        field nfsr_dis[7]    is (read_write) "NFS Read Disable";
+        field nfs_ver[9:8]   is (read_write) "NFS Version";
+        field ipv6_dis[10]   is (unimplemented) "IPv6 Disable";
+        field ipv6xsum_dis[11] is (unimplemented) "IPv6 Xsum Disable";
+        field ipfrsp_dis[14] is (read_write) "IP Fragment Split Disable";
+        field lef[18]        is (unimplemented) "Forward Length Error Packet";
+        field synqfp[19]     is (unimplemented) "5-tuple/SYN filter priority";
+    }
+
+    register reta[$RETA_CNT] {
+        field qidx[3:0]    is (read_write) "Queue Index";
+    }
+
+    register mrqc {
+        field mrqe[1:0] is (read_write) "Multiple Receive Queues Enable" {
+            method write(value) {
+                if ($rctl.en == 1) {
+                    log "spec_violation", 1:
+                    "can't modify %s's value when Receiver is enabled", $name;
+                    return;
+                }
+                if ($this != value && value > 1) {
+                    log "spec_violation", 1: "value %d for %s is reserved, %s",
+                        value, $name, "adjusted to 0b00";
+                    value = 0;
+                }
+                $this = value;
+            }
+        }
+        field rssie[2] is (unimplemented);
+        // reserved[15:3]
+        field rssfe[21:16] is (read_write) "RSS Field Enable";
+    }
+
+    method calc_frame_rss_hash(const uint8 *ip, frame_info_t *info) {
+        if ($mrqc.rssfe != 0) {
+            if (info->ipv4) {
+                if (info->l3_prot == ETH_PROT_TCP && $mrqc.rssfe[0] != 0)
+                    info->rss_type = 1;
+                else if ($mrqc.rssfe[1] != 0)
+                    info->rss_type = 2;
+            } else if (info->ipv6) {
+                if (info->l3_prot == ETH_PROT_TCP && $mrqc.rssfe[2] != 0)
+                    info->rss_type = 3;
+                else if ($mrqc.rssfe[3] != 0 && info->ipv6_ext)
+                    info->rss_type = 4;
+                else if ($mrqc.rssfe[4] != 0)
+                    info->rss_type = 5;
+            }
+        }
+
+        if (info->rss_type != 0) {
+            call $compute_ip_hash(ip, info->ipv6,
+                    info->rss_type == 1 || info->rss_type == 3) -> (info->hash);
+            return;
+        }
+
+        info->hash = 0;
+        info->rss_type = 0;
+        $rx_queue_nbr = 0;
+    }
+}
+
+template rx_buffer_ctrl {
+    field bsize[17:16]  is (read_write) "Receive Buffer Size";
+}
+
+template flow_ctl_register {
+    // reserved[3:0]
+    field rt[15:4] is (unimplemented) "Receive Threshold Value";
+    // reserved[30:16]
+    field b31[31] is (unimplemented) "XON Enable";
+}

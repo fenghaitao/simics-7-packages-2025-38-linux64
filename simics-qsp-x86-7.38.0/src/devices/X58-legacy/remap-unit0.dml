@@ -1,0 +1,31 @@
+/*
+  remap-unit0.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device x58_remap_unit0_legacy;
+parameter classname = "x58-remap-unit0-legacy";
+
+parameter desc = "model of DMA/Interrupt remapping unit 0";
+parameter documentation = "The DMA/Interrupt remapping unit 0. - legacy variant, using old PCIe libraries";
+
+import "vtd.dml";
+
+bank vtd {
+    register ecap {
+        field sc { parameter hard_reset_value = 1; }
+        field di { parameter hard_reset_value = 1; }
+    }
+}

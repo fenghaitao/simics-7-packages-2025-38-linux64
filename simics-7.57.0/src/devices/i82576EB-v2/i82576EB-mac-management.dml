@@ -1,0 +1,67 @@
+/*
+  i82576EB-mac-management.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+/*
+ * NOTE: Wakeup control/filter is unimplemented.
+ */
+
+bank csr {
+    method miss_access(memop, offset, size) {
+        log "spec_violation", 1: "**** missed access to offset 0x%x size %d", offset, size;
+    }
+
+    /* --------------------------------------------------------------
+       MANAGEMENT REGISTERS
+       -------------------------------------------------------------- */
+
+    register wuc        @ 0x05800 "Wakeup Control";
+    register wufc       @ 0x05808 "Wakeup Filter Control";
+    register wus        @ 0x05810 "Wakeup Status";
+    register ipav       @ 0x05838 "IP Address Valid";
+    register ip4at[4]   @ 0x05840 + $i * 8 "IPv4 Address Table";
+    register ip6at[4]   @ 0x05880 + $i * 4 "IPv6 Address Table";
+    register wupl       @ 0x05900 "Wakeup Packet Length";
+    register wupm[32]   @ 0x05a00 + $i * 4 "Wakeup Packet Memory";
+    register fflt[4]    @ 0x05f00 + $i * 8 "Flexible Filter Length Table";
+    register ffmt[128]  @ 0x09000 + $i * 8 "Flexible Filter Mask Table";
+    register ffvt[128]  @ 0x09800 + $i * 8 "Flexible Filter Value Table";
+
+    register manc       @ 0x05820 "Management Control";
+    register pb_ecc     @ 0x01100 "Packet Buffer ECC";
+    
+
+    register wuc is (unimplemented);
+    register wufc is (unimplemented);
+    register wus is (read_only);
+    register ipav {
+        field v40[3:0] is (unimplemented) "IPv4 Address 0~3 Valid";
+	// reserved[15:4]
+        field v60[16]  is (unimplemented) "IPv6 Address Valid";
+	// reserved[31:17]
+    }
+    register ip4at[4] is (unimplemented);
+    register ip6at[4] is (unimplemented);
+    register wupl is (unimplemented);
+    register wupm[32] is (unimplemented);
+
+    register fflt[4] is (unimplemented);
+    register ffmt[128] is (unimplemented);
+    register ffvt[128] is (unimplemented);
+    register manc is (unimplemented);
+    
+    register pb_ecc is (unimplemented);
+}

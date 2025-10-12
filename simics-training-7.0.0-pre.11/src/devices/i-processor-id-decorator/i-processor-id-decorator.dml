@@ -1,0 +1,163 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i_processor_id_decorator;
+
+import "simics/devs/translator.dml";
+
+param desc = "processor ID inserter";
+
+param documentation = "Simple translator that just adds a processor ID atom to a transaction.";
+
+import "utility.dml";
+import "i-processor-id-atom.dml";
+
+extern void VADD(...);
+extern void VREMOVE_FIRST_MATCH(...);
+extern int VLEN(...);
+extern void VFREE(...);
+
+attribute processor_id is uint64_attr {
+    param documentation = "ID that will be inserted into transactions.";
+}
+
+connect memory_space is map_target "Physical Memory";
+
+typedef struct {
+    transaction_t t;
+    atom_t atoms[4];
+} txn_with_id_t;
+
+method empty_completion(transaction_t *t, exception_type_t e)
+    -> (exception_type_t) {
+    return e;
+}
+method completion(transaction_t *t,
+                  exception_type_t e) -> (exception_type_t) {
+    local txn_with_id_t *id_txn = cast(t, txn_with_id_t *);
+    VREMOVE_FIRST_MATCH(chained_transactions.val, id_txn);
+    delete id_txn;
+    return e;
+}
+
+implement transaction_translator {
+    method translate(uint64 addr,
+                     access_t access,
+                     transaction_t *t,
+                     exception_type_t (*callback)(translation_t txl,
+                                                  transaction_t *tx,
+                                                  cbdata_call_t cbd),
+                     cbdata_register_t cbdata) -> (exception_type_t) default
+    {
+        local txn_with_id_t id_txn;
+        id_txn.t.atoms = id_txn.atoms;
+        id_txn.t.prev = t;
+
+        log info, 3: "Adding processor id %d to transaction", processor_id.val;
+        
+        id_txn.t.atoms[0] = ATOM_training_processor_id(processor_id.val);
+        id_txn.t.atoms[1] = ATOM_completion(&empty_completion);
+        id_txn.t.atoms[2] = ATOM_owner(dev.obj);
+        id_txn.t.atoms[3] = ATOM_list_end(0);
+        
+        local translation_t txl = { .target = memory_space.map_target, ...};
+       
+        local exception_type_t exc = callback(txl, &id_txn.t, cbdata);
+
+        if (exc == Sim_PE_Deferred) {
+            local txn_with_id_t *new_id_txn = new txn_with_id_t;
+            new_id_txn->t.atoms = new_id_txn->atoms;
+            new_id_txn->t.prev = t;
+            new_id_txn->t.atoms[0] = ATOM_training_processor_id(processor_id.val);
+            new_id_txn->t.atoms[1] = ATOM_completion(&completion);
+            new_id_txn->t.atoms[2] = ATOM_owner(dev.obj);
+            new_id_txn->t.atoms[3] = ATOM_list_end(0);
+            SIM_replace_transaction(&id_txn.t, &new_id_txn->t);
+            VADD(chained_transactions.val, new_id_txn);
+            return SIM_monitor_chained_transaction(&new_id_txn->t, exc);
+        } else {
+            return SIM_monitor_chained_transaction(&id_txn.t, exc);
+        }
+    }
+}
+
+implement translation_flush {
+    method flush_range(uint64 base, uint64 size, access_t access,
+                       const map_target_t *default_target) -> (bool) default {
+        local bool ret = SIM_map_target_flush(memory_space.map_target, base, size, access);
+        if (!ret) {
+            log info, 1 then 2: "Failed flushing map_target %s",
+            SIM_object_name(SIM_map_target_object(memory_space.map_target));
+        }
+        return ret;
+    }
+}
+
+method destroy() {
+    chained_transactions.destroy();
+}
+
+attribute chained_transactions {
+    param type = "[[ii]*]";
+    param internal = true;
+    session txn_with_id_t * vect val;
+
+    method set(attr_value_t value) throws {
+        if (!SIM_is_restoring_state(obj)) {
+            SIM_attribute_error("must only be set during checkpoint restore");
+            throw;
+        }
+
+        for (local int i = 0; i < VLEN(this.val); i++)
+            delete this.val[i];
+
+        VFREE(this.val);
+
+        for (local int i = 0; i < SIM_attr_list_size(value); i++) {
+            local attr_value_t* id_pair = SIM_attr_list(SIM_attr_list_item(value, i));
+            local int64 id      = SIM_attr_integer(SIM_attr_list_item(*id_pair, 0));
+            local int64 proc_id = SIM_attr_integer(SIM_attr_list_item(*id_pair, 1));
+            local txn_with_id_t *id_txn = new txn_with_id_t;
+            id_txn->t.atoms = id_txn->atoms;
+            id_txn->t.atoms[0] = ATOM_training_processor_id(proc_id);
+            id_txn->t.atoms[1] = ATOM_completion(&completion);
+            id_txn->t.atoms[2] = ATOM_owner(dev.obj);
+            id_txn->t.atoms[3] = ATOM_list_end(0);
+
+            VADD(this.val, id_txn);
+            SIM_reconnect_transaction(&id_txn->t, id);
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(this.val));
+        local transaction_t t;
+        for (local int i = 0; i < VLEN(this.val); i++) {
+            // we only save the txn ID, because our proc ID is fixed
+            SIM_attr_list_set_item(&value, i, SIM_make_attr_list(2,
+                                                SIM_make_attr_uint64(SIM_get_transaction_id(&this.val[i]->t)),
+                                                SIM_make_attr_uint64(processor_id.val))
+                                  );
+        }
+        return value;
+    }
+
+    method destroy() {
+        // Deferred transactions are completed by Simics Core, we just need to
+        // free the vect
+        VFREE(this.val);
+    }
+}
+

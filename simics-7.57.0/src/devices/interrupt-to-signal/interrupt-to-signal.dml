@@ -1,0 +1,218 @@
+dml 1.2;
+
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+device interrupt_to_signal;
+
+import "simics/devs/interrupt.dml";
+import "simics/devs/signal.dml";
+
+parameter desc = "simple_interrupt to signal converter";
+
+parameter documentation =
+    "The <class>" + $classname + "</class> class converts an interrupt "
+    + "received via the <iface>simple_interrupt</iface> interface to a "
+    + "signal (the <iface>signal</iface> interface).";
+
+struct signal_target_t {
+    int id;                /* the argument to the simple_interrupt functions */
+    conf_object_t *object; /* the destination object */
+    char *port_name;       /* the destination port */
+    bool high;             /* the current output signal level */
+    const signal_interface_t *signal_iface;
+}
+
+typedef signal_target_t vect signal_target_list_t;
+
+
+method init {
+    VINIT($signal_targets.cached_targets);
+}
+
+implement simple_interrupt {
+    method interrupt(int id) {
+        local signal_target_t *target;
+        local bool exist_flag = false;
+
+        foreach target in ($signal_targets.cached_targets) {
+            if (target->id == id) {
+                if (target->high) {
+                    log error:
+                        "trying to raise already high signal level for IRQ %d",
+                        id;
+                } else  {
+                    target->signal_iface->signal_raise(target->object);
+                    target->high = true;
+                    log info, 4: "raise signal level for IRQ %d", id;
+                }
+                exist_flag = true;
+            }
+        }
+        if (exist_flag == false) {
+            log error: "no mapping for interrupt ID %d", id;
+        }
+    }
+
+    method interrupt_clear(int id) {
+        local signal_target_t *target;
+        local bool exist_flag = false;
+
+        foreach target in ($signal_targets.cached_targets) {
+            if (target->id == id) {
+                if (!target->high) {
+                    log error:
+                        "trying to lower already low signal level for IRQ %d",
+                        id;
+                } else {
+                    target->high = false;
+                    target->signal_iface->signal_lower(target->object);
+                    log info, 4: "lower signal level for IRQ %d", id;
+                }
+                exist_flag = true;
+            }
+        }
+        if (exist_flag == false) {
+            log error: "no mapping for interrupt ID %d", id;
+        }
+    }
+}
+
+attribute signal_targets {
+    parameter type = "[[i,o,s|n,i]*]";
+    parameter documentation =
+        "Simple interrupt to target object/port mappings. The first parameter "
+        + "is the simple interrupt ID, the second the object, the third the "
+        + "port name (or null if no port), and the fourth the current signal "
+        + "level.";
+
+    data signal_target_list_t cached_targets;
+
+    method get() -> (attr_value_t return_attr) {
+        local int i;
+
+        return_attr = SIM_alloc_attr_list(VLEN($cached_targets));
+
+        for (i = 0; i < SIM_attr_list_size(return_attr); i++) {
+            local signal_target_t *target = &$cached_targets[i];
+            SIM_attr_list_set_item(
+                &return_attr, i,
+                SIM_make_attr_list(4,
+                                 SIM_make_attr_uint64(target->id),
+                                 SIM_make_attr_object(target->object),
+                                 SIM_make_attr_string(target->port_name),
+                                 SIM_make_attr_uint64(target->high ? 1 : 0)));
+        }
+    }
+
+    method set_attribute(attr_value_t val) -> (set_error_t return_code) {
+        local signal_target_list_t tmp_targets;
+        VINIT(tmp_targets);
+        local int i;
+
+        for (i = 0; i < SIM_attr_list_size(val); i++) {
+            local attr_value_t attr = SIM_attr_list_item(val, i);
+            local signal_target_t target;
+
+            target.id = SIM_attr_integer(SIM_attr_list_item(attr, 0));
+            target.object = SIM_attr_object(SIM_attr_list_item(attr, 1));
+            local attr_value_t port_a = SIM_attr_list_item(attr, 2);
+            if (SIM_attr_is_nil(port_a)) {
+                target.port_name = NULL;
+            } else {
+                local const char *port = SIM_attr_string(port_a);
+                target.port_name = *port == 0 ? NULL : MM_STRDUP(port);
+            }
+            target.high = SIM_attr_integer(SIM_attr_list_item(attr, 3)) > 0;
+
+            target.signal_iface = SIM_get_port_interface(target.object,
+                                                         "signal",
+                                                         target.port_name);
+            if (target.signal_iface == NULL) {
+                call $free_target_list(&tmp_targets);
+                return_code = Sim_Set_Interface_Not_Found;
+                return;
+            }
+
+            VADD(tmp_targets, target);
+        }
+
+        if (!SIM_is_restoring_state($dev.obj)
+            && SIM_object_is_configured($dev.obj))
+            call $update_signal_levels(&$cached_targets, &tmp_targets);
+
+        call $free_target_list(&$cached_targets);
+        $cached_targets = tmp_targets;
+
+        return_code = Sim_Set_Ok;
+    }
+
+    method update_signal_levels(signal_target_list_t *ls_bef,
+                                signal_target_list_t *ls_aft) {
+        local signal_target_t *bef;
+        local signal_target_t *aft;
+        foreach bef in (*ls_bef) {
+            local bool lower = bef->high;
+            foreach aft in (*ls_aft) {
+                if (aft->id == bef->id) {
+                    // it might still count as hot-plugging if we exchanged one
+                    // object for another
+                    lower = bef->high
+                        && (aft->object != bef->object
+                            || bef->signal_iface != aft->signal_iface);
+                    break;
+                }
+            }
+            if (lower) {
+                bef->signal_iface->signal_lower(bef->object);
+            }
+        }
+        foreach aft in (*ls_aft) {
+            local bool raise = aft->high;
+            foreach bef in (*ls_bef) {
+                if (bef->id == aft->id) {
+                    // it might still count as hot-plugging if we exchanged one
+                    // object for another
+                    raise = aft->high
+                        && (aft->object != bef->object
+                            || bef->signal_iface != aft->signal_iface);
+                }
+            }
+            if (raise) {
+                aft->signal_iface->signal_raise(aft->object);
+            }
+        }
+    }
+
+    method free_target_list(signal_target_list_t *list) {
+        local signal_target_t *target;
+        foreach target in (*list) {
+            MM_FREE(target->port_name);
+        }
+        VFREE(*list);
+    }
+    method post_init() {
+        local signal_target_t *target;
+        foreach target in ($cached_targets) {
+            SIM_require_object(target->object);
+        }
+        local signal_target_list_t l;
+        VINIT(l);
+        if (!SIM_is_restoring_state($dev.obj))
+            call $update_signal_levels(&l, &$cached_targets);
+    }
+}
+
+method post_init() {
+    call $signal_targets.post_init();
+}

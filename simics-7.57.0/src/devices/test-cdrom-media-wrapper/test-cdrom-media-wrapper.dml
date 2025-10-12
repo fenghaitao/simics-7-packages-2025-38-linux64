@@ -1,0 +1,66 @@
+/*
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+// Test device to help test cdrom-media interface that is not python wrapped.
+
+dml 1.2;
+
+device test_cdrom_media_wrapper;
+
+import "simics/model-iface/cdrom.dml";
+
+parameter documentation = "Test device for ISO9660 image CD-ROM support";
+parameter desc = "tests CD-ROM support for ISO image";
+
+connect cdrom {
+    interface cdrom_media;
+}
+
+attribute read_block_lba "Read block from this lba address" {
+    parameter allocate_type = "int64";
+}
+
+attribute read_block "Read block from read_block_lba address" {
+    parameter type = "d";
+    parameter configuration = "pseudo";
+
+    method get() -> (value) {
+        local uint8 buf[2048];
+        memset(buf, 0xA0, 2048);     // Fill with pattern
+        local int len = $cdrom.cdrom_media.read_block(buf, $read_block_lba);
+        if (len < 0) {
+            log "error": "Read block failed, exit code: %d", len;
+            throw;
+        }
+        value = SIM_make_attr_data(len, buf);
+    }
+}
+
+attribute read_toc_msf "Read TOC in MSF format if true (LBA if false)." {
+    parameter allocate_type = "bool";
+}
+
+attribute read_toc "Read TOC in either LBA or MSF format" {
+    parameter type = "d";
+    parameter configuration = "pseudo";
+
+    method get() -> (value) {
+        local uint8 buf[2048];
+        memset(buf, 0xA0, 2048);     // Fill with pattern
+        local const int unused = 0;
+        local int msf = $read_toc_msf ? 1 : 0;
+        local int len = $cdrom.cdrom_media.read_toc(buf, msf, unused);
+        assert len > 0;
+        value = SIM_make_attr_data(len, buf);
+    }
+}

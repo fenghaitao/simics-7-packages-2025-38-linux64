@@ -1,0 +1,3170 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "simics/util/bitcount.dml";
+
+/**
+   These are templates for PCIe Capabilities. They are designed to be applied
+   on a `group`. For convenience there exists a template
+   `defining_xyz_capability` for each capability `xyz` which defines a group
+   `xyz` with the `xyz_capability` applied. Most templates only define the
+   registers with their standard access restrictions. If additional behavior is
+   needed, the user of the template must implement this manually.
+
+   Each capability template uses the following parameters:
+   * `base`: Base address of the capability header
+   * `next_ptr`: Value of the next_ptr field in the capability header
+*/
+
+template capability is group {
+    param id;
+    param base;
+    param next_ptr;
+    param use_standard_access_templates
+        default bank.use_standard_access_templates;
+    param use_standard_write_templates
+        default bank.use_standard_write_templates;
+
+    register header size 2 @ base is pcie_desc {
+        param pcie_desc = "Capability Header";
+        field id       @ [7:0]  is pcie_desc {
+            param pcie_desc = "Capability ID";
+            param init_val default parent.parent.id;
+        }
+        field next_ptr @ [15:8] is pcie_desc {
+            param pcie_desc = "Next Capability Offset";
+            param init_val default parent.parent.next_ptr;
+        }
+    }
+
+#if (use_standard_access_templates) {
+    register header {
+        field id       is ignore_write;
+        field next_ptr is ignore_write;
+    }
+}
+}
+
+/**
+   ## Power Management Capability registers
+
+    - name: `pm_capability`
+    - implemented: registers only
+*/
+template pm_capability is capability {
+    param id = 0x1;
+
+    register capability     size 2 @ (base + 0x2) is pcie_desc {
+        param pcie_desc = "PM Capabilities";
+    }
+    register status_control size 2 @ (base + 0x4) is pcie_desc {
+        param pcie_desc = "PM Status and Control";
+    }
+    register data           size 1 @ (base + 0x7) is pcie_desc {
+        param pcie_desc = "PM Data";
+    }
+
+    register capability {
+        field v       @ [2:0]   is pcie_desc {
+            param pcie_desc = "Version";
+        }
+        field pmec    @ [3]     is pcie_desc {
+            param pcie_desc = "PME Clock";
+        }
+        field irortd0 @ [4]     is pcie_desc {
+            param pcie_desc = "Immediate Readiness on Return to D0";
+        }
+        field dsi     @ [5]     is pcie_desc {
+            param pcie_desc = "Device Specific Initialization";
+        }
+        field auxc    @ [8:6]   is pcie_desc {
+            param pcie_desc = "AUX Current";
+        }
+        field d1s     @ [9]     is pcie_desc {
+            param pcie_desc = "D1 Support";
+        }
+        field d2s     @ [10]    is pcie_desc {
+            param pcie_desc = "D2 Support";
+        }
+        field pmes    @ [15:11] is pcie_desc {
+            param pcie_desc = "PME Support";
+        }
+    }
+    register status_control {
+        field ps     @ [1:0]   is pcie_desc {
+            param pcie_desc = "Power State";
+        }
+        field nsr    @ [3]     is pcie_desc {
+            param pcie_desc = "No Soft Reset";
+        }
+        field pmee   @ [8]     is pcie_desc {
+            param pcie_desc = "PME Enable";
+        }
+        field dse    @ [12:9]  is pcie_desc {
+            param pcie_desc = "Data Select";
+        }
+        field dsc    @ [14:13] is pcie_desc {
+            param pcie_desc = "Data Scale";
+        }
+        field pmes   @ [15]    is pcie_desc {
+            param pcie_desc = "PME Status";
+        }
+    }
+
+#if (use_standard_access_templates) {
+    register capability is read_only;
+    register status_control {
+        field nsr  is ignore_write;
+    }
+    register data is ignore_write;
+}
+#if (use_standard_write_templates) {
+    register status_control {
+        field pmes is pcie_write_1_clears;
+    }
+}
+
+#if (pcie_version < 5) {
+    register sc_bridge      size 1 @ (base + 0x6)
+        "PM Status/Control Bridge Extensions" {
+        field bbs    @ [6] is pcie_desc {
+            param pcie_desc = "B2/B3 Support";
+        }
+        field bpcce  @ [7] is pcie_desc {
+            param pcie_desc = "Bus Power/Clock Control Enable";
+        }
+    }
+#if (use_standard_access_templates) {
+    register sc_bridge is ignore_write;
+}
+}
+}
+
+template defining_pm_capability {
+    param pm_offset;
+    param pm_next_ptr;
+    group pm is pm_capability {
+        param base = pm_offset;
+        param next_ptr = pm_next_ptr;
+    }
+}
+
+constant PCIE_DP_Type_EP        = 0b0000;
+constant PCIE_DP_Type_Legacy_EP = 0b0001;
+constant PCIE_DP_Type_RCiEP     = 0b1001;
+constant PCIE_DP_Type_RCEC      = 0b1010;
+constant PCIE_DP_Type_RP        = 0b0100;
+constant PCIE_DP_Type_UP        = 0b0101;
+constant PCIE_DP_Type_DP        = 0b0110;
+constant PCIE_DP_Type_BridgeX   = 0b0111;
+constant PCIE_DP_Type_XBridge   = 0b1000;
+
+param SLOT_ATTENTION_BUTTON    = 0;
+param SLOT_PRESENCE_DETECT     = 1;
+param SLOT_MRL_SENSOR          = 2;
+param SLOT_POWER_FAULT         = 3;
+param LINK_DLL                 = 4;
+param SLOT_POWER_INDICATOR    = 5;
+param SLOT_COMMAND_COMPLETED   = 6;
+
+param PCIE_DCP_Link_Down_Presence_Not_Determined = 0b000;
+param PCIE_DCP_Link_Down_Component_Not_Present = 0b001;
+param PCIE_DCP_Link_Down_Component_Present = 0b010;
+param PCIE_DCP_Link_Down_Flit_Mode_Negotiation_Completed = 0b011;
+param PCIE_DCP_Link_Up_Component_Present = 0b100;
+param PCIE_DCP_Link_Up_Component_Present_and_DRS_Received = 0b101;
+
+method hotplug_type_to_str(int type) -> (const char*) {
+    switch (type) {
+    case SLOT_ATTENTION_BUTTON:  return "SLOT_ATTENTION_BUTTION";
+    case SLOT_PRESENCE_DETECT:   return "SLOT_PRESENCE_DETECT";
+    case SLOT_MRL_SENSOR:        return "SLOT_MRL_SENSOR";
+    case SLOT_POWER_FAULT:       return "SLOT_POWER_FAULT";
+    case LINK_DLL:               return "LINK_DLL";
+    case SLOT_POWER_INDICATOR:   return "SLOT_POWER_INDICATOR";
+    case SLOT_COMMAND_COMPLETED: return "SLOT_COMMAND_COMPLETED";
+    default:    assert(false);
+    }
+}
+
+/**
+   ## PCI Express Capability registers
+
+    - name: `exp_capability`
+    - implemented: functional
+
+   ### Parameters:
+   - `has_hotplug_capable_slot`: Device has a native PCIe Hot-Plug capable slot.
+     This param will set the *has_hotplug_capable* in the instantiated
+     *exp_slot* template, default false
+   - `has_attention_button_slot`: Attention button present in slot. This param
+     will set the *has_attention_button* in the instantiated *exp_slot*
+     template, default false
+   - `has_links`: Presence of __links__ registers, default
+     *has_hotplug_capable_slot*
+   - `has_slots`: Presence of __slots__ registers, default
+     *has_hotplug_capable_slot*
+   - `has_root`: Presence of __root__ registers, default false
+   - `dp_type`: Device/port type, as indicated in `exp.capability.dpt` register field, ([see constants](#device-port-type-constants)), default `PCIE_DP_Type_EP`.
+   - `cap_version`: Version of this capability structure, as indicated in `exp.capability.cv` register field, default 2
+   - `imn`: The MSI/MSI-X vector used for the interrupt message generated in
+     association with any of the status bits of this Capability structure,
+     default 0
+
+    #### Adds groups:
+    - `device` which instantiates template `exp_dev`.
+    - `link` which instantiates template `exp_link`. Optionally added depending on param `has_links`.
+    - `slot` which instantiates template `exp_slot`. Optionally added depending on param `has_slots`.
+    - `root` which instantiates template `exp_root`. Optionally added depending on param `has_root`.
+
+   #### Device/port type constants for field `exp.capability.dpt` <span id="device-port-type-constants"><span>
+   `PCIE_DP_Type_EP`, `PCIE_DP_Type_Legacy_EP`, `PCIE_DP_Type_RCiEP`, `PCIE_DP_Type_RCEC`,
+   `PCIE_DP_Type_RP`, `PCIE_DP_Type_UP`, `PCIE_DP_Type_DP`, `PCIE_DP_Type_BridgeX`, `PCIE_DP_Type_XBridge`
+*/
+
+template exp_capability is capability {
+    param id = 0x10;
+    param has_links default has_hotplug_capable_slot;
+    param has_slots default has_hotplug_capable_slot;
+    param has_root default false;
+    param dp_type: uint4;
+    param dp_type default PCIE_DP_Type_EP;
+    param cap_version default (pcie_version >= 2.0) ? 2 : 1;
+    param has_hotplug_capable_slot default false;
+    param has_attention_button_slot default false;
+    param has_power_indicator default false;
+    param imn default 0;
+    param has_flit_mode_support default false;
+
+    param PCIE_Is_Upstream_Component = ((dp_type == PCIE_DP_Type_RP)
+        || (dp_type == PCIE_DP_Type_DP)
+        || (dp_type == PCIE_DP_Type_BridgeX));
+    param PCIE_Is_Downstream_Component = ((dp_type == PCIE_DP_Type_EP)
+        || (dp_type == PCIE_DP_Type_UP)
+        || (dp_type == PCIE_DP_Type_Legacy_EP));
+
+#if ((pcie_version < 6.0) && has_flit_mode_support) {
+    error "Flit Mode cannot be supported in PCIe versions < 6.0";
+}
+
+    register capability size 2 @ base + 0x2 is pcie_desc {
+        param pcie_desc = "PCI Express Capabilities";
+        field cv   @ [3:0] is pcie_desc {
+            param pcie_desc = "Capability Version";
+            param init_val default cap_version;
+        }
+        field dpt  @ [7:4] is pcie_desc {
+            param pcie_desc = "Device/Port Type";
+            param init_val default dp_type;
+        }
+        field si   @ [8] is pcie_desc {
+            param pcie_desc = "Slot Implemented";
+            param init_val default has_slots ? 1 : 0;
+        }
+        field imn  @ [13:9] is pcie_desc {
+            param pcie_desc = "Interrupt Message Number";
+            param init_val default parent.parent.imn;
+        }
+        field trs  @ [14] is pcie_desc {
+            param pcie_desc = "TCS Routing Supported";
+        }
+#if (pcie_version >= 6.0) {
+        field fms @ [15] is pcie_desc {
+            param pcie_desc = "Flit Mode Supported";
+            param init_val default has_flit_mode_support ? 1 : 0;
+        }
+}
+    }
+    group device is exp_dev;
+#if (has_links) {
+    group link is exp_link {
+        param dll_link_active_reporting default has_hotplug_capable_slot;
+    }
+}
+
+#if (has_slots) {
+    group slot is exp_slot {
+        param is_hotplug_capable = has_hotplug_capable_slot;
+        param has_attention_button = has_attention_button_slot;
+    }
+}
+#if (has_root) {
+    group root is exp_root;
+}
+
+#if (has_hotplug_capable_slot && (!has_slots || !has_links)) {
+    error "Hot-Plug can not be enabled without enabling slots and links";
+}
+#if (has_hotplug_capable_slot && ((dp_type != PCIE_DP_Type_DP) && (dp_type != PCIE_DP_Type_RP))) {
+    error "Only a Downstream Port can be Hot-Plug capable";
+}
+
+    shared method notify();
+    method notify() {
+        foreach msix in (each msix_capability in (this.parent)) {
+            if (msix.is_enabled()) {
+                log info, 4: "PCI Express Capability notification using MSI-X"
+                           + " on %s", this.qname;
+                msix.raise(capability.imn.val);
+                return;
+            }
+        }
+        foreach msi in (each msi_capability in (this.parent)) {
+            if (msi.is_enabled()) {
+                log info, 4: "PCI Express Capability notification using MSI on"
+                           + " %s", this.qname;
+                msi.raise(capability.imn.val);
+                return;
+            }
+        }
+        if ((interrupt_pin.val > 0) && (command.id.val == 0)) {
+            log info, 4: "PCI Express Capability notification using"
+                       + " PCI-compatible INTx Emulation on %s", this.qname;
+            raise_legacy_interrupt();
+            return;
+        }
+        log info, 2: " PCI Express Capability notify skipped on %s. No"
+                   + " interrupt mechanism enabled.", this.qname;
+    }
+
+    /**
+       #### `flit_mode_supported() -> (bool)`
+       Returns true the Flit Mode Supported field is set
+    */
+    shared method flit_mode_supported() -> (bool);
+    method flit_mode_supported() -> (bool) default {
+#if ((pcie_version >= 6.0) && (has_links)) {
+        return capability.fms.val == 1;
+} #else {
+        return false;
+}
+    }
+
+#if (use_standard_access_templates) {
+    register capability {
+        field cv  is read_only;
+        field dpt is read_only;
+        field si  is hwinit;
+        field imn is read_only;
+        field trs is read_only;
+#if (pcie_version >= 6.0) {
+        field fms is hwinit;
+}
+    }
+}
+#if (use_standard_write_templates) {
+    register capability {
+        field si  is pcie_sticky;
+    }
+}
+}
+
+template _defining_exp_capability {
+    param exp_offset;
+    param exp_next_ptr;
+}
+
+template defining_exp_capability is _defining_exp_capability {
+    param exp_dp_type;
+    group exp is exp_capability {
+        param base = exp_offset;
+        param next_ptr = exp_next_ptr;
+        param dp_type = exp_dp_type;
+    }
+}
+
+/**
+   ### PCI Express Capability Device registers
+
+    - name: `exp_dev`
+    - implemented: functional
+*/
+template exp_dev is group {
+    register cap      size 4 @ (base + 0x04) is pcie_desc {
+        param pcie_desc = "Device Capabilities";
+    }
+    register control  size 2 @ (base + 0x08) is pcie_desc {
+        param pcie_desc = "Device Control";
+    }
+    register status   size 2 @ (base + 0x0a) is pcie_desc {
+        param pcie_desc = "Device Status";
+    }
+
+    register cap {
+        field mpss  @ [2:0]   is pcie_desc {
+            param pcie_desc = "Max Payload_Size Supported";
+        }
+        field pfs   @ [4:3]   is pcie_desc {
+            param pcie_desc = "Phantom Functions Supported";
+        }
+        field etfs  @ [5:5]   is pcie_desc {
+            param pcie_desc = "Extended Tag Field Supported";
+        }
+        field el0al @ [8:6]   is pcie_desc {
+            param pcie_desc = "Endpoint L0 Acceptable Latency";
+        }
+        field el1al @ [11:9]  is pcie_desc {
+            param pcie_desc = "Endpoint L1 Acceptable Latency";
+        }
+#if (cap_version == 1) {
+        field abp   @ [12:12] is pcie_desc {
+            param pcie_desc = "Attention Button Present";
+            param init_val default has_attention_button_slot ? 1 : 0;
+        }
+        field aip   @ [13:13] is pcie_desc {
+            param pcie_desc = "Attention Indicator Present";
+        }
+        field pip   @ [14:14] is pcie_desc {
+            param pcie_desc = "Power Indicator Present";
+            param init_val default has_power_indicator ? 1 : 0;
+        }
+}
+        field rber  @ [15:15] is pcie_desc {
+            param pcie_desc = "Role Based Error Reporting";
+            param init_val default 1;
+        }
+#if (pcie_version >= 5.0) {
+        field ecsc  @ [16:16] is pcie_desc {
+            param pcie_desc = "ERR COR Subclass Capable";
+        }
+}
+#if (pcie_version >= 6.0) {
+        field rmf @ [17:17] is pcie_desc {
+            param pcie_desc = "Rx_MPS_Fixed";
+        }
+}
+        field csplv @ [25:18] is pcie_desc {
+            param pcie_desc = "Captured Slot Power Limit Value";
+        }
+        field cspls @ [27:26] is pcie_desc {
+            param pcie_desc = "Captured Slot Power Limit Scale";
+        }
+        field flrc  @ [28:28] is pcie_desc {
+            param pcie_desc = "Function Level Reset Capability";
+            param init_val default (dp_type == PCIE_DP_Type_EP || dp_type == PCIE_DP_Type_RCiEP) #? 1 #: 0;
+        }
+#if (pcie_version >= 6.0) {
+        field mms @ [29:29] is pcie_desc {
+            param pcie_desc = "Mixed_MPS_Supported";
+        }
+}
+    }
+    register control {
+        field cere   @ [0:0]   is pcie_desc {
+            param pcie_desc = "Correctable Error Reporting Enable";
+        }
+        field nfere  @ [1:1]   is pcie_desc {
+            param pcie_desc = "Non-Fatal Error Reporting Enable";
+        }
+        field fere   @ [2:2]   is pcie_desc {
+            param pcie_desc = "Fatal Error Reporting Enable";
+        }
+        field urre   @ [3:3]   is pcie_desc {
+            param pcie_desc = "Unsupported Request Reporting Enable";
+        }
+        field ero    @ [4:4]   is pcie_desc {
+            param pcie_desc = "Enabled Relaxed Ordering";
+        }
+        field mps    @ [7:5]   is pcie_desc {
+            param pcie_desc = "Max Payload Size";
+        }
+        field etfe   @ [8:8]   is pcie_desc {
+            param pcie_desc = "Extended Tag Field Enable";
+        }
+        field pfe    @ [9:9]   is pcie_desc {
+            param pcie_desc = "Phantom Functions Enable";
+        }
+        field appme  @ [10:10] is pcie_desc {
+            param pcie_desc = "Auxiliary Power PM Enable";
+        }
+        field ens    @ [11:11] is pcie_desc {
+            param pcie_desc = "Enabled No Snoop";
+        }
+        field mrrs   @ [14:12] is pcie_desc {
+            param pcie_desc = "Max Read Request Size";
+        }
+        field bcre_iflr @ [15:15] is pcie_desc {
+            param pcie_desc = "Bridge Configuration Retry Enable / Initiate Function Level Reset";
+    #if (dp_type == PCIE_DP_Type_EP || dp_type == PCIE_DP_Type_RCiEP) {
+            method pcie_write(uint64 value) default {
+                if (value == 1) {
+                    if (cap.flrc.val == 1) {
+                        log info, 2: "Initiate FLR on %s", bank.qname;
+                        bank.pcie_function_level_reset();
+                    } else {
+                        log spec_viol: "FLR unsupported, writing 1 to %s", this.qname;
+                    }
+                }
+            }
+    }
+        }
+    }
+    register status {
+        field ced   @ [0:0] is pcie_desc {
+            param pcie_desc = "Correctable Error Detected";
+        }
+        field nfed  @ [1:1] is pcie_desc {
+            param pcie_desc = "Non-Fatal Error Detected";
+        }
+        field fed   @ [2:2] is pcie_desc {
+            param pcie_desc = "Fatal Error Detected";
+        }
+        field urd   @ [3:3] is pcie_desc {
+            param pcie_desc = "Unsupported Request Detected";
+        }
+        field auxpd @ [4:4] is pcie_desc {
+            param pcie_desc = "AUX Power Detected";
+        }
+        field tp    @ [5:5] is pcie_desc {
+            param pcie_desc = "Transactions Pending";
+        }
+#if (pcie_version >= 4.0) {
+        field eprd  @ [6:6] is pcie_desc {
+            param pcie_desc = "Emergency Power Reduction Detected";
+        }
+}
+    }
+
+#if (cap_version >= 2) {
+    register cap2     size 4 @ (base + 0x24) is pcie_desc {
+        param pcie_desc = "Device Capabilities 2";
+    }
+    register control2 size 2 @ (base + 0x28) is pcie_desc {
+        param pcie_desc = "Device control 2";
+    }
+    register status2  size 2 @ (base + 0x2a) is pcie_desc {
+        param pcie_desc = "Device status 2";
+    }
+
+    register cap2 {
+        field ctrs     @ [3:0]   is pcie_desc {
+            param pcie_desc = "Completion Timeout Ranges Supported";
+        }
+        field ctds     @ [4:4]   is pcie_desc {
+            param pcie_desc = "Completion Timeout Disable Supported";
+        }
+#if (pcie_version >= 2.1) {
+        field arifs    @ [5:5]   is pcie_desc {
+            param pcie_desc = "ARI Forwarding Supported";
+        }
+        field aors     @ [6:6]   is pcie_desc {
+            param pcie_desc = "AtomicOp Routing Supported";
+        }
+        field aocs32   @ [7:7]   is pcie_desc {
+            param pcie_desc = "32-bit AtomicOp Completer Supported";
+        }
+        field aocs64   @ [8:8]   is pcie_desc {
+            param pcie_desc = "64-bit AtomicOp Completer Supported";
+        }
+        field cascs    @ [9:9]   is pcie_desc {
+            param pcie_desc = "128-bit CAS Completer Supported";
+        }
+        field nroprprp @ [10:10] is pcie_desc {
+            param pcie_desc = "No RO-enabled PR-PR Passing";
+        }
+        field ltrms    @ [11:11] is pcie_desc {
+            param pcie_desc = "LTR Mechanism Supported";
+        }
+        field tphcs    @ [13:12] is pcie_desc {
+            param pcie_desc = "TPH Completer Supported";
+        }
+#if (pcie_version >= 3.0) {
+        field obffs    @ [19:18] is pcie_desc {
+            param pcie_desc = "OBFF Supported";
+        }
+}
+        field effs     @ [20:20] is pcie_desc {
+            param pcie_desc = "Extended Fmt Field Supported";
+        }
+        field eetlpps  @ [21:21] is pcie_desc {
+            param pcie_desc = "End-End TLP Prefix Supported";
+        }
+        field meetlpp  @ [23:22] is pcie_desc {
+            param pcie_desc = "Max End-End TLP Prefixes";
+        }
+}
+#if (pcie_version >= 3.1) {
+#if (pcie_version < 6.0) {
+        // Deprecated in PCIe 6
+        field lnscls   @ [15:14] is pcie_desc {
+            param pcie_desc = "LN System CLS";
+        }
+}
+        field frss     @ [31:31] is pcie_desc {
+            param pcie_desc = "FRS Supported";
+        }
+}
+#if (pcie_version >= 4.0) {
+        field tcs      @ [16:16] is pcie_desc {
+            param pcie_desc = "10-Bit Tag Completer Supported";
+        }
+        field trs      @ [17:17] is pcie_desc {
+            param pcie_desc = "10-Bit Tag Requester Supported";
+        }
+        field eprs     @ [25:24] is pcie_desc {
+            param pcie_desc = "Emergency Power Reduction Supported";
+        }
+        field eprir    @ [26:26] is pcie_desc {
+            param pcie_desc = "Emergency Power Reduction Init Required";
+        }
+}
+#if (pcie_version >= 6.0) {
+        field dmwcs    @ [28:28] is pcie_desc {
+            param pcie_desc = "DMWr Completer Supported";
+        }
+        field dmwls    @ [30:29] is pcie_desc {
+            param pcie_desc = "DMWr Lengths Supported";
+        }
+}
+    }
+    register control2 {
+        field ctv     @ [3:0]   is pcie_desc {
+            param pcie_desc = "Completion Timeout Value";
+        }
+        field ctd     @ [4:4]   is pcie_desc {
+            param pcie_desc = "Completion Timeout Disable";
+        }
+        field arife   @ [5:5]   is pcie_desc {
+            param pcie_desc = "ARI Forwarding Enable";
+        }
+        field aore    @ [6:6]   is pcie_desc {
+            param pcie_desc = "AtomicOp Requester Enable";
+        }
+        field aoeb    @ [7:7]   is pcie_desc {
+            param pcie_desc = "AtomicOp Egress Blocking";
+        }
+        field idore   @ [8:8]   is pcie_desc {
+            param pcie_desc = "IDO Request Enable";
+        }
+        field idoce   @ [9:9]   is pcie_desc {
+            param pcie_desc = "IDO Completion Enable";
+        }
+        field ltrme   @ [10:10] is pcie_desc {
+            param pcie_desc = "LTR Mechanism Enable";
+        }
+#if (pcie_version >= 4.0) {
+        field eprr    @ [11:11] is pcie_desc {
+            param pcie_desc = "Emergency Power Reduction Request";
+        }
+        field tre     @ [12:12] is pcie_desc {
+            param pcie_desc = "10-Bit Tag Requester Enable";
+        }
+}
+#if (pcie_version >= 3.0) {
+        field obffe   @ [14:13] is pcie_desc {
+            param pcie_desc = "OBFF Enable";
+        }
+}
+        field eetlppb @ [15:15] is pcie_desc {
+            param pcie_desc = "End-End TLP Prefix Blocking";
+        }
+    }
+}  // if cap_version >= 2
+
+    /**
+       #### `set_status_error(uint8 error_type, bool is_ur) throws`
+       Sets the bits in the status register related to error signaling.
+    */
+    shared method set_status_error(uint8 error_type, bool is_ur) throws;
+    method set_status_error(uint8 error_type, bool is_ur) throws {
+        switch (error_type) {
+        case PCIE_ERR_COR:
+            status.ced.val = 1;
+            break;
+        case PCIE_ERR_NONFATAL:
+            status.nfed.val = 1;
+            break;
+        case PCIE_ERR_FATAL:
+            status.fed.val = 1;
+            break;
+        default:
+            log error: "Invalid Error Type %d", error_type;
+            throw;
+        }
+
+        if (is_ur)
+            status.urd.val = 1;
+    }
+
+    shared method get_urre() -> (uint1);
+    method get_urre() -> (uint1) { return control.urre.val; }
+
+    shared method get_fere() -> (uint1);
+    method get_fere() -> (uint1) { return control.fere.val; }
+
+    shared method get_nfere() -> (uint1);
+    method get_nfere() -> (uint1) { return control.nfere.val; }
+
+    shared method get_cere() -> (uint1);
+    method get_cere() -> (uint1) { return control.cere.val; }
+
+#if (use_standard_access_templates) {
+    register cap {
+        field mpss  is read_only;
+        field pfs   is read_only;
+        field etfs  is read_only;
+        field el0al is read_only;
+        field el1al is read_only;
+#if (cap_version == 1) {
+        field abp   is read_only;
+        field aip   is read_only;
+        field pip   is read_only;
+}
+        field rber  is read_only;
+#if (pcie_version >= 5.0) {
+        field ecsc  is read_only;
+}
+#if (pcie_version >= 6.0) {
+        field rmf is hwinit;
+}
+        field csplv is read_only;
+        field cspls is read_only;
+        field flrc  is read_only;
+#if (pcie_version >= 6.0) {
+        field mms is hwinit;
+}
+    }
+    register control {
+#if (dp_type != PCIE_DP_Type_EP
+     && dp_type != PCIE_DP_Type_RCiEP
+     && dp_type != PCIE_DP_Type_BridgeX) {
+        field bcre_iflr is ignore_write;
+}
+    }
+    register status {
+        field auxpd is ignore_write;
+        field tp    is ignore_write;
+    }
+#if (cap_version >= 2) {
+    register cap2 {
+        field ctrs     is hwinit;
+        field ctds     is ignore_write;
+#if (pcie_version >= 2.1) {
+        field arifs    is ignore_write;
+        field aors     is ignore_write;
+        field aocs32   is ignore_write;
+        field aocs64   is ignore_write;
+        field cascs    is ignore_write;
+        field nroprprp is hwinit;
+        field ltrms    is ignore_write;
+        field tphcs    is ignore_write;
+#if (pcie_version >= 3.1) {
+#if (pcie_version < 6.0) {
+        field lnscls   is hwinit;
+}
+        field frss     is hwinit;
+}
+#if (pcie_version >= 4.0) {
+        field tcs      is hwinit;
+        field trs      is hwinit;
+        field eprs     is hwinit;
+        field eprir    is hwinit;
+}
+#if (pcie_version >= 3.0) {
+        field obffs    is hwinit;
+}
+        field effs     is ignore_write;
+        field eetlpps  is hwinit;
+        field meetlpp  is hwinit;
+}
+    }
+    register status2  is read_only;
+}
+}
+#if (use_standard_write_templates) {
+    register cap {
+        field csplv is pcie_no_function_level_reset;
+        field cspls is pcie_no_function_level_reset;
+    }
+    register control {
+        field mps is pcie_no_function_level_reset;
+#if (dp_type == PCIE_DP_Type_EP || dp_type == PCIE_DP_Type_RCiEP) {
+        field bcre_iflr is pcie_write;
+}
+    }
+    register status {
+        field ced   is pcie_write_1_clears;
+        field nfed  is pcie_write_1_clears;
+        field fed   is pcie_write_1_clears;
+        field urd   is pcie_write_1_clears;
+#if (pcie_version >= 4.0) {
+        field eprd  is pcie_write_1_clears;
+}
+    }
+#if (cap_version >= 2) {
+    register cap2 {
+        field ctrs     is pcie_sticky;
+#if (pcie_version >= 2.1) {
+        field nroprprp is pcie_sticky;
+#if (pcie_version >= 3.1) {
+#if (pcie_version < 6.0) {
+        field lnscls   is pcie_sticky;
+}
+        field frss     is pcie_sticky;
+}
+#if (pcie_version >= 4.0) {
+        field tcs      is pcie_sticky;
+        field trs      is pcie_sticky;
+        field eprs     is pcie_sticky;
+        field eprir    is pcie_sticky;
+}
+#if (pcie_version >= 3.0) {
+        field obffs    is pcie_sticky;
+}
+        field eetlpps  is pcie_sticky;
+        field meetlpp  is pcie_sticky;
+        }
+    }
+}
+}
+}
+
+/**
+   ### PCI Express Capability Link registers
+
+    - name: `exp_link`
+    - implemented: link training
+
+   #### Parameters:
+   - `dll_link_active_reporting`: Link supports DLL Link Active Reporting, default false
+   - `max_link_speed`: Max link speed provided as a value of the
+   pcie_link_speed_t enum, default PCIE_Link_Speed_Undefined
+   - `max_link_width`: Max link width provided as a value of the
+   pcie_link_width_t enum, PCIE_Link_Width_Undefined
+   - `link_bandwidth_notifications`: Support Link Bandwidth Notifications,
+   default ((dp_type == PCIE_DP_Type_DP) || (dp_type == PCIE_DP_Type_RP))
+
+   #### Methods
+*/
+
+template exp_link is group {
+    param dll_link_active_reporting default false;
+    param max_link_speed default PCIE_Link_Speed_Undefined;
+    param max_link_width default PCIE_Link_Width_Undefined;
+    param link_bandwidth_notifications default ((dp_type == PCIE_DP_Type_DP) || (dp_type == PCIE_DP_Type_RP));
+
+    session map_target_t *link_training_target;
+
+    register cap      size 4 @ (base + 0x0c) is pcie_desc {
+        param pcie_desc = "Link Capabilities";
+    }
+    register control  size 2 @ (base + 0x10) is pcie_desc {
+        param pcie_desc = "Link Control";
+    }
+    register status   size 2 @ (base + 0x12) is pcie_desc {
+        param pcie_desc = "Link Status";
+    }
+
+    register cap {
+        field mls    @ [3:0] is (link_speed_init, pcie_desc) {
+            param pcie_desc = "Max Link Speed";
+        }
+        field mlw    @ [9:4]   is pcie_desc {
+            param pcie_desc = "Max Link Width";
+            param init_val default max_link_width;
+        }
+        field aspms  @ [11:10] is pcie_desc {
+            param pcie_desc = "Active State Power Management Support";
+        }
+        field l0el   @ [14:12] is pcie_desc {
+            param pcie_desc = "L0 Exit Latency";
+        }
+        field l1el   @ [17:15] is pcie_desc {
+            param pcie_desc = "L1 Exit Latency";
+        }
+        field cpm    @ [18:18] is pcie_desc {
+            param pcie_desc = "Clock Power Management";
+        }
+        field sder   @ [19:19] is pcie_desc {
+            param pcie_desc = "Surprise Down Error Reporting Capable";
+        }
+        field dlllar @ [20:20] is pcie_desc {
+            param pcie_desc = "DLL Link Active Reporting Capable";
+            param init_val default dll_link_active_reporting ? 1 : 0;
+        }
+        field lbn    @ [21:21] is pcie_desc {
+            param pcie_desc = "Link Bandwidth Notification Capability";
+            param init_val default link_bandwidth_notifications ? 1 : 0;
+        }
+#if (pcie_version >= 3.0) {
+        field aspmoc @ [22:22] is pcie_desc {
+            param pcie_desc = "ASPM Optionality Compliance";
+        }
+}
+        field pn     @ [31:24] is pcie_desc {
+            param pcie_desc = "Port Number";
+        }
+    }
+    register control {
+        field aspmc   @ [1:0]   is pcie_desc {
+            param pcie_desc = "Active State Power Management Control";
+        }
+#if (pcie_version >= 6.0) {
+        field ppdaib  @ [2:2]   is pcie_desc {
+            param pcie_desc = "PTM Propagation Delay Adaptation Interpretation B";
+        }
+}
+        field rcb     @ [3:3]   is pcie_desc {
+            param pcie_desc = "Read Completion Boundary";
+        }
+        field ld      @ [4:4]   is pcie_desc {
+            param pcie_desc = "Link Disable";
+        }
+        field rl      @ [5:5]   is pcie_desc {
+            param pcie_desc = "Retrain Link";
+            method pcie_write(uint64 value) default {
+#if ((dp_type != PCIE_DP_Type_DP) && (dp_type != PCIE_DP_Type_RP)) {
+                if (value == 1) {
+                    log spec_viol: "Link retraining is only supported on"
+                                + " Downstream Ports.";
+                }
+} #else {
+                if ((value == 1) && do_link_training(0)) {
+                    log info, 1: "Link retraining completed. Setting Link"
+                               + " Bandwidth Management Status";
+                    status.lbms.val = 1;
+                    // Do notify after the register has been written completely
+                    after: link_bandwidth_notify();
+                }
+}
+            }
+        }
+        field ccc     @ [6:6]   is pcie_desc {
+            param pcie_desc = "Common Clock Configuration";
+        }
+        field es      @ [7:7]   is pcie_desc {
+            param pcie_desc = "Extended Synch";
+        }
+        field ecpm    @ [8:8]   is pcie_desc {
+            param pcie_desc = "Enable Clock Power Management";
+        }
+        field hawd    @ [9:9]   is pcie_desc {
+            param pcie_desc = "Hardware Autonomous Width Disable";
+        }
+        field lbmie   @ [10:10] is pcie_desc {
+            param pcie_desc = "Link Bandwidth Management Interrupt Enable";
+            method pcie_write(uint64 value) default {
+#if ((dp_type != PCIE_DP_Type_DP) && (dp_type != PCIE_DP_Type_RP)) {
+            if (value == 1) {
+                log spec_viol: "Link Bandwidth Notifications are not applicable"
+                         + " for devices other than root ports and downstream"
+                         + " ports";
+            }
+} #else {
+                if ((value == 1) && !cap.lbn.val) {
+                    log spec_viol: "Link bandwitch management interrupts were"
+                                 + " enabled without the Link Bandwidth"
+                                 + " Notification Capability being supported";
+                }
+                this.val = value;
+}
+            }
+        }
+        field labie   @ [11:11] is pcie_desc {
+            param pcie_desc = "Link Autonomous Bandwidth Interrupt Enable";
+        }
+#if (pcie_version >= 6.0) {
+        field sc      @ [12:12] is pcie_desc {
+            param pcie_desc = "SRIS Clocking";
+        }
+        field fmd     @ [13:13] is pcie_desc {
+            param pcie_desc = "Flit Mode Disable";
+        }
+}
+#if (pcie_version >= 3.1) {
+        field drssc   @ [15:14] is pcie_desc {
+            param pcie_desc = "DRS Signaling Control";
+        }
+}
+    }
+    register status {
+        field ls    @ [3:0]   is pcie_desc {
+            param pcie_desc = "Current Link Speed";
+        }
+        field nlw   @ [9:4]   is pcie_desc {
+            param pcie_desc = "Negotiated Link Width";
+        }
+        field te    @ [10:10] is pcie_desc {
+            param pcie_desc = "Training Error";
+        }
+        field lt    @ [11:11] is pcie_desc {
+            param pcie_desc = "Link Training";
+        }
+        field scc   @ [12:12] is pcie_desc {
+            param pcie_desc = "Slot Clock Configuration";
+        }
+        field dllla @ [13:13] is pcie_desc {
+            param pcie_desc = "Data Link Layer Link Active";
+        }
+        field lbms  @ [14:14] is pcie_desc {
+            param pcie_desc = "Link Bandwidth Management Status";
+        }
+        field labs  @ [15:15] is pcie_desc {
+            param pcie_desc = "Link Autonomous Bandwidth Status";
+        }
+    }
+#if (cap_version >= 2) {
+    register cap2     size 4 @ (base + 0x2c) is pcie_desc {
+        param pcie_desc = "Link Capabilities 2";
+    }
+    register control2 size 2 @ (base + 0x30) is pcie_desc {
+        param pcie_desc = "Link Control 2";
+    }
+    register status2  size 2 @ (base + 0x32) is pcie_desc {
+        param pcie_desc = "Link Status 2";
+    }
+
+    register cap2 {
+#if (pcie_version >= 3.0) {
+        field slsv       @ [7:1]   is pcie_desc {
+            param pcie_desc = "Supported Link Speeds Vector";
+            param init_val default max_link_speed * 2 - 1;
+        }
+        field cs         @ [8:8]   is pcie_desc {
+            param pcie_desc = "Crosslink Supported";
+        }
+}
+#if (pcie_version >= 3.1) {
+        field lskposgssv @ [15:9]  is pcie_desc {
+            param pcie_desc = "Lower SKP OS Generation Supported Speeds Vector";
+        }
+        field lskposrssv @ [22:16] is pcie_desc {
+            param pcie_desc = "Lower SKP OS Reception Supported Speeds Vector";
+        }
+        field drss       @ [31:31] is pcie_desc {
+            param pcie_desc = "DRS Supported";
+            param init_val default has_flit_mode_support ? 1 : 0;
+        }
+}
+#if (pcie_version >= 4.0) {
+        field rpds       @ [23:23] is pcie_desc {
+            param pcie_desc = "Retimer Presence Detect Supported";
+        }
+        field trpds      @ [24:24] is pcie_desc {
+            param pcie_desc = "Two Retimers Presence Detect Supported";
+        }
+}
+    }
+    register control2 {
+        field tls   @ [3:0] is (link_speed_init, pcie_desc) {
+            param pcie_desc = "Target Link Speed";
+            method pcie_write(uint64 value) default {
+                if (value == 0) {
+                    if (max_link_speed != PCIE_Link_Speed_2_5) {
+                        log spec_viol: "Setting target link speed to 0 is only"
+                                     + " allowed if the device only supports a"
+                                     + " link speed of 2.5 GT/s";
+                    }
+                }
+#if (pcie_version >= 3.0) {
+                if (cap2.slsv.val[value - 1] != 1) {
+                    log spec_viol: "The target link speed can not be set to an"
+                                 + " unsupported link speed as defined by the"
+                                 + " Supported Link Speeds Vector Register.";
+                }
+} #else {
+                if ((value != 0b0001) && (value != 0b0010)) {
+                    log spec_viol: "The target link speed must be set to 0001b"
+                        + " or 0010b";
+                }
+}
+                this.val = value;
+            }
+        }
+        field ec    @ [4:4] is pcie_desc {
+            param pcie_desc default  "Enter Compliance";
+        }
+        field hasd  @ [5:5] is pcie_desc {
+            param pcie_desc default  "Hardware Autonomous Speed Disable";
+        }
+        field sd    @ [6:6]   is pcie_desc {
+            param pcie_desc = "Selectable De-emphasis";
+        }
+        field tm    @ [9:7]   is pcie_desc {
+            param pcie_desc = "Transmit Margin";
+        }
+        field emc   @ [10:10] is pcie_desc {
+            param pcie_desc = "Enter Modified Compliance";
+        }
+        field csos  @ [11:11] is pcie_desc {
+            param pcie_desc = "Compliance SOS";
+        }
+#if (pcie_version == 2.0) {
+        field cd    @ [12:12] is pcie_desc {
+            param pcie_desc = "Compliance de-emphasis";
+        }
+}
+#if (pcie_version >= 3.0) {
+        field cd    @ [15:12] is pcie_desc {
+            param pcie_desc = "Compliance Preset/De-emphasis";
+        }
+}
+    }
+    register status2 {
+        field cdl   @ [0:0]   is pcie_desc {
+            param pcie_desc = "Current De-emphasis Level";
+        }
+#if (pcie_version >= 3.0) {
+        field ec    @ [1:1]   is pcie_desc {
+            param pcie_desc = "Equalization 8.0 GT/s Complete";
+        }
+        field ep1s  @ [2:2]   is pcie_desc {
+            param pcie_desc = "Equalization 8.0 GT/s Phase 1 Successful";
+        }
+        field ep2s  @ [3:3]   is pcie_desc {
+            param pcie_desc = "Equalization 8.0 GT/s Phase 2 Successful";
+        }
+        field ep3s  @ [4:4]   is pcie_desc {
+            param pcie_desc = "Equalization 8.0 GT/s Phase 3 Successful";
+        }
+        field ler   @ [5:5]   is pcie_desc {
+            param pcie_desc = "Link Equalization Request 8.0 GT/s";
+        }
+}
+#if (pcie_version >= 3.1) {
+       field dcp   @ [14:12] is pcie_desc {
+           param pcie_desc = "Downstream Component Presence";
+       }
+       field drsmr @ [15:15] is pcie_desc {
+           param pcie_desc = "DRS Message Received";
+       }
+}
+#if (pcie_version >= 4.0) {
+       field rpd   @ [6:6]   is pcie_desc {
+           param pcie_desc = "Retimer Presence Detected";
+       }
+       field trpd  @ [7:7]   is pcie_desc {
+           param pcie_desc = "Two Retimers Presence Detected";
+       }
+       field cr    @ [9:8]   is pcie_desc {
+           param pcie_desc = "Crosslink Resolution";
+       }
+}
+#if (pcie_version >= 6.0) {
+       field fms   @ [10:10] is pcie_desc {
+           param pcie_desc = "Flit Mode Status";
+       }
+}
+    }
+}  // if cap_version >= 2
+
+    shared method get_port_number() -> (uint8);
+    method get_port_number() -> (uint8) {
+        return cap.pn.val;
+    }
+
+    method link_bandwidth_notify() {
+        if (control.lbmie.val == 1) {
+            log info, 2: "Notifying software that link retraining"
+                        + " has completed";
+            notify();
+        }
+    }
+
+    /**
+       #### `link_speed_vector_decode(uint8 encoded_link_speed)`
+       Given a value in the Current Link Speed or Max Link Speed field, returns
+       the corresponding link speed based on values in the Supported Link
+       Speeds Vector field. Returns PCIE_Link_Speed_Undefined if the value of
+       `encoded_link_speed` corresponds to an unset Supported Link Speed vector
+       bit.
+    */
+    method link_speed_vector_decode(uint8 encoded_link_speed) ->
+        (pcie_link_speed_t) {
+        assert(encoded_link_speed > 0);
+#if ((cap_version >= 2) && (pcie_version >= 3.0)) {
+        if (cap2.slsv.val[encoded_link_speed - 1] == 1) {
+            return 1 << encoded_link_speed - 1;
+        } else {
+            log error: "Link speed %d is not supported by the device",
+                encoded_link_speed;
+            return PCIE_Link_Speed_Undefined;
+        }
+
+} #else {
+        return PCIE_Link_Speed_Undefined;
+}
+    }
+
+    /**
+       #### `set_link_training_target(map_target_t *target)`
+       Sets the default link training target when `do_link_training()` is called
+       with NULL.
+    */
+    shared method set_link_training_target(map_target_t *target);
+    method set_link_training_target(map_target_t *target) {
+        this.link_training_target = target;
+    }
+
+    /**
+       #### `link_training_width_speed_result(const transaction_t *t, exception_type_t exc) -> (bool)`
+         This method handles pcie_link_negotiation atom after a link training
+         transaction has completed. If there is no pcie_link_negotiation atom,
+         the method does nothing.
+    */
+    method link_training_width_speed_result(const transaction_t *t,
+        exception_type_t exc) -> (bool) default {
+        local const pcie_link_negotiation_t *negotiation = ATOM_get_transaction_pcie_link_negotiation(t);
+
+        local bool lt_success;
+        if ((negotiation->negotiated_link_speed != PCIE_Link_Speed_Undefined)
+            && (negotiation->negotiated_link_width != PCIE_Link_Width_Undefined)
+            && (exc == Sim_PE_No_Exception)) {
+            set_link_attributes(negotiation->negotiated_link_speed,
+                                negotiation->negotiated_link_width);
+            log info, 4: "Link training done. Setting link speed to %s and link"
+                       + " width to %s",
+                       pcie_link_speed_name(negotiation->negotiated_link_speed),
+                       pcie_link_width_name(negotiation->negotiated_link_width);
+            lt_success = true;
+        }
+        if (!lt_success) {
+            log info, 3: "Link training failed";
+            return false;
+        }
+        return true;
+    }
+
+    /**
+       #### `link_training_flit_mode_result(const transaction_t *t, exception_type_t exc)`
+         This method handles pcie_link_flit_mode atom after a link training
+         transaction has completed. If there is no pcie_link_flit_mode atom, the
+         method does nothing.
+    */
+    method link_training_flit_mode_result(const transaction_t *t,
+        exception_type_t exc) default {
+        local const pcie_link_flit_mode_t *flit_mode_negotiation = ATOM_get_transaction_pcie_link_flit_mode(t);
+        if (flit_mode_negotiation == NULL) {
+            set_flit_mode_status(false);
+            return;
+        }
+
+        if (flit_mode_negotiation->enable_flit_mode) {
+            if (flit_mode_supported() && drs_supported()) {
+                set_flit_mode_status(true);
+                log info, 3: "Flit Mode negotiation done. Flit Mode will be"
+                    + " enabled.";
+            } else {
+                log info, 1: "Peer asked for Flit Mode to be enabled even"
+                    + " though this device did not indicate Flit Mode support";
+                set_flit_mode_status(false);
+            }
+        } else {
+            set_flit_mode_status(false);
+            log info, 3: "Flit Mode negotiation done. Flit Mode will be"
+                + " disabled";
+        }
+    }
+
+    /**
+       #### `link_training_flit_mode_result(const transaction_t *t, exception_type_t exc)`
+         This method handles any custom atoms after a link training transaction
+         has completed. If there are no custom atoms in the transaction, this
+         method should do nothing.
+    */
+    method link_training_result_custom(const transaction_t *t,
+        exception_type_t exc) -> (bool) default {
+        return true;
+    }
+
+    /**
+       #### `link_training_result(const transaction_t *t, exception_type_t exc) -> (bool)`
+         Calls all the link training result handlers. Returns false if at least
+         one of the handlers return false.
+    */
+    method link_training_result(const transaction_t *t, exception_type_t exc) ->
+        (bool) default {
+        local bool result = true;
+        result = result && link_training_width_speed_result(t, exc);
+        if (drs_supported()) {
+            set_downstream_component_presence(
+                result ? PCIE_DCP_Link_Up_Component_Present
+                : PCIE_DCP_Link_Down_Component_Present);
+        }
+        link_training_flit_mode_result(t, exc);
+        result = result && link_training_result_custom(t, exc);
+        return result;
+    }
+
+    /**
+       #### `do_link_training(uint16 device_id)`
+       Initiates link training by sending a link training transaction to either
+       the to the target set with `set_link_training_target()`. Returns true if
+       link negotiation was deemed successful.
+    */
+    shared method do_link_training(uint16 device_id) -> (bool);
+    method do_link_training(uint16 device_id) -> (bool) default {
+        return do_link_training_extra(device_id, NULL);
+    }
+
+    /**
+       #### `do_link_training_extra(uint16 device_id, atom_t *extra_atoms)`
+       Same as (do_link_training())[#do_link_training], but allows for adding
+       extra atoms to the link training transaction.
+    */
+    shared method do_link_training_extra(uint16 device_id, atom_t *extra_atoms)
+        -> (bool);
+    method do_link_training_extra(uint16 device_id, atom_t *extra_atoms) ->
+        (bool) default {
+#if (!PCIE_Is_Upstream_Component) {
+        log error: "Link training can only be started by an Upstream component"
+                 + " on a link (dp_type on %s is not PCIE_DP_Type_DP nor"
+                 + " PCIE_DP_Type_RP).", this.qname;
+        return false;
+}
+#else {
+        if (link_training_target == NULL)
+            return false;
+
+        local int num_extra_atoms;
+        if (extra_atoms != NULL) {
+            local const atom_t *a;
+            for (a = extra_atoms; a->id != Sim_Atom_Id_list_end; a++)
+                num_extra_atoms++;
+        }
+        local atom_t atoms[4 + num_extra_atoms];
+        local int j = 0;
+
+        local pcie_link_negotiation_t negotiation;
+        negotiation.maximum_link_speed = get_target_link_speed();
+        negotiation.maximum_link_width = get_max_link_width();
+
+        if ((negotiation.maximum_link_speed != PCIE_Link_Speed_Undefined)
+            && (negotiation.maximum_link_width != PCIE_Link_Width_Undefined)) {
+            atoms[j++] = ATOM_pcie_link_negotiation(&negotiation);
+        }
+
+        local bool flit_mode_supported = flit_mode_supported();
+        local bool flit_mode_disabled = flit_mode_disabled();
+        local bool drs_supported = drs_supported();
+        local bool try_enable_flit_mode = (flit_mode_supported
+            && !flit_mode_disabled && drs_supported);
+        local pcie_link_flit_mode_t flit_negotiation;
+        if (try_enable_flit_mode) {
+            atoms[j++] = ATOM_pcie_link_flit_mode(&flit_negotiation);
+        }
+        else {
+            log info, 3: "Flit Mode is not supported, disabled or DRS is not"
+                       + " supported, so no pcie_link_flit_mode atom will be"
+                       + " sent";
+        }
+
+        atoms[j++] = ATOM_initiator(pcie_obj);
+        for (local int i = 0; i < num_extra_atoms; i++)
+            atoms[j++] = extra_atoms[i];
+        atoms[j] = ATOM_list_end(0);
+        local transaction_t t;
+        t.atoms = atoms;
+        local uint64 addr;
+        addr[31:16] = device_id;
+        local exception_type_t exc =  SIM_issue_transaction(
+            link_training_target, &t, addr);
+        if (exc != Sim_PE_No_Exception)
+            return false;
+
+        return link_training_result(&t, exc);
+}
+    }
+
+    /**
+       #### `get_supported_link_speeds_vector() -> (uint7)`
+       Returns the Supported Link Speeds Vector.
+    */
+    shared method get_supported_link_speeds_vector() -> (uint7);
+    method get_supported_link_speeds_vector() -> (uint7) {
+#if ((cap_version >= 2) && (pcie_version >= 3.0)) {
+        return cap2.slsv.val;
+} #else {
+        return 0;
+}
+    }
+
+    /**
+       #### `get_target_link_speed() -> (pcie_link_speed_t)`
+       Returns the target link speed. Note that this is not the value of the
+       Target Link Speed field, but rather the decoded target link speed based
+       on the value of the Target Link Speed field. Note that the Downstream
+       component should not be using this during link negotiation, as it's only
+       applicable in Enter Compliance mode in such components, which currently
+       is not supported.
+    */
+    shared method get_target_link_speed() -> (pcie_link_speed_t);
+    method get_target_link_speed() -> (pcie_link_speed_t) {
+#if ((cap_version >= 2) && (pcie_version >= 3.0)) {
+        if (control2.tls.val > 0) {
+            return link_speed_vector_decode(control2.tls.val);
+        } else {
+            return PCIE_Link_Speed_Undefined;
+        }
+} #else {
+        // See IMPLEMENTATION NOTE: SOFTWARE MANAGEMENT OF LINK SPEEDS WITH EARLIER HARDWARE
+        if (control2.tls.val == 0b0001) {
+            return PCIE_Link_Speed_2_5;
+        } else if (control2.tls.val == 0b0010) {
+            return PCIE_Link_Speed_5;
+        } else {
+            return PCIE_Link_Speed_Undefined;
+        }
+}
+    }
+
+    /**
+       #### `get_max_link_width() -> (pcie_link_width_t)`
+       Returns the value of maximum link width
+    */
+    shared method get_max_link_width() -> (pcie_link_width_t);
+    method get_max_link_width() -> (pcie_link_width_t) {
+        return cap.mlw.val;
+    }
+
+    /**
+       #### `get_max_link_speed() -> (uint4)`
+       Returns the maximum link speed
+    */
+    shared method get_max_link_speed() -> (pcie_link_speed_t);
+    method get_max_link_speed() -> (pcie_link_speed_t) {
+#if ((cap_version >= 2) && (pcie_version >= 3.0)) {
+        return link_speed_vector_decode(cap.mls.val);
+} #else {
+        if (cap.mls.val == 0b0001) {
+            return PCIE_Link_Speed_2_5;
+        } else if (cap.mls.val == 0b0010) {
+            return PCIE_Link_Speed_5;
+        } else {
+            log error: "Can not return a maximum link speed for this function,"
+                + " %s.cap.mls must not be either 0001b or 0010b", this.qname;
+            return PCIE_Link_Speed_Undefined;
+        }
+}
+    }
+
+    /**
+       #### `set_link_attributes(pcie_link_speed_t speed, pcie_link_width_t width)`
+       Sets the status.ls and status.nlw fields.
+    */
+    shared method set_link_attributes(pcie_link_speed_t speed,
+                                      pcie_link_width_t width);
+    method set_link_attributes(pcie_link_speed_t speed,
+                               pcie_link_width_t width) {
+        set_current_speed(speed);
+        set_current_link_width(width);
+    }
+
+    method set_current_speed(pcie_link_speed_t speed) {
+        switch (speed) {
+        case PCIE_Link_Speed_Undefined:
+            status.ls.val = 0b000;
+            break;
+        case PCIE_Link_Speed_2_5:
+            status.ls.val = 0b001;
+            break;
+        case PCIE_Link_Speed_5:
+            status.ls.val = 0b010;
+            break;
+        case PCIE_Link_Speed_8:
+            status.ls.val = 0b011;
+            break;
+        case PCIE_Link_Speed_16:
+            status.ls.val = 0b100;
+            break;
+        case PCIE_Link_Speed_32:
+            status.ls.val = 0b101;
+            break;
+        case PCIE_Link_Speed_64:
+            status.ls.val = 0b110;
+            break;
+        }
+    }
+
+    method set_current_link_width(pcie_link_width_t width) {
+        status.nlw.val = width;
+    }
+
+    /**
+       #### `flit_mode_supported() -> (bool)`
+       Returns `flit_mode_supported()` of parent (`exp_capability`). Convenience
+       method to check if Flit Mode is supported without retrieving an instance
+       of `exp_capability` if an instance of `exp_link` is available.
+    */
+    shared method flit_mode_supported() -> (bool);
+    method flit_mode_supported() -> (bool) default {
+        return parent.flit_mode_supported();
+    }
+
+    /**
+       #### `flit_mode_disabled() -> (bool)`
+       Returns true the Flit Mode Disable field is set
+    */
+    shared method flit_mode_disabled() -> (bool);
+    method flit_mode_disabled() -> (bool) default {
+#if (pcie_version >= 6.0) {
+        return control.fmd.val == 1;
+} #else {
+    // Just say true if this field doesn't exist
+    return true;
+}
+    }
+
+    /**
+       #### `set_flit_mode_status(bool enabled)`
+       Set the Flit Mode Status field
+    */
+    shared method set_flit_mode_status(bool enabled);
+    method set_flit_mode_status(bool enabled) default {
+#if (pcie_version >= 6.0) {
+        if (enabled && !flit_mode_supported()) {
+            log error: "Can't set Flit Mode Status since Flit Mode is not"
+               + " supported";
+            return;
+        }
+        if (enabled && !drs_supported()) {
+            log error: "\"DRS MUST@FLIT be implemented\" in order to set Flit"
+                + " Mode Status";
+            return;
+        }
+#if ((dp_type == PCIE_DP_Type_RP) || (dp_type == PCIE_DP_Type_DP)){
+        if (enabled) {
+            local uint3 dcp = get_downstream_component_presence();
+            if (((dcp != PCIE_DCP_Link_Down_Flit_Mode_Negotiation_Completed)
+                && (dcp != PCIE_DCP_Link_Up_Component_Present)
+                && (dcp != PCIE_DCP_Link_Up_Component_Present_and_DRS_Received))) {
+                log error: "Can't enable Flit Mode since the Downstream"
+                    + " Component Presence is not set to a valid value";
+            }
+        }
+}
+        status2.fms.val = enabled ? 1 : 0;
+} #else {
+        if (enabled) {
+            log error: "Unexpected call to set_flit_mode_status() on a device"
+                + " that does not support Flit Mode";
+        }
+}
+    }
+
+    /**
+       #### `drs_supported() -> (bool)`
+       Returns true if DRS is supported
+    */
+    shared method drs_supported() -> (bool);
+
+    /**
+       #### `send_drs_msg() -> (pcie_error_t)`
+       Sends a Device Ready Status (DRS) message. This method can only be called
+       from function 0 of a Downstream component. The DRS message is sent to the
+       Upstream component.
+    */
+    shared method send_drs_msg() -> (pcie_error_t);
+
+    /**
+       #### `drs_msg_received() -> (pcie_error_t)`
+       This method can be called when a DRS message is received. It sets the DRS
+       Message Received field and the Downstream Component Presence field in the
+       Link Status 2 register
+    */
+    shared method drs_msg_received() -> (pcie_error_t);
+
+
+#if (pcie_version >= 3.1 && cap_version >= 2) {
+    method drs_supported() -> (bool) default {
+        return cap2.drss.val == 1;
+    }
+
+    method send_drs_msg() -> (pcie_error_t) default {
+        if (!PCIE_Is_Downstream_Component || (function != 0)) {
+            log error: "Only function 0 of PCIe Downstream component can send a"
+                + " DRS message (send_drs_msg())";
+        return PCIE_Error_Master_Abort;
+        }
+
+        if (!drs_supported()) {
+            log error: "Can't send Device Ready Status (DRS) message since DRS"
+                + " is not supported";
+            return PCIE_Error_Master_Abort;
+        }
+        local atom_t atoms[3] = {
+            ATOM_pcie_msg_vdm_subtype(PCIE_VDM_Device_Readiness_Status),
+            ATOM_pcie_msg_vdm_vendor_id(PCIe_Vendor_ID_PCI_SIG),
+            ATOM_list_end(0)
+        };
+        local bytes_t bytes;  // DRS messages have an empty payload
+        return message.send_custom(0, PCIE_Vendor_Defined_Type_1,
+            PCIE_Msg_Route_Terminate, bytes, atoms);
+    }
+
+    method drs_msg_received() -> (pcie_error_t) default {
+#if (!PCIE_Is_Upstream_Component) {
+        log warning: "Only Upstream component should receive a DRS message";
+        return PCIE_Error_Completer_Abort;
+} #else {
+        if (!drs_supported()) {
+            log info, 2: "Received Device Ready Status (DRS) message but DRS is"
+                + " not supported";
+            return PCIE_Error_Unsupported_Request;
+        }
+        log info, 2: "Received Device Ready Status (DRS) message";
+        status2.drsmr.val = 1;
+        if (link.get_downstream_component_presence()
+            == PCIE_DCP_Link_Up_Component_Present) {
+            log info, 3: "Setting Downstream Component Presence (DCP) to"
+                + " PCIE_DCP_Link_Up_Component_Present_and_DRS_Received";
+            link.set_downstream_component_presence(
+                PCIE_DCP_Link_Up_Component_Present_and_DRS_Received);
+        }
+        return PCIE_Error_No_Error;
+}
+    }
+} #else {
+    method drs_supported() -> (bool) default {
+        return false;
+    }
+
+    method send_drs_msg() -> (pcie_error_t) default {
+        log error: "send_drs_msg() is not supported on this device";
+        return PCIE_Error_Master_Abort;
+    }
+
+    method drs_msg_received() -> (pcie_error_t) default {
+        log error: "drs_msg_received() is not supported on this device";
+        return PCIE_Error_Unsupported_Request;
+    }
+}
+
+    /**
+       #### `get_downstream_component_presence() -> (uint3)`
+       Returns the value of the Downstream Component Presence field
+    */
+    shared method get_downstream_component_presence() -> (uint3);
+    method get_downstream_component_presence() -> (uint3) default {
+#if ((pcie_version >= 3.1) && (cap_version >= 2)) {
+        if (!drs_supported()) {
+            log error: "Can't get Downstream Component Presence (DCP) since DRS"
+                + " is not supported";
+            return 0;
+        }
+        return status2.dcp.val;
+} #else {
+        log error: "get_downstream_component_presence() is not supported on"
+            + " this device";
+        return 0;
+}
+    }
+
+    /**
+       #### `set_downstream_component_presence(uint3 value)`
+       Sets the value of the Downstream Component Presence field
+    */
+    shared method set_downstream_component_presence(uint3 value);
+    method set_downstream_component_presence(uint3 value) default {
+#if ((pcie_version >= 3.1) && (cap_version >= 2)) {
+        if (!drs_supported()) {
+            log error: "Can't set Downstream Component Presence (DCP) since DRS"
+                + " is not supported";
+            return;
+        }
+        status2.dcp.val = value;
+} #else {
+        log error: "set_downstream_component_presence() is not supported on"
+            + " this device";
+}
+    }
+
+
+#if (use_standard_access_templates) {
+    register cap {
+        field mls    is ignore_write;
+        field mlw    is ignore_write;
+        field aspms  is ignore_write;
+        field l0el   is ignore_write;
+        field l1el   is ignore_write;
+        field cpm    is ignore_write;
+        field sder   is ignore_write;
+        field dlllar is ignore_write;
+        field lbn    is ignore_write;
+#if (pcie_version >= 3.0) {
+        field aspmoc is hwinit;
+}
+        field pn     is hwinit;
+    }
+    register status {
+        field ls    is ignore_write;
+        field nlw   is ignore_write;
+        field te    is ignore_write;
+        field lt    is ignore_write;
+        field scc   is hwinit;
+        field dllla is ignore_write;
+    }
+#if (cap_version >= 2) {
+    register cap2 {
+#if (pcie_version >= 3.0) {
+        field slsv       is hwinit;
+        field cs         is ignore_write;
+}
+#if (pcie_version >= 3.1) {
+        field lskposgssv is hwinit;
+        field lskposrssv is hwinit;
+        field drss       is hwinit;
+}
+#if (pcie_version >= 4.0) {
+        field rpds       is hwinit;
+        field trpds      is hwinit;
+}
+    }
+    register control2 {
+        field sd    is hwinit;
+    }
+    register status2 {
+#if (pcie_version >= 3.0) {
+        field ec    is (read_only);
+        field ep1s  is (read_only);
+        field ep2s  is (read_only);
+        field ep3s  is (read_only);
+}
+#if (pcie_version >= 3.1) {
+        field dcp   is (read_only);
+}
+#if (pcie_version >= 4.0) {
+       field rpd   is (read_only);
+       field trpd  is (read_only);
+       field cr    is (read_only);
+}
+#if (pcie_version >= 6.0) {
+       field fms   is (read_only);
+}
+    }
+}  // if cap_version >= 2
+}  // if use_standard_access_templates
+#if (use_standard_write_templates) {
+    register cap {
+#if (pcie_version >= 3.0) {
+        field aspmoc is pcie_sticky;
+}
+        field pn     is pcie_sticky;
+    }
+    register control {
+        field aspmc is pcie_no_function_level_reset;
+        field rl is pcie_write;
+        field lbmie is pcie_write;
+        field ccc is pcie_no_function_level_reset;
+        field rcb is pcie_no_function_level_reset;
+        field es  is pcie_no_function_level_reset;
+        field ecpm is pcie_no_function_level_reset;
+        field hawd is pcie_no_function_level_reset;
+    }
+    register status is pcie_no_function_level_reset {
+        field lbms  is pcie_write_1_clears;
+        field labs  is pcie_write_1_clears;
+        field scc   is pcie_sticky;
+    }
+#if (cap_version >= 2) {
+    register cap2 {
+#if (pcie_version >= 3.0) {
+        field slsv       is pcie_sticky;
+}
+#if (pcie_version >= 3.1) {
+        field lskposgssv is pcie_sticky;
+        field lskposrssv is pcie_sticky;
+        field drss       is pcie_sticky;
+}
+#if (pcie_version >= 4.0) {
+        field rpds       is pcie_sticky;
+        field trpds      is pcie_sticky;
+}
+    }
+    register control2 {
+        field sd    is pcie_sticky;
+        field tls   is (pcie_write, pcie_sticky);
+        field ec    is pcie_sticky;
+        field hasd  is pcie_sticky;
+        field tm    is pcie_sticky;
+        field emc   is pcie_sticky;
+        field csos  is pcie_sticky;
+#if (pcie_version == 2.0) {
+        field cd    is pcie_sticky;
+}
+#if (pcie_version >= 3.0) {
+        field cd    is pcie_sticky;
+}
+    }
+    register status2 is pcie_no_function_level_reset {
+#if (pcie_version >= 3.0) {
+        field ec    is (pcie_sticky);
+        field ep1s  is (pcie_sticky);
+        field ep2s  is (pcie_sticky);
+        field ep3s  is (pcie_sticky);
+        field ler   is (pcie_sticky, pcie_write_1_clears);
+}
+#if (pcie_version >= 3.1) {
+        field drsmr is (pcie_write_1_clears);
+}
+#if (pcie_version >= 4.0) {
+       field rpd   is (pcie_sticky);
+       field trpd  is (pcie_sticky);
+}
+    }
+}  // if cap_version >= 2
+}  // if use_standard_write_templates
+}
+
+template link_speed_init is (field) {
+    method init() default {
+        default();
+        if (max_link_speed == PCIE_Link_Speed_Undefined)
+            return;
+
+        local uint7 link_speeds_vector = max_link_speed * 2 - 1;
+        for (local int8 i = 7 - 1; i >= 0; i--) {
+            if (link_speeds_vector[i] == 1) {
+                this.val = i + 1;
+                return;
+            }
+        }
+    }
+}
+
+/**
+   ### PCI Express Capability Slot registers
+
+    - name: `exp_slot`
+    - implemented: functional
+
+   #### Parameters:
+   - `is_hotplug_capable`: Slot is native PCIe Hot-Plug capable, default false
+   - `has_power_indicator`: Slot has a power indicator, default false
+   - `has_power_controller`: Slot has a power controller, default false
+   - `has_mrl_sensor`: Slot has an MRL sensor, default false
+   - `has_command_completions`: Slot sends command completed notifications, default false
+
+   #### Methods
+*/
+
+template exp_slot is group {
+    param is_hotplug_capable default false;
+    param has_attention_button default false;
+    param has_power_indicator default false;
+    param has_power_controller default false;
+    param has_mrl_sensor default false;
+    param has_command_completions default true;
+
+    param _control : register;
+    param _control = cast(control, register);
+
+    register cap      size 4 @ (base + 0x14) is pcie_desc {
+        param pcie_desc = "Slot Capabilities";
+    }
+    register control  size 2 @ (base + 0x18) is pcie_desc {
+        param pcie_desc = "Slot Control";
+    }
+    register status   size 2 @ (base + 0x1a) is pcie_desc {
+        param pcie_desc = "Slot Status";
+    }
+
+    register cap {
+        field abp   @ [0:0]   is pcie_desc {
+            param pcie_desc = "Attention Button Present";
+            param init_val default has_attention_button ? 1 : 0;
+        }
+        field pcp   @ [1:1]   is pcie_desc {
+            param pcie_desc = "Power Controller Present";
+            param init_val default has_power_controller ? 1 : 0;
+        }
+        field mrlsp @ [2:2]   is pcie_desc {
+            param pcie_desc = "MRL Sensor Present";
+            param init_val default has_mrl_sensor ? 1 : 0;
+        }
+        field aip   @ [3:3]   is pcie_desc {
+            param pcie_desc = "Attention Indicator Present";
+        }
+        field pip   @ [4:4]   is pcie_desc {
+            param pcie_desc = "Power Indicator Present";
+            param init_val default has_power_indicator ? 1 : 0;
+        }
+        field hps   @ [5:5]   is pcie_desc {
+            param pcie_desc = "Hot-Plug Surprise";
+        }
+        field hpc   @ [6:6]   is pcie_desc {
+            param pcie_desc = "Hot Plug Capable";
+            param init_val default is_hotplug_capable ? 1 : 0;
+        }
+        field splv  @ [14:7]  is pcie_desc {
+            param pcie_desc = "Slot Power Limit Value";
+        }
+        field spls  @ [16:15] is pcie_desc {
+            param pcie_desc = "Slot Power Limit Scale";
+        }
+        field psn   @ [31:19] is pcie_desc {
+            param pcie_desc = "Physical Slot Number";
+        }
+        field eip   @ [17:17] is pcie_desc {
+            param pcie_desc = "Electromechanical Interlock Present";
+        }
+        field nccs  @ [18:18] is pcie_desc {
+            param pcie_desc = "No Command Completed Support";
+            param init_val default !has_command_completions ? 1 : 0;
+        }
+    }
+    register control {
+        field abpe   @ [0:0]   is pcie_desc {
+            param pcie_desc = "Attention Button Pressed Enable";
+        }
+        field pfde   @ [1:1]   is pcie_desc {
+            param pcie_desc = "Power Fault Detected Enable";
+        }
+        field mrlsce @ [2:2]   is pcie_desc {
+            param pcie_desc = "MRL Sensor Changed Enable";
+        }
+        field pdce   @ [3:3]   is pcie_desc {
+            param pcie_desc = "Present Detected Change Enable";
+        }
+        field ccie   @ [4:4]   is pcie_desc {
+            param pcie_desc = "Command Completed Interrupt Enable";
+        }
+        field hpie   @ [5:5]   is pcie_desc {
+            param pcie_desc = "Hot-Plug Interrupt Enable";
+        }
+        field aic    @ [7:6]   is pcie_desc {
+            param pcie_desc = "Attention Indicator Control";
+        }
+        field pic    @ [9:8]   is pcie_desc {
+            param pcie_desc = "Power Indicator Control";
+            param init_val default has_power_indicator ? 0b11 : 0;
+            method pcie_write(uint64 value) default {
+                if (control.pic.val != value) {
+                    control.pic.val = value;
+                    if (!hotplug_conditions_met(SLOT_POWER_INDICATOR))
+                        return;
+                } else {
+                    return;
+                }
+
+                switch (value) {
+                case 0b01:
+                    log info, 2: "Power Indicator set to On. Insertion or"
+                               + " removal of the adapter is not permitted.";
+                    return;
+                case 0b10:
+                    log info, 2: "Power Indicator set to Blink. Hot-plug"
+                               + " operation is in progress and insertion or"
+                               + " removal of the adapter is not permitted.";
+                    return;
+                case 0b11:
+                    log info, 2: "Power Indicator set to Off. Insertion or"
+                               + " removal of the adapter is permitted.";
+                    return;
+                default:
+                    log spec_viol: "Reserved Power Indicator value %d", value;
+                    return;
+                }
+            }
+        }
+        field pcc    @ [10:10] is pcie_desc {
+            param pcie_desc = "Power Controller Control";
+        }
+        field eic    @ [11:11] is pcie_desc {
+            param pcie_desc = "Electromechanical Interlock Control";
+        }
+        field dllsce @ [12:12] is pcie_desc {
+            param pcie_desc = "Data Link Layer State Changed Enable";
+        }
+#if (pcie_version >= 3.1) {
+        field aspld  @ [13:13] is pcie_desc {
+            param pcie_desc = "Auto Slot Power Limit Disable";
+        }
+}
+#if (pcie_version >= 4.0) {
+        field ibpdd  @ [14:14] is pcie_desc {
+            param pcie_desc = "In-Band PD Disable";
+        }
+}
+
+        method pcie_write_action(uint64 value) default {
+            status.cc.val = 1;
+            if (cap.nccs.val != 1)
+                notify();
+        }
+    }
+    register status {
+        field abp    @ [0:0] is pcie_desc {
+            param pcie_desc = "Attention Button Pressed";
+        }
+        field pfd    @ [1:1] is pcie_desc {
+            param pcie_desc = "Power Fault Detected";
+        }
+        field mrlsc  @ [2:2] is pcie_desc {
+            param pcie_desc = "MRL Sensor Changed";
+        }
+        field pdc    @ [3:3] is pcie_desc {
+            param pcie_desc = "Presence Detect Changed";
+        }
+        field cc     @ [4:4] is pcie_desc {
+            param pcie_desc = "Command Completed";
+        }
+        field mrlss  @ [5:5] is pcie_desc {
+            param pcie_desc = "MRL Sensor State";
+        }
+        field pds    @ [6:6] is pcie_desc {
+            param pcie_desc = "Presence Detect State";
+        }
+        field eis    @ [7:7] is pcie_desc {
+            param pcie_desc = "Electromechanical Interlock Status";
+        }
+        field dllsc  @ [8:8] is pcie_desc {
+            param pcie_desc = "Data Link Layer State Changed";
+        }
+
+        method pcie_read_action() {
+            if ((interrupt_pin.val > 0) && (command.id.val == 0)) {
+                lower_legacy_interrupt();
+            }
+        }
+    }
+#if (cap_version >= 2) {
+    register cap2     size 4 @ (base + 0x34) is pcie_desc {
+        param pcie_desc = "Slot Capabilities 2";
+    }
+    register control2 size 2 @ (base + 0x38) is pcie_desc {
+        param pcie_desc = "Slot Control 2";
+    }
+    register status2  size 2 @ (base + 0x3a) is pcie_desc {
+        param pcie_desc = "Slot Status 2";
+    }
+
+    register cap2 {
+#if (pcie_version >= 5.0) {
+        field ibpdds @ [0:0] is pcie_desc {
+            param pcie_desc = "In-Band PD Disable Supported";
+        }
+}
+    }
+}  // if cap_version >= 2
+
+
+    method hotplug_conditions_met(int type) -> (bool) {
+        if (!is_hotplug_capable) {
+            log spec_viol: "Hot-Plug events can't be submitted in %s. Slot is"
+                         + " not Hot-Plug capable", this.qname;
+            return false;
+        }
+        if (!hotplug_capable(type)) {
+            log spec_viol: "Capability %d not enabled. No Hot-Plug event will"
+                         + " be created", type;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+       #### `presence_change_event(pcie_hotplug_pd_t state) -> (bool)`
+       Sets the presence detect state field to `state`. If the state has
+       changed, also sets the presence detect changed field and notifies
+       software if applicable. Returns true if event was registered
+    */
+    shared method presence_change_event(pcie_hotplug_pd_t state) -> (bool);
+    method presence_change_event(pcie_hotplug_pd_t state) -> (bool) default {
+        if (!hotplug_conditions_met(SLOT_PRESENCE_DETECT))
+            return false;
+        if ((state != PCIE_HP_PD_Adapter_Not_Present) && (state != PCIE_HP_PD_Adapter_Present)) {
+            log error: "Illegal hotplug_pd_state state %d. Must be either %d or"
+                     + " %d. ", state, PCIE_HP_PD_Adapter_Not_Present, PCIE_HP_PD_Adapter_Present;
+            assert(false);
+        }
+        if (state == status.pds.val) {
+            log info, 4: "Presence detect state did not change. Will not create"
+                       + " a Hot-Plug event";
+            return false;
+        }
+        status.pds.val = state;
+        status.pdc.val = 1;
+        log info, 4: "Set Present Detect State to %d and Presence Detect"
+                   + " Changed to 1", status.pds.val;
+        if (hotplug_event_enabled(SLOT_PRESENCE_DETECT))
+            notify();
+        return true;
+    }
+
+    /**
+       #### `mrl_sensor_event(pcie_hotplug_mrl_t state) -> (bool)`
+       Sets the MRL sensor state field to `state`. If the state has changed,
+       also sets the MRL sensor changed field and notifies software if
+       applicable. Returns true if event was registered
+    */
+    shared method mrl_sensor_event(pcie_hotplug_mrl_t state) -> (bool);
+    method mrl_sensor_event(pcie_hotplug_mrl_t state) -> (bool) default {
+        if (!hotplug_conditions_met(SLOT_MRL_SENSOR))
+            return false;
+        if (state == status.mrlss.val) {
+            log info, 4: "MRL state did not change. Will not create a Hot-Plug"
+                       + " a event";
+            return false;
+        }
+        status.mrlss.val = state;
+        status.mrlsc.val = 1;
+        log info, 4: "Set MRL Sensor State to %d and MRL Sensor Changed to 1",
+            status.mrlss.val;
+        if (hotplug_event_enabled(SLOT_MRL_SENSOR))
+            notify();
+        return true;
+    }
+
+    /**
+       #### `data_link_layer_event(bool is_active) -> (bool)`
+       Sets the Data Link Layer Link Active in the link status register to
+       `is_active`. If this field changes value, also sets the Data Link Layer
+       state changed field in the slot status register and notifies software if
+       applicable. Returns true if event was registered
+    */
+    shared method data_link_layer_event(bool is_active) -> (bool);
+    method data_link_layer_event(bool is_active) -> (bool) default {
+        if (!hotplug_conditions_met(LINK_DLL))
+            return false;
+        local int is_active_int = is_active ? 1 : 0;
+        if (is_active_int == link.status.dllla.val) {
+            log info, 4: "Data link layer active value did not change. Will not"
+                       + " create a Hot-Plug a event";
+            return false;
+        }
+        link.status.dllla.val = is_active_int;
+        status.dllsc.val = 1;
+        log info, 4: "Set Data Link Active to %d and Data Link Changed to 1",
+            link.status.dllla.val;
+        if (hotplug_event_enabled(LINK_DLL))
+            notify();
+        return true;
+    }
+
+    /**
+       #### `power_fault_event() -> (bool)`
+       Sets the Power Fault Detected field and notifies software if applicable.
+       Returns true if event was registered
+    */
+    shared method power_fault_event() -> (bool);
+    method power_fault_event() -> (bool) default {
+        if (!hotplug_conditions_met(SLOT_POWER_FAULT))
+            return false;
+        status.pfd.val = 1;
+        log info, 4: "Set Power Fault Detected to 1";
+        if (hotplug_event_enabled(SLOT_POWER_FAULT))
+            notify();
+        return true;
+    }
+
+    /**
+       #### `attention_button_event() -> (bool)`
+       Sets the Attention Button Pressed field and notifies software if
+       applicable. Returns true if event was registered
+    */
+    shared method attention_button_event() -> (bool);
+    method attention_button_event() -> (bool) default {
+        if (!hotplug_conditions_met(SLOT_ATTENTION_BUTTON))
+            return false;
+        status.abp.val = 1;
+        log info, 4: "Set Attention Button Pressed to 1";
+        if (hotplug_event_enabled(SLOT_ATTENTION_BUTTON))
+            notify();
+        return true;
+    }
+
+    /**
+       #### `hotplug_event_enabled(int type) -> (bool)`
+       Returns true if slot has Hot-Plug event types of type `type` enabled. The
+       available types are `param`:s defined in this file that have the prefix
+       SLOT_ and LINK_.
+    */
+    shared method hotplug_event_enabled(int type) -> (bool);
+    method hotplug_event_enabled(int type) -> (bool) {
+        if (!is_hotplug_capable)
+            return false;
+
+        local bool ret;
+        switch (type) {
+        case SLOT_ATTENTION_BUTTON:
+            ret = (control.hpie.val == 1) && (control.abpe.val == 1);
+            break;
+        case SLOT_POWER_FAULT:
+            ret = (control.hpie.val == 1) && (control.pfde.val == 1);
+            break;
+        case SLOT_MRL_SENSOR:
+            ret = (control.hpie.val == 1) && (control.mrlsce.val == 1);
+            break;
+        case SLOT_PRESENCE_DETECT:
+            ret = (control.hpie.val == 1) && (control.pdce.val == 1);
+            break;
+        case SLOT_COMMAND_COMPLETED:
+            ret = control.ccie.val == 1;
+            break;
+        case LINK_DLL:
+            ret = (control.hpie.val == 1) && (control.dllsce.val == 1);
+            break;
+        default:
+            log error: "Unsupported hotplug event type provided in %s",
+                this.qname;
+            assert(false);
+        }
+        log info, 4: "%s hotplug event %s", hotplug_type_to_str(type),
+            ret ? "enabled" : "disabled";
+        return ret;
+    }
+
+    /**
+       #### `hotplug_capable(int type)`
+       Returns true if the slot is capable of handling Hot-Plug events of type
+       `type`. The available types are `param`:s defined in this file that have
+       the prefix SLOT_ and LINK_.
+    */
+    shared method hotplug_capable(int type) -> (bool);
+    method hotplug_capable(int type) -> (bool) {
+        if (!is_hotplug_capable) {
+            log info, 4: "Not hotlplug capable %d", type;
+            return false;
+        }
+
+        local bool ret;
+        switch (type) {
+        case SLOT_ATTENTION_BUTTON:
+            ret = cap.abp.val == 1;
+            break;
+        case SLOT_POWER_INDICATOR:
+            ret = cap.pip.val == 1;
+            break;
+        case SLOT_POWER_FAULT:
+            ret = cap.pcp.val == 1;
+            break;
+        case SLOT_MRL_SENSOR:
+            ret = cap.mrlsp.val == 1;
+            break;
+        case SLOT_PRESENCE_DETECT:
+            ret = true;
+            break;
+        case SLOT_COMMAND_COMPLETED:
+            ret = cap.nccs.val == 0;
+            break;
+        case LINK_DLL:
+            ret = link.cap.dlllar.val == 1;
+            break;
+        default:
+            log error: "Unsupported hotplug event type provided in %s",
+                this.qname;
+            assert(false);
+        }
+        log info, 4: "%s hotplug %s", hotplug_type_to_str(type),
+            ret ? "capable" : "incapable";
+        return ret;
+    }
+
+#if (use_standard_access_templates) {
+    register cap     is hwinit;
+    register status {
+        field mrlss  is ignore_write;
+        field pds    is ignore_write;
+        field eis    is ignore_write;
+    }
+#if (cap_version >= 2) {
+    register cap2     is hwinit;
+    register control2 is read_only;
+    register status2  is read_only;
+}
+} // if use_standard_access_templates
+#if (use_standard_write_templates) {
+    register cap     is pcie_sticky;
+    register status is pcie_register_read_action {
+        field abp    is pcie_write_1_clears;
+        field pfd    is pcie_write_1_clears;
+        field mrlsc  is pcie_write_1_clears;
+        field pdc    is pcie_write_1_clears;
+        field cc     is pcie_write_1_clears;
+        field dllsc  is pcie_write_1_clears;
+    }
+    register control is pcie_register_write_action {
+        field pic is pcie_write;
+    }
+#if (cap_version >= 2) {
+    register cap2     is pcie_sticky;
+}
+} // if use_standard_write_templates
+}
+
+/**
+   ### PCI Express Capability Root registers
+
+    - name: `exp_root`
+    - implemented: registers only
+*/
+template exp_root is group {
+    register control size 2 @ (base + 0x1c) is pcie_desc {
+        param pcie_desc = "Root Control";
+    }
+    register cap     size 2 @ (base + 0x1e) is pcie_desc {
+        param pcie_desc = "Root Capabilities";
+    }
+    register status  size 4 @ (base + 0x20) is pcie_desc {
+        param pcie_desc = "Root Status";
+    }
+
+    register control {
+        field secee    @ [0:0] is pcie_desc {
+            param pcie_desc = "System Error on Correctable Error Enable";
+        }
+        field senfee   @ [1:1] is pcie_desc {
+            param pcie_desc = "System Error on Non-Fatal Error Enable";
+        }
+        field sefee    @ [2:2] is pcie_desc {
+            param pcie_desc = "System Error on Fatal Error Enable";
+        }
+        field pmeie    @ [3:3] is pcie_desc {
+            param pcie_desc = "PME Interrupt Enable";
+        }
+        field crssve   @ [4:4] is pcie_desc {
+            param pcie_desc = "CRS Software Visibility Enable";
+        }
+        field nnsbtrp  @ [5:5] is pcie_desc {
+            param pcie_desc = "No NFM Subtree Below This Root Port";
+        }
+    }
+    register status {
+        field pmerid  @ [15:0]  is pcie_desc {
+            param pcie_desc = "PME Requester ID";
+        }
+        field pmes    @ [16:16] is pcie_desc {
+            param pcie_desc = "PME Status";
+        }
+        field pmep    @ [17:17] is pcie_desc {
+            param pcie_desc = "PME Pending";
+        }
+    }
+    register cap {
+        field csv  @ [0:0] is pcie_desc {
+            param pcie_desc = "CRS Software Visibility";
+        }
+    }
+
+#if (use_standard_access_templates) {
+    register cap is read_only;
+    register status {
+        field pmerid is ignore_write;
+        field pmep   is ignore_write;
+    }
+}
+#if (use_standard_write_templates) {
+    register status {
+        field pmes   is pcie_write_1_clears;
+    }
+}
+}
+
+/**
+   ## VPD Capability registers
+
+    - name: `vpd_capability`
+    - implemented: registers only
+*/
+template vpd_capability is capability {
+    param id = 3;
+
+    register address size 2 @ base + 0x2 is pcie_desc {
+        param pcie_desc = "VPD Address";
+        field a @ [14:0] is pcie_desc {
+            param pcie_desc = "VPD Address";
+        }
+        field f @ [15] is pcie_desc {
+            param pcie_desc = "F (flag)";
+        }
+    }
+    register data size 4 @ (base + 0x4) is pcie_desc {
+        param pcie_desc = "VPD Data";
+    }
+}
+
+template defining_vpd_capability {
+    param vpd_offset;
+    param vpd_next_ptr;
+
+    group vpd is vpd_capability {
+        param base = vpd_offset;
+        param next_ptr = vpd_next_ptr;
+    }
+}
+
+/**
+   ## Message Signaled Interrupts (MSI) Capability registers
+
+    - name: `msi_capability`
+    - implemented: functional
+
+   ### Parameters:
+   - `is_64bit_capable`: Support 64-bit addresses, i.e. `address` register is
+     8 bytes instead of 4.
+   - `is_pvm_capable`: Support Per-Vector-Masking, i.e. the `mask` register is
+     present.
+   - `is_emd_capable`: Support extended message data, i.e. the `data` register
+     is 8 bytes instead of 4.
+   - `num_vectors`: The number of interrupt vectors supported.
+
+   ### Methods
+*/
+template msi_capability is capability {
+    param id = 5;
+    param is_64bit_capable;
+    param is_pvm_capable;
+    param is_emd_capable;
+    param num_vectors;
+    param unmapped_offset = 0xffff_ffff_ffff_ffff;
+
+    param asz = is_64bit_capable ? 8 : 4;
+    param dsz = is_emd_capable ? 4 : 2;
+    param data_offset = address.offset + address.size;
+    param mask_offset = is_pvm_capable #? data_offset + 4 #: unmapped_offset;
+    param pend_offset = is_pvm_capable #? mask_offset + 4 #: unmapped_offset;
+
+    register control size 2   @ base + 0x2  is pcie_desc {
+        param pcie_desc = "Message Control";
+    }
+    register address size asz @ base + 0x4  is pcie_desc {
+        param pcie_desc = "Message Address";
+    }
+    register data    size dsz @ data_offset is pcie_desc {
+        param pcie_desc = "Message Data";
+    }
+    register mask    size 4   @ mask_offset is pcie_desc {
+        param pcie_desc = "Mask Bits";
+    }
+    register pending size 4   @ pend_offset is pcie_desc {
+        param pcie_desc = "Pending Bits";
+    }
+
+    register control {
+        field msie  @ [0]   is pcie_desc {
+            param pcie_desc = "MSI Enable";
+            method pcie_write(uint64 value) {
+                if (this.val != value) {
+                    this.val = value;
+                    signal_all_pending();
+                }
+            }
+        }
+        field mmc   @ [3:1] is pcie_desc {
+            param pcie_desc = "Multiple Message Capable";
+            param init_val default num_vectors > 0 ?
+                63 - count_leading_zeros64(num_vectors) : 0;
+        }
+        field mme   @ [6:4] is pcie_desc {
+            param pcie_desc = "Multiple Message Enable";
+        }
+        field ac64  @ [7] is pcie_desc {
+            param pcie_desc = "64-bit Address Capable";
+            param init_val default is_64bit_capable #? 1 #: 0;
+        }
+        field pvmc  @ [8] is pcie_desc {
+            param pcie_desc = "Per-Vector Masking Capable";
+            param init_val default is_pvm_capable #? 1 #: 0;
+        }
+        field emdc  @ [9] is pcie_desc {
+            param pcie_desc = "Extended Message Data Capable";
+            param init_val default is_emd_capable #? 1 #: 0;
+        }
+        field emde @ [10] is pcie_desc {
+            param pcie_desc = "Extended Message Data Enable";
+            method pcie_write(uint64 value) {
+                if (!emdc.val)
+                    return;
+                this.val = value;
+            }
+        }
+    }
+
+    register mask {
+        method pcie_write(uint64 value) {
+            this.val = value;
+            signal_all_pending();
+        }
+    }
+
+    /**
+       #### `signal_all_pending()`
+       Signals all pending MSI's
+     */
+    method signal_all_pending() {
+        if (control.msie.val) {
+            local uint8 msb = (1 << control.mme.val) - 1;
+            if (msb >= 32)
+                msb = 31;
+            local uint32 active = (pending.val & ~mask.val)[msb:0];
+            if (active > 0) {
+                for (local uint8 i = 0; i <= msb; i++) {
+                    if (active[i]) {
+                        _signal(i);
+                        pending.val[i] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+       #### `raise(uint8 i)`
+       Raises MSI `i` if capable and enabled, and signals it if not masked
+     */
+    shared method raise(uint8 i);
+    method raise(uint8 i) {
+        local uint8 capable = 1 << control.mmc.val;
+        local uint8 enabled = 1 << control.mme.val;
+        if (i < 32 && i < capable) {
+            if (control.msie.val) {
+                if (i < enabled) {
+                    if (mask.val[i])
+                        pending.val[i] = 1;
+                    else
+                        _signal(i);
+                } else {
+                    log info, 2: "can't raise MSI%d, vector not enabled", i;
+                }
+            } else {
+                log info, 2: "can't raise MSI%d, MSI's disabled", i;
+            }
+        } else {
+            log spec_viol: "can't raise MSI%d, not capable", i;
+        }
+    }
+
+    /**
+       #### `lower(uint8 i)`
+       Lowers MSI `i`
+     */
+    method lower(uint8 i) {
+        pending.val[i] = 0;
+    }
+
+    method _signal(uint8 i) {
+        if (!upstream_target.connected())
+            return;
+        local uint8 size = control.emde.val ? 4 : 2;
+        local uint32 value = data.val[(size * 8) - 1: 0];
+        if (control.mme.val > 0)
+            value[control.mme.val - 1:0] = i;
+        memory.write(address.val, value, 4);
+    }
+
+    shared method is_enabled() -> (bool);
+    method is_enabled() -> (bool) {
+        return control.msie.val == 1;
+    }
+
+#if (use_standard_access_templates) {
+    register control {
+        field mmc  is ignore_write;
+        field ac64 is ignore_write;
+        field pvmc is ignore_write;
+        field emdc is ignore_write;
+    }
+    register pending is read_only;
+}
+#if (use_standard_write_templates) {
+    register control {
+        field msie is pcie_write;
+        field emde is pcie_write;
+    }
+    register mask is pcie_write;
+}
+}
+
+template defining_msi_capability {
+    param msi_offset;
+    param msi_next_ptr;
+    param msi_num_vectors;
+    param msi_64bit_capable;
+    param msi_pvm_capable;
+    param msi_emd_capable;
+    group msi is msi_capability {
+        param base = msi_offset;
+        param next_ptr = msi_next_ptr;
+        param num_vectors = msi_num_vectors;
+        param is_64bit_capable = msi_64bit_capable;
+        param is_pvm_capable = msi_pvm_capable;
+        param is_emd_capable = msi_emd_capable;
+    }
+}
+
+/**
+   ## Message Signaled Interrupts X (MSI-X) Capability registers
+
+    - name: `msix_capability`
+    - implemented: functional
+
+   ### Parameters:
+   - `table_offset_bir`: Initial value of the Table Offset/BIR register (at
+      offset 0x4 in the MSI-X capability structure).
+   - `pba_offset_bir`: Initial value of the PBA Offset/BIR register (at
+     offset 0x8 in the MSI-X capability structure).
+   - `data_bank`: The bank which holds the Table and Pending Bits data, which
+     must use the template `msix_table`
+   - `num_vectors`: Number of interrupt vectors supported.
+
+   ### Methods
+*/
+constant MSIX_MAX_VECTORS = 2048;
+template msix_capability is capability {
+    param id = 0x11;
+    param num_vectors;
+    param table_offset_bir;
+    param pba_offset_bir;
+    param data_bank;
+
+    #if (num_vectors > MSIX_MAX_VECTORS) {
+        error "msix_capability.num_vectors too big";
+    }
+
+    register control size 2 @ base + 0x2 is pcie_desc {
+        param pcie_desc = "MSI-X Message Control";
+    }
+    register table   size 4 @ base + 0x4 is pcie_desc {
+        param pcie_desc = "MSI-X Table Offset / Table BIR";
+    }
+    register pba     size 4 @ base + 0x8 is pcie_desc {
+        param pcie_desc = "MSI-X PBA Offset / PBA BIR";
+    }
+
+    register control {
+        field sz     @ [10:0] is pcie_desc {
+            param pcie_desc = "Table Size";
+            param init_val default num_vectors - 1;
+        }
+        field mask   @ [14]   is pcie_desc {
+            param pcie_desc = "Function Mask";
+        }
+        field enable @ [15]   is pcie_desc {
+            param pcie_desc = "MSI-X Enable";
+        }
+        method pcie_write(uint64 value) {
+            this.val = value;
+            if (!mask.val && enable.val) {
+                for (local int i = 0; i < num_vectors; i++) {
+                    if (data_bank.get_and_clear(i))
+                        _signal(i);
+                }
+            }
+        }
+    }
+
+    register table {
+        param init_val default table_offset_bir;
+        field bir  @ [2:0]  is pcie_desc {
+            param pcie_desc = "Bar Equivalent Index";
+        }
+        field offs @ [31:3] is pcie_desc {
+            param pcie_desc = "Offset";
+        }
+    }
+
+    register pba {
+        param init_val default pba_offset_bir;
+        field bir  @ [2:0]  is pcie_desc {
+            param pcie_desc = "Bar Equivalent Index";
+        }
+        field offs @ [31:3] is pcie_desc {
+            param pcie_desc = "Offset";
+        }
+    }
+
+    saved bool table_mapped;
+    saved uint64 table_base;
+    saved bool bir_mapped;
+    saved uint64 bir_base;
+
+
+    shared method update_map(uint8 bir, map_info_t base);
+    method update_map(uint8 bir, map_info_t bar_nfo) {
+        del_map(bir);
+        if (table.bir.val == bir) {
+            local map_info_t nfo;
+            nfo.base = bar_nfo.base + (table.offs.val << 3);
+            nfo.length = num_vectors * 0x10;
+            nfo.start = 0;
+            nfo.priority = bar_nfo.priority - 1;
+            if (upstream_target.connected()) {
+                upstream_target.pcie_map.add_map(
+                    data_bank.obj, nfo, PCIE_Type_Mem);
+                table_mapped = true;
+                table_base = nfo.base;
+            }
+        }
+        if (pba.bir.val == bir) {
+            local map_info_t nfo;
+            nfo.base = bar_nfo.base + (pba.offs.val << 3);
+            nfo.length = ((num_vectors + 31) / 32) * 4;
+            nfo.start = MSIX_MAX_VECTORS * 0x10;
+            nfo.priority = bar_nfo.priority - 1;
+            if (upstream_target.connected()) {
+                upstream_target.pcie_map.add_map(
+                    data_bank.obj, nfo, PCIE_Type_Mem);
+                bir_mapped = true;
+                bir_base = nfo.base;
+            }
+        }
+    }
+
+    shared method del_map(uint8 bir);
+    method del_map(uint8 bir) {
+        if (table_mapped && table.bir.val == bir) {
+            if (table_mapped && upstream_target.connected()) {
+                upstream_target.pcie_map.del_map(
+                    data_bank.obj, table_base, PCIE_Type_Mem);
+                table_mapped = false;
+            }
+        }
+        if (bir_mapped && pba.bir.val == bir) {
+            if (bir_mapped && upstream_target.connected()) {
+                upstream_target.pcie_map.del_map(
+                    data_bank.obj, bir_base, PCIE_Type_Mem);
+                bir_mapped = false;
+            }
+        }
+    }
+
+    /**
+       #### `raise(uint16 i)`
+       Raises MSI-X `i` if enabled, and signals it if not masked
+     */
+    shared method raise(uint16 i);
+    method raise(uint16 i) default {
+        if (control.enable.val) {
+            if (control.mask.val || data_bank.entry[i].control.mask.val) {
+                log info, 2: "can't raise MSI-X %d, %s masked, set pending",
+                    i, control.mask.val ? "function" : "vector";
+                data_bank.set_pending(i);
+            } else {
+                _signal(i);
+            }
+        } else {
+            log info, 2: "can't raise MSI-X %d, MSI-X disabled", i;
+        }
+    }
+
+    /**
+       #### `lower(uint16 i)`
+       Lowers MSI-X `i`
+     */
+    method lower(uint16 i) default {
+        data_bank.get_and_clear(i);
+    }
+
+    method _signal(uint16 i) default {
+        if (!upstream_target.connected())
+            return;
+        local uint64 addr = data_bank.entry[i].address.val;
+        local uint32 data = data_bank.entry[i].data.val;
+        log info, 2: "raise MSI-X %d @ 0x%x <= 0x%x", i, addr, data;
+        memory.write(addr, data, 4);
+    }
+
+    shared method is_enabled() -> (bool);
+    method is_enabled() -> (bool) {
+        return control.enable.val == 1;
+    }
+
+#if (use_standard_access_templates) {
+    register control {
+        field sz   is ignore_write;
+    }
+    register table is read_only;
+    register pba   is read_only;
+}
+#if (use_standard_write_templates) {
+    register control is pcie_write;
+}
+}
+
+/**
+   ### msix_table
+
+   Template to model the msix table data and pending bits.
+   #### Parameters:
+    - `num_vectors`: Number of MSI-X vectors
+    - `msix_bank`: Bank containing the group instantiating the MSI-X capability.
+*/
+template msix_table is bank {
+    param use_io_memory = false;
+    param num_vectors default MSIX_MAX_VECTORS;
+    param use_standard_write_templates default true;
+    param msix_bank default dev;
+
+    #if (num_vectors > MSIX_MAX_VECTORS) {
+        error "msix_table.num_vectors too big";
+    }
+    group entry[i < num_vectors] {
+        register address size 8 @ 0x0 + i * 0x10 is pcie_desc {
+            param pcie_desc = "Message Address";
+        }
+        register data    size 4 @ 0x8 + i * 0x10 is pcie_desc {
+            param pcie_desc = "Message Data";
+        }
+        register control size 4 @ 0xc + i * 0x10 is pcie_desc {
+            param pcie_desc = "Vector Control";
+        }
+
+        register control {
+            field mask @ [0]     is pcie_desc {
+                param pcie_desc = "Mask Bit";
+                method pcie_write(uint64 value) {
+                    if (value != this.val) {
+                        this.val = value;
+                        if (get_and_clear(i))
+                            raise(i);
+                    }
+                }
+            }
+            field st   @ [31:16] is pcie_desc {
+                param pcie_desc = "Steering Tag";
+            }
+        }
+    }
+    register pending[i < ((num_vectors + 31) / 32)] size 4
+        @ MSIX_MAX_VECTORS * 0x10 + i * 4 "Pending Bits";
+
+    method raise(uint16 i) default {
+        local bool found;
+        foreach msix in (each msix_capability in (msix_bank)) {
+            if (found) {
+                log error: "More than one msix_capability found! The parameter"
+                    + "'msix_bank' must be set to the PCIe config bank this"
+                    + " MSI-X table should use";
+                return;
+            }
+            msix.raise(i);
+            found = true;
+        }
+    }
+
+    method get_and_clear(uint16 i) -> (bool) {
+        if (i < num_vectors) {
+            local bool val =
+                !entry[i].control.mask.val && pending[i / 32].val[i % 32];
+            if (val)
+                pending[i / 32].val[i % 32] = 0;
+            return val;
+        } else {
+            log error: "get_and_clear: invalid MSI-X vector %d", i;
+            return false;
+        }
+    }
+
+    method set_pending(uint16 i) {
+        if (i < num_vectors)
+            pending[i / 32].val[i % 32] = 1;
+        else
+            log error: "set_pending: invalid MSI-X vector %d", i;
+    }
+
+#if (use_standard_write_templates) {
+    group entry[i < num_vectors] {
+        register control {
+            field mask is pcie_write;
+        }
+    }
+}
+}
+
+template defining_msix_capability {
+    param msix_offset;
+    param msix_next_ptr;
+    param msix_num_vectors;
+    param msix_table_offset_bir;
+    param msix_pba_offset_bir;
+    param msix_data_bank;
+    group msix is msix_capability {
+        param base             = msix_offset;
+        param next_ptr         = msix_next_ptr;
+        param num_vectors      = msix_num_vectors;
+        param table_offset_bir = msix_table_offset_bir;
+        param pba_offset_bir   = msix_pba_offset_bir;
+        param data_bank        = msix_data_bank;
+    }
+}
+
+/**
+   ## Subsystem ID and Subsystem Vendor ID Capability registers
+
+    - name: `ssid_capability`
+    - implemented: registers only
+*/
+template ssid_capability is capability {
+    param id = 0x0d;
+
+    register ssvid size 2 @ (base + 0x4) is pcie_desc {
+        param pcie_desc = "SSVID";
+    }
+    register ssid  size 2 @ (base + 0x6) is pcie_desc {
+        param pcie_desc = "SSID";
+    }
+
+#if (use_standard_access_templates) {
+    register ssvid is hwinit;
+    register ssid  is hwinit;
+}
+#if (use_standard_write_templates) {
+    register ssvid is pcie_sticky;
+    register ssid  is pcie_sticky;
+}
+}
+
+template defining_ssid_capability {
+    param ssid_offset;
+    param ssid_next_ptr;
+
+    group ssid is ssid_capability {
+        param base = ssid_offset;
+        param next_ptr = ssid_next_ptr;
+    }
+}
+
+/**
+   ## Conventional PCI Advanced Features Capability (AF) registers
+
+    - name: `af_capability`
+    - implemented: FLR
+*/
+template af_capability is capability {
+    param id = 0x13;
+
+    register length     size 1 @ (base + 0x2) is pcie_desc {
+        param pcie_desc = "AF Length";
+    }
+    register capability size 1 @ (base + 0x3) is pcie_desc {
+        param pcie_desc = "AF Capabilities";
+    }
+    register control    size 1 @ (base + 0x4) is pcie_desc {
+        param pcie_desc = "AF Control";
+    }
+    register status     size 1 @ (base + 0x5) is pcie_desc {
+        param pcie_desc = "AF Control";
+    }
+
+    register length {
+        param init_val default 6;
+    }
+    register capability   {
+        field tp_cap  @ [0] is pcie_desc {
+            param pcie_desc = "Transactions Pending Supported";
+        }
+        field flr_cap @ [1] is pcie_desc {
+            param pcie_desc = "Function Level Reset Supported";
+        }
+    }
+    register control {
+        field iflr @ [0:0] is pcie_desc {
+            param pcie_desc = "Function Level Reset (INITIATE_FLR)";
+            method pcie_write(uint64 value) default {
+                if (value == 1) {
+                    if (capability.flr_cap.val == 1) {
+                        log info, 2: "Initiate FLR on %s", bank.qname;
+                        bank.pcie_function_level_reset();
+                    } else {
+                        log spec_viol: "FLR unsupported, writing 1 to %s", this.qname;
+                    }
+                }
+            }
+        }
+    }
+    register status {
+        field tp @ [0:0] is pcie_desc {
+            param pcie_desc = "Transactions Pending (TP)";
+        }
+    }
+
+#if (use_standard_access_templates) {
+    register length is read_only;
+    register capability is hwinit;
+    register status is read_only;
+}
+#if (use_standard_write_templates) {
+    register capability is pcie_sticky;
+    register control {
+        field iflr is pcie_write;
+    }
+}
+}
+
+template defining_af_capability {
+    param af_offset;
+    param af_next_ptr;
+
+    group af is af_capability {
+        param base = af_offset;
+        param next_ptr = af_next_ptr;
+    }
+}
+
+/**
+   ## Enhanced Allocation (EA) Capability registers
+
+    - name: `ea_capability`
+    - implemented: registers only
+*/
+template ea_capability is capability {
+    param id = 0x14;
+    param num_entries default 0;
+
+    register n_entries size 2 @ base + 0x2 is pcie_desc {
+        param pcie_desc = "EA Number of Entries";
+        param init_val default num_entries;
+    }
+
+#if (is_type_1_header) {
+    register capability size 4 @ (base + 0x4) {
+        field fsecbn @ [7:0]  is pcie_desc {
+            param pcie_desc = "Fixed Secondary Bus Number";
+        }
+        field fsubbn @ [15:8] is pcie_desc {
+            param pcie_desc = "Fixed Subordinate Bus Number";
+        }
+    }
+}
+
+    param eb = base + (is_type_1_header #? 8 #: 4);
+#if (num_entries > 0 ) {
+    register entries[i < num_entries] size 4 @ (eb + i * 4) is pcie_desc {
+        param pcie_desc = "EA Entry";
+        field es  @ [2:0]   is pcie_desc {
+            param pcie_desc = "Entry Size";
+        }
+        field bei @ [7:4]   is pcie_desc {
+            param pcie_desc = "BAR Equivalent Indicator";
+        }
+        field pp  @ [15:8]  is pcie_desc {
+            param pcie_desc = "Primary Properties";
+        }
+        field sp  @ [23:16] is pcie_desc {
+            param pcie_desc = "Secondary Properties";
+        }
+        field w   @ [30:30] is pcie_desc {
+            param pcie_desc = "Writable";
+        }
+        field e   @ [31:31] is pcie_desc {
+            param pcie_desc = "Enable";
+        }
+    }
+}
+
+#if (use_standard_access_templates) {
+    register n_entries is hwinit;
+#if (is_type_1_header) {
+    register capability is hwinit;
+}
+#if (num_entries > 0 ) {
+    register entries[i < num_entries] {
+        field es  is hwinit;
+        field bei is hwinit;
+        field pp  is hwinit;
+        field sp  is hwinit;
+        field w   is hwinit;
+        field e   is hwinit;
+    }
+}
+}
+#if (use_standard_write_templates) {
+    register n_entries is pcie_sticky;
+#if (is_type_1_header) {
+    register capability is pcie_sticky;
+}
+#if (num_entries > 0 ) {
+    register entries[i < num_entries] {
+        field es  is pcie_sticky;
+        field bei is pcie_sticky;
+        field pp  is pcie_sticky;
+        field sp  is pcie_sticky;
+        field w   is pcie_sticky;
+        field e   is pcie_sticky;
+    }
+}
+}
+}
+
+template defining_ea_capability {
+    param ea_offset;
+    param ea_next_ptr;
+    param ea_num_entries;
+
+    group ea is ea_capability {
+        param base = ea_offset;
+        param next_ptr = ea_next_ptr;
+        param num_entries = ea_num_entries;
+    }
+}
+
+/**
+   ## Flattening Portal Bridge (FPB) Capability registers
+
+    - name: `fpb_capability`
+    - implemented: registers only
+
+   Fields and access restrictions to be added upon request.
+*/
+template fpb_capability is capability {
+    param id = 0x15;
+
+    register capability                size 4 @ (base + 0x04) is pcie_desc {
+        param pcie_desc = "FPB Capabilities";
+    }
+    register rid_vector_control_1      size 4 @ (base + 0x08) is pcie_desc {
+        param pcie_desc = "FPB RID Vector Control 1";
+    }
+    register rid_vector_control_2      size 4 @ (base + 0x0c) is pcie_desc {
+        param pcie_desc = "FPB RID Vector Control 2";
+    }
+    register mem_low_vector_control    size 4 @ (base + 0x10) is pcie_desc {
+        param pcie_desc = "FPB MEM Low Vector Control";
+    }
+    register mem_high_vector_control_1 size 4 @ (base + 0x14) is pcie_desc {
+        param pcie_desc = "FPB MEM High Vector Control 1";
+    }
+    register mem_high_vector_control_2 size 4 @ (base + 0x18) is pcie_desc {
+        param pcie_desc = "FPB MEM High Vector Control 2";
+    }
+    register vector_access_control     size 4 @ (base + 0x1c) is pcie_desc {
+        param pcie_desc = "FPB Vector Access Control";
+    }
+    register vector_access_data        size 4 @ (base + 0x20) is pcie_desc {
+        param pcie_desc = "FPB Vector Access Data";
+    }
+
+}
+
+template defining_fpb_capability {
+    param fpb_offset;
+    param fpb_next_ptr;
+
+    group fpb is fpb_capability {
+        param base = fpb_offset;
+        param next_ptr = fpb_next_ptr;
+    }
+}
+
+/**
+   ## Null Capability registers
+
+    - name: `null_capability`
+    - implemented: registers only
+*/
+template null_capability is capability {
+    param id = 0x0;
+}
+
+template defining_null_capability {
+    param null_offset;
+    param null_next_ptr;
+
+    group null is null_capability {
+        param base = null_offset;
+        param next_ptr = null_next_ptr;
+    }
+}

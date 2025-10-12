@@ -1,0 +1,110 @@
+/*
+  sample-device-dml.dml - sample DML code for a Simics device
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device sample_signal_device_impl;
+parameter desc = "sample device to test the signal-link";
+parameter documentation = "This is a very simple device.";
+
+import "simics/devs/signal.dml";
+
+connect outgoing_receiver {
+    interface signal;
+    method after_set {
+        if (SIM_object_is_configured($dev.obj))
+            call $start_output;
+    }
+    method raise {
+        $signal.signal_raise();
+    }
+    method lower {
+        $signal.signal_lower();
+    }
+}
+
+attribute out_level {
+    parameter allocate_type = "uint8";
+}
+
+attribute period "The period of the signal in seconds" {
+    parameter allocate_type = "double";
+    parameter configuration = "required";
+}
+
+attribute incount "number of RAISE messages received" {
+    parameter allocate_type = "uint32";
+}
+
+attribute count "number of times to toggle" {
+    parameter allocate_type = "uint32";
+    parameter configuration = "required";
+    method after_set {
+        if (SIM_object_is_configured($dev.obj))
+            call $start_output;
+    }
+}
+
+attribute trigger_output "change signal at once" {
+    parameter allocate = false;
+    parameter type = "i";
+    parameter configuration = "pseudo";
+    method set(attr_value_t value) {
+        if (SIM_object_is_configured($dev.obj))
+            call $toggle.event(NULL);
+    }
+}
+
+port incoming {
+    implement signal {
+        method signal_raise() {
+            log info: "RAISE";
+            $incount++;
+        }
+        method signal_lower() {
+            log info: "LOWER";
+        }
+    }
+}
+
+event toggle "Toggle output level" {
+    method event(void *data) {
+        $out_level = 1 - $out_level;
+        if ($out_level == 1) {
+            log info, 2: "raising";
+            call $outgoing_receiver.raise;
+        } else {
+            log info, 2: "lowering";
+            call $outgoing_receiver.lower;
+            if ($count > 0)
+                $count--;
+        }
+        call $start_output();
+    }
+}
+
+method start_output {
+    if (SIM_object_clock($dev.obj)) {
+        local bool already_posted;
+        call $toggle.posted(NULL) -> (already_posted);
+        if (!already_posted && $count > 0)
+            inline $toggle.post($period / 2, NULL);
+    }
+}
+
+method post_init {
+    if ($outgoing_receiver.obj)
+        call $start_output;
+}

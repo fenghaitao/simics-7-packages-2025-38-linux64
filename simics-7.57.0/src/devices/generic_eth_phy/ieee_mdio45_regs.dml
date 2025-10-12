@@ -1,0 +1,531 @@
+/*
+  IEEE 802.3 Clause 45 PHY functionality
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+  This file requires the following:
+  - a device-level method link_is_up(), returning bool, must be defined
+  - post_init must call $mii_regs.post_init()
+  In return, it defines:
+  - attributes etc. for a set of MII management registers
+  - the method loopback_mode()
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "simics/devs/mii.dml";
+
+/* Set to true if the PHY also implements the mii_management interface */
+param has_mii default undefined;
+
+param mmds default [mmd_pma_pmd, mmd_wis, mmd_pcs, mmd_phy_xs,
+                        mmd_dte_xs, mmd_tc, mmd_auto_neg, mmd_mii_ext,
+                        mmd_vendor1, mmd_vendor2];
+
+template mdio45_mmd_bank is (bank, object) {
+    param mappable = false;
+    param register_size = 2;
+
+    param mmd_name default undefined;
+    param mmd_idx default undefined;
+
+    param documentation
+        = "The " + mmd_name + " MMD register set in the MDIO interface, "
+        + "as described in IEEE 802.3.";
+
+    method mdio45_read(int reg) -> (uint16) default {
+        local uint16 value;
+        try {
+            value = read(reg * 2, 0xFFFF, NULL);
+        } catch {
+            log spec_viol, 2:
+            "reading from non-existing register: MMD=%d (%s), register=0x%x",
+                mmd_idx, mmd_name, reg;
+            value = 0;
+        }
+        return value;
+    }
+
+    method mdio45_write(int reg, uint16 value) default {
+        local bool success;
+        try {
+            write(reg * 2, value, 0xFFFF, NULL);
+        } catch {
+            log spec_viol, 2:
+            "writing 0x%04x to non-existing register: MMD=%d (%s), register=0x%x",
+                value, mmd_idx, mmd_name, reg;
+        }
+    }
+}
+
+template dev_in_package_bit is field {
+    is read_only;
+    param configuration = "pseudo";
+
+    param mmd default undefined;
+
+    is get;
+    method get() -> (uint64) {
+        #select mmd_bank in (mmds) where (mmd_bank.mmd_idx == mmd.mmd_idx) {
+            return 1;
+        } #else {
+            return 2;
+        }
+    }
+    is read;
+}
+
+template mmd_common_regs {
+    param has_speed_ability default true;
+    param has_status default true;
+
+    /*
+     * Register map
+     */
+    register control1              @ 0 * 2;
+    #if (has_status) {
+        register status1           @ 1 * 2;
+    }
+    register device_identifier[i < 2]  @ (2 + i) * 2;
+    #if (has_speed_ability) {
+        register speed_ability     @ 4 * 2;
+    }
+    register devices_in_package1   @ 5 * 2;
+    register devices_in_package2   @ 6 * 2;
+    register package_identifier[i < 2] @ (14 + i) * 2;
+
+
+    /*
+     * Implementation
+     */
+    register devices_in_package2 {
+        param configuration = "pseudo";
+        field vendor2_present @ [15] is dev_in_package_bit {
+            param mmd = mmd_vendor2;
+        }
+        field vendor1_present @ [14] is dev_in_package_bit {
+            param mmd = mmd_vendor1;
+        }
+        field mii_ext_present @ [13] is dev_in_package_bit {
+            param mmd = mmd_mii_ext;
+        }
+        field auto_neg_present @ [7] is dev_in_package_bit {
+            param mmd = mmd_auto_neg;
+        }
+        field tc_present @ [6]       is dev_in_package_bit {
+            param mmd = mmd_tc;
+        }
+        field dte_xs_present @ [5]   is dev_in_package_bit {
+            param mmd = mmd_dte_xs;
+        }
+        field phy_xs_present @ [4]   is dev_in_package_bit {
+            param mmd = mmd_phy_xs;
+        }
+        field pcs_present @ [3]      is dev_in_package_bit {
+            param mmd = mmd_pcs;
+        }
+        field wis_present @ [2]      is dev_in_package_bit {
+            param mmd = mmd_wis;
+        }
+        field pma_pmd_present @ [1]  is dev_in_package_bit {
+            param mmd = mmd_pma_pmd;
+        }
+        field mii_regs_present @ [0] is read_only {
+            param configuration = "pseudo";
+
+            is get;
+            method get() -> (uint64) {
+                return has_mii ? 1 : 0;
+            }
+            is read;
+        }
+    }
+}
+
+bank mmd_pma_pmd {
+    param mmd_name = "PMA/PMD";
+    param mmd_idx = 1;
+    is mdio45_mmd_bank;
+
+    group grp_PMA_PMD {
+        is mmd_common_regs;
+    }
+
+    group grp_10G {
+        register PMA_PMD_control2          @ 7 * 2;
+        register PMA_PMD_status2           @ 8 * 2;
+        register PMA_PMD_transmit_disable  @ 9 * 2;
+        register PMD_receive_signal_detect @ 10 * 2;
+        register PMA_PMD_extended_ability  @ 11 * 2;
+    }
+
+    group grp_10P_2B {
+        register PMA_PMD_control            @ 30 * 2;
+        register PMA_PMD_status             @ 31 * 2;
+        register LP_PMA_PMD_control         @ 32 * 2;
+        register LP_PMA_PMD_status          @ 33 * 2;
+        register link_loss_counter          @ 36 * 2;
+        register rx_snr_margin              @ 37 * 2;
+        register LP_rx_snr_margin           @ 38 * 2;
+        register line_attenuation           @ 39 * 2;
+        register LP_link_attenuation        @ 40 * 2;
+        register line_quality_tresholds     @ 41 * 2;
+        register LP_line_quality_thresholds @ 42 * 2;
+    }
+
+    group grp_10P {
+        register FEC_correctable_errors_counter        @ 43 * 2;
+        register FEC_uncorrectable_errors_counter      @ 44 * 2;
+        register LP_FEC_correctable_errors_counter     @ 45 * 2;
+        register LP_FEC_uncorrectable_errors_counter   @ 46 * 2;
+        register electrical_length                     @ 47 * 2;
+        register LP_electrical_length                  @ 48 * 2;
+        register PMA_PMD_general_configuration         @ 49 * 2;
+        register PSD_configuration                     @ 50 * 2;
+        register downstream_data_rate_configuration1   @ 51 * 2;
+        register downstream_data_rate_configuration2   @ 52 * 2;
+        register downstream_reed_solomon_configuration @ 53 * 2;
+        register upstream_data_rate[i < 2]                 @ (54 + i) * 2;
+        register upstream_reed_solomon_configuration   @ 56 * 2;
+        register tone_group[i < 2]                         @ (57 + i) * 2;
+        register tone_control_parameters[i < 5]            @ (59 + i) * 2;
+        register tone_control_action                   @ 64 * 2;
+        register tone_status[i < 3]                        @ (65 + i) * 2;
+        register outgoind_indicator_bits               @ 68 * 2;
+        register incoming_indicator_bits               @ 69 * 2;
+        register cyclic_extension_configuration        @ 70 * 2;
+        register attainable_downstream_data_rate       @ 71 * 2;
+    }
+
+    group grp_2B {
+        register general_parameters                  @ 80 * 2;
+        register PMD_parameters[i < 8]                   @ (81 + i) * 2;
+        register code_violation_errors_counter       @ 89 * 2;
+        register LP_code_violation_errors_counter    @ 90 * 2;
+        register errored_seconds_counter             @ 91 * 2;
+        register LP_errored_seconds_counter          @ 92 * 2;
+        register severely_errored_seconds_counter    @ 93 * 2;
+        register LP_severely_errored_seconds_counter @ 94 * 2;
+        register LOSW_counter                        @ 95 * 2;
+        register LP_LOSW_counter                     @ 96 * 2;
+        register unavailable_seconds_counter         @ 97 * 2;
+        register LP_unavailable_seconds_counter      @ 98 * 2;
+        register state_defects                       @ 99 * 2;
+        register LP_state_defects                    @ 100 * 2;
+        register negotiated_constellation            @ 101 * 2;
+        register extended_PMD_parameters[i < 8]          @ (102 + i) * 2;
+    }
+
+
+    group grp_10G_BASE_T {
+        register status                                       @ 129 * 2;
+        register pair_swap_and_polarity                       @ 130 * 2;
+        register TX_power_backoff_and_PHY_short_reach_setting @ 131 * 2;
+        register test_mode                                    @ 132 * 2;
+        group channels[i < 4] {
+            register SNR_operating_margin                     @ (133 + i) * 2;
+            register minimum_margin                           @ (137 + i) * 2;
+            register RX_signal_power                          @ (141 + i) * 2;
+        }
+        register skew_delay[i < 2]                                @ (145 + i) * 2;
+    }
+
+    group grp_10G_BASE_KR {
+        register PMD_control           @ 150 * 2;
+        register PMD_status            @ 151 * 2;
+        register LP_coefficient_update @ 152 * 2;
+        register LP_status_report      @ 153 * 2;
+        register LD_coefficient_update @ 154 * 2;
+        register LD_status_report      @ 155 * 2;
+    }
+
+    group grp_10G_BASE_KX {
+        register control @ 160 * 2;
+        register status  @ 161 * 2;
+    }
+
+    group grp_10G_BASE_R {
+        group FEC {
+            register ability                       @ 170 * 2;
+            register control                       @ 171 * 2;
+            register corrected_blocks_counter[i < 2]   @ (172 + i) * 2;
+            register uncorrected_blocks_counter[i < 2] @ (174 + i) * 2;
+        }
+    }
+}
+
+
+bank mmd_wis {
+    param mmd_name = "WIS";
+    param mmd_idx = 2;
+    is mdio45_mmd_bank;
+
+    group grp_WIS {
+        is mmd_common_regs;
+    }
+
+    group grp_10G {
+        register WIS_control2                       @ 7 * 2;
+        register WIS_status2                        @ 8 * 2;
+        register WIS_test_pattern_error_counter     @ 9 * 2;
+        register WIS_status3                        @ 33 * 2;
+        register WIS_far_end_path_block_error_count @ 37 * 2;
+        register WIS_J1_transmit[i < 8]                 @ (39 + i) * 2;
+        register WIS_J1_receive[i < 8]                  @ (47 + i) * 2;
+        register WIS_far_end_line_BIP_errors[i < 2]     @ (55 + i) * 2;
+        register WIS_line_BIP_errors[i < 2]             @ (57 + i) * 2;
+        register WIS_path_block_error_count         @ 59 * 2;
+        register WIS_section_BIP_error_count        @ 60 * 2;
+        register WIS_J0_transmit[i < 8]                 @ (64 + i) * 2;
+        register WIS_J0_receive[i < 8]                  @ (72 + i) * 2;
+    }
+}
+
+bank mmd_pcs {
+    param mmd_name = "PCS";
+    param mmd_idx = 3;
+    is mdio45_mmd_bank;
+
+    group grp_PCS {
+        is mmd_common_regs;
+    }
+
+    group grp_10G {
+        register PCS_control2 @ 7 * 2;
+        register PCS_status2  @ 8 * 2;
+    }
+
+    group grp_10G_BASE_X {
+        register PCS_status       @ 24 * 2;
+        register PCS_test_control @ 25 * 2;
+    }
+
+    group grp_10G_BASE_R {
+        register PCS_status1 @ 32 * 2;
+        register PCS_status2 @ 33 * 2;
+
+        group PCS_test_pattern {
+            register seed_A[i < 4]     @ (34 + i) * 2;
+            register seed_B[i < 4]     @ (38 + i) * 2;
+            register control       @ 42 * 2;
+            register error_counter @ 43 * 2;
+        }
+    }
+
+    group grp_10P_2B {
+        register capability @ 60 * 2;
+        register PCS_control @ 61 * 2;
+        register PME_available[i < 2] @ (62 + i) * 2;
+        register PME_aggregate[i < 2] @ (64 + i) * 2;
+
+        group PAF {
+            register RX_error_counter @ 66 * 2;
+            register small_fragments_counter @ 67 * 2;
+            register large_fragments_counter @ 68 * 2;
+            register overflow_counter @ 69 * 2;
+            register bad_fragments_counter @ 70 * 2;
+            register lost_fragments_counter @ 71 * 2;
+            register lost_starts_of_fragments_counter @ 72 * 2;
+            register lost_ends_of_fragments_counter @ 73 * 2;
+        }
+    }
+}
+
+bank mmd_phy_xs {
+    param mmd_name = "PHY XS";
+    param mmd_idx = 4;
+    is mdio45_mmd_bank;
+
+    group grp_PHY_XS {
+        is mmd_common_regs;
+        register status2 @ 8 * 2;
+    }
+
+    group grp_10G {
+        register PHY_XGXS_lane_status  @ 24 * 2;
+        register PHY_XGXS_test_control @ 25 * 2;
+    }
+}
+
+bank mmd_dte_xs {
+    param mmd_name = "DTE XS";
+    param mmd_idx = 5;
+    is mdio45_mmd_bank;
+
+    group grp_DTE_XS {
+        is mmd_common_regs;
+        register status2 @ 8 * 2;
+    }
+
+    group grp_10G {
+        register DTE_XGXS_lane_status  @ 24 * 2;
+        register DTE_XGXS_test_control @ 25 * 2;
+    }
+}
+
+bank mmd_tc {
+    param mmd_name = "TC";
+    param mmd_idx = 6;
+    is mdio45_mmd_bank;
+
+    group grp_TC {
+        param has_status = false;
+        is mmd_common_regs;
+    }
+
+    group grp_10P_2B {
+        register aggregation_discovery_control       @ 16 * 2;
+        register aggregation_discovery_status        @ 17 * 2;
+        register aggregation_discovery_code[i < 3]       @ (18 + i) * 2;
+        register LP_PME_aggregate_control            @ 21 * 2;
+        register LP_PME_aggregate_data[i < 2]            @ (22 + i) * 2;
+        register TC_CRC_error_counter                @ 24 * 2;
+        register TPS_TC_coding_violations_counter[i < 2] @ (25 + i) * 2;
+        register TC_indications                      @ 27 * 2;
+    }
+}
+
+bank mmd_auto_neg {
+    param mmd_name = "Auto-Negotiation";
+    param mmd_idx = 7;
+    is mdio45_mmd_bank;
+
+    group grp_AN {
+        param has_speed_ability = false;
+        is mmd_common_regs;
+
+        register advertisement[i < 3]        @ (16 + i) * 2;
+        register LP_base_page_ability[i < 3] @ (19 + i) * 2;
+        register XNP_transmit[i < 3]         @ (22 + i) * 2;
+        register LP_XNP_ability[i < 3]       @ (25 + i) * 2;
+    }
+
+    group grp_10G_BASE_T {
+        register AN_control              @ 32 * 2;
+        register AN_status               @ 33 * 2;
+    }
+
+    register BP_Ethernet_status          @ 48 * 2;
+}
+
+bank mmd_mii_ext {
+    param mmd_name = "MII extension";
+    param mmd_idx = 29;
+    is mdio45_mmd_bank;
+
+    register devices_in_package[i < 2]                    @ (5 + i) * 2;
+    group FEC {
+        register capability                           @ 7 * 2;
+        register control                              @ 8 * 2;
+        register buffer_head_coding_violation_counter @ 9 * 2;
+        register corrected_blocks_counter             @ 10 * 2;
+        register uncorrected_blocks_counter           @ 11 * 2;
+    }
+}
+
+bank mmd_vendor1 {
+    param mmd_name = "vendor1";
+    param mmd_idx = 30;
+    is mdio45_mmd_bank;
+}
+
+bank mmd_vendor2 {
+    param mmd_name = "vendor2";
+    param mmd_idx = 31;
+    is mdio45_mmd_bank;
+}
+
+bank mmd_default {
+    param mappable = false;
+    param register_size = 2;
+
+    param documentation
+        = "Fallback MMD used for unimplemented and/or reserved MMDs";
+
+    method mdio45_read(int mmd, int reg) -> (uint16) default {
+        log spec_viol, 2:
+            "reading from register 0x%x in non-existing MMD %d",
+            reg, mmd;
+        return 0;
+    }
+
+    method mdio45_write(int mmd, int reg, uint16 value) default {
+        log spec_viol, 2:
+            "writing 0x%04x to register 0x%x in non-existing MMD %d",
+            value, reg, mmd;
+    }
+}
+
+implement mdio45_phy {
+    method read_register(int mmd, int reg) -> (uint16) {
+        #select mmd_bank in (mmds) where (mmd_bank.mmd_idx == mmd) {
+            return mmd_bank.mdio45_read(reg);
+        } #else {
+            return mmd_default.mdio45_read(mmd, reg);
+        }
+    }
+
+    method write_register(int mmd, int reg, uint16 value) {
+        #select mmd_bank in (mmds) where (mmd_bank.mmd_idx == mmd) {
+            mmd_bank.mdio45_write(reg, value);
+        } #else {
+            mmd_default.mdio45_write(mmd, reg, value);
+        }
+    }
+}
+
+bank mmd_pma_pmd {
+    group grp_10G {
+        register PMA_PMD_status2 {
+            field device_present @ [15:14]           is (read_only) {
+                param init_val = 2;
+            }
+            field transmit_fault_ability @ [13]      is (read_only);
+            field receive_fault_ability @ [12]       is (read_only);
+            field transmit_fault @ [11]              is (read_only);
+            field receive_fault @ [10]               is (read_only);
+            field extended_abilities @ [9]           is (read_only) {
+                param init_val = 1;
+            }
+            field PMD_transmit_disable_ability @ [8] is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_sr @ [7]                is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_lr @ [6]                is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_er @ [5]                is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_lx4 @ [4]               is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_sw @ [3]                is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_lw @ [2]                is (read_only) {
+                param init_val = 1;
+            }
+            field ta_10gbase_ew @ [1]                is (read_only) {
+                param init_val = 1;
+            }
+            field PMA_loopback_ability @ [0]         is (read_only) {
+                param init_val = 1;
+            }
+        }
+    }
+}

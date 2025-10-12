@@ -1,0 +1,460 @@
+/*
+  ich-sata-f2.dml - Integrated Serial ATA host controller
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter limitations = $ahci_limits;
+
+import "sata-common.dml";
+import "sata-ahci.dml";
+
+parameter ports_impl = $ich9_mobile? 0b11 : 0b111111;
+parameter default_cap = 
+    $ich9_desktop ? 0xFF22FFC2
+    : $ich9_mobile  ? 0xDE127F03
+    : $ich10_consumer ? 0xFF22FFC5
+    : $ich10_corporate ? 0xFF22FF45
+    : undefined;
+parameter ahci_ver = 0x10200;
+parameter default_em_loc = 0x1000002;
+parameter default_em_ctrl = 0x07010000;
+parameter ccc_int = 6;
+
+attribute w7_shutdown_workaround {
+    parameter documentation
+        = "Setting this to true prevents windows 7 from getting an access to "
+        + "unmapped AHCI memory space at the time Windows is shutting down.";
+    parameter configuration = "optional";
+    parameter allocate_type = "bool";
+}
+
+bank pci_config {
+    register abar_sidpba size 4 @ 0x24 {
+        parameter desc = "AHCI/SATA Index Data Pair Base Address";
+    }
+
+    parameter base_address_registers =
+        ["pcmd_bar", "pcnl_bar", "scmd_bar", "scnl_bar", "bar"];
+
+    register capabilities_ptr {
+        parameter value = 0x80;
+    }
+    register scgc   size 4 @ 0x94 "SATA Clock Gating Control";
+    register sclkgc size 4 @ 0x9c "SATA Clock General Configuration";
+    // dft[id] = something about SATA buffer strength
+    register dfti   size 4 @ 0xa0 is (undocumented);
+    register dftd   size 4 @ 0xa4 is (undocumented);
+    register sp     size 4 @ 0xd0 "Scratch Pad";
+    register bfcs   size 4 @ 0xe0 "BIST FIS Control/Status";
+    register bftd1  size 4 @ 0xe4 "BIST FIS Transmit Data, DW1";
+    register bftd2  size 4 @ 0xe8 "BIST FIS Transmit Data, DW2";
+
+    method update_device_id() {
+        // This method is based on the
+        // "Intel® ICH9 Device and Revision ID Table" in the
+        // "Intel® I/O Controller Hub 9 (ICH9) Family Specification Update"
+        if ($ich9_mobile) {
+            if ($pci_config.map.sms == IDE_MODE) {
+                $device_id = 0x2928;
+            } else if ($pci_config.map.sms == AHCI_MODE) {
+                $device_id = 0x2929;
+            } else if ($pci_config.map.sms == RAID_MODE) {
+                $device_id = $pci_config.sclkgc.aie == 0 ? 0x282a : 0x292c;
+            }
+        } else if ($ich9_base) {
+            if ($pci_config.map.sms == IDE_MODE) {
+                $device_id = 0x2921;
+            } else if ($pci_config.map.sms == AHCI_MODE) {
+                $device_id = 0x2923;
+            } else if ($pci_config.map.sms == RAID_MODE) {
+                assert(false);
+            }
+        } else if ($ich9_desktop) {
+            if ($pci_config.map.sms == IDE_MODE) {
+                $device_id = 0x2920;
+            } else if ($pci_config.map.sms == AHCI_MODE) {
+                $device_id = 0x2922;
+            } else if ($pci_config.map.sms == RAID_MODE) {
+                $device_id = $pci_config.sclkgc.aie == 0 ? 0x2822 : 0x2925;
+            }
+        } else if ($ich10_consumer) {
+            if ($pci_config.map.sms == IDE_MODE) {
+                $device_id = 0x3A20;
+            } else if ($pci_config.map.sms == AHCI_MODE) {
+                $device_id = 0x3A22;
+            } else if ($pci_config.map.sms == RAID_MODE) {
+                $device_id = $pci_config.sclkgc.aie == 0 ? 0x3A22 : 0x3A25;
+            }
+        } else if ($ich10_corporate) {
+            if ($pci_config.map.sms == IDE_MODE) {
+                $device_id = 0x3A00;
+            } else if ($pci_config.map.sms == AHCI_MODE) {
+                $device_id = 0x3A02;
+            } else if ($pci_config.map.sms == RAID_MODE) {
+                $device_id = $pci_config.sclkgc.aie == 0 ? 0x3A02 : 0x3A05;
+            }
+        } else {
+            error;
+        }
+    }
+
+    method update_class_code() {
+        local uint8 pi;
+        local uint8 scc;
+
+        if ($pci_config.map.sms == IDE_MODE) {
+            pi[7] = 1;
+            pi[6:4] = 0;
+            pi[3] = $pci_config.map.mv == 0 ? 1: 0;
+            pi[2] = $pci_config.class_code[2];
+            pi[1] = $pci_config.map.mv == 0 ? 1: 0;
+            pi[0] = $pci_config.class_code[0];
+            scc = 0x01;
+        } else if ($pci_config.map.sms == AHCI_MODE) {
+            pi = 0x01;
+            scc = 0x06;
+        } else if ($pci_config.map.sms == RAID_MODE) {
+            pi = 0x00;
+            scc = 0x04;
+        } else
+            assert false;
+
+        $class_code = 0x01 << 16 | scc << 8 | pi;
+    }
+
+    register interrupt_pin {
+        method get()->(value) {
+            value = $chipset_config.int_register.read(0x3100)[11:8];
+        }
+        method set(value) {
+            local typeof(value) current_value;
+            inline $get()->(current_value);
+            if (value != current_value) {
+                log "error", 1, PCI_config:
+                    "%s is a read-only alias for d31p.sip in %s",
+                    $qname, $chipset_config.qname;
+            }
+        }
+        method read()->(value) {
+            inline $get()->(value);
+        }
+    }
+
+    // The ABAR_SIDPBA register is actually two BAR registers
+    // of different kinds mapping at the same location.
+    // Only one of them is active at a time depending on if
+    // the SATA is running in IDE mode or not.
+
+    register abar_sidpba {
+        parameter allocate = false;
+        parameter configuration = "pseudo";
+
+        method remove_map(space_type) {
+            local bool is_ide;
+            inline $sata_is_ide_controller() -> (is_ide);
+            if (is_ide) {
+                if (space_type == "I/O")
+                    call $sidpba.remove_map();
+            } else {
+                if (space_type == "memory")
+                    call $abar.remove_map();
+            }
+        }
+        method update_mapping(space_type) {
+            if ($abar_w7_workaround.base != 0 && $w7_shutdown_workaround) {
+                call $abar_w7_workaround.remove_map();
+                $abar_w7_workaround.base = 0;
+            }
+            local bool is_ide;
+            inline $sata_is_ide_controller() -> (is_ide);
+            if (is_ide) {
+                if (space_type == "I/O")
+                    call $sidpba.update_mapping();
+            } else {
+                if (space_type == "memory") {
+                    call $abar.update_mapping();
+                    if ($command.mem == 0 && $w7_shutdown_workaround) {
+                        $abar_w7_workaround.base = $abar.base;
+                        call $abar_w7_workaround.add_map();
+                    }
+                }
+            }
+        }
+
+        method get -> (value) {
+            local bool is_ide;
+            inline $sata_is_ide_controller() -> (is_ide);
+            if (is_ide)
+                inline $sidpba.get() -> (value);
+            else
+                inline $abar.get() -> (value);
+        }
+        method set(value) {
+            local bool is_ide;
+            inline $sata_is_ide_controller() -> (is_ide);
+            if (is_ide)
+                inline $sidpba.set(value);
+            else
+                inline $abar.set(value);
+        }
+
+        field base [31:4] {
+            method read() -> (value) {
+                local bool is_ide;
+                inline $sata_is_ide_controller() -> (is_ide);
+                if (is_ide) {
+                    local uint32 bar;
+                    inline $sidpba.base.read() -> (bar);
+                    value = bar >> 2;
+                } else {
+                    inline $abar.base.read() -> (value);
+                }
+            }
+            method write(value) {
+                local bool is_ide;
+                inline $sata_is_ide_controller() -> (is_ide);
+                if (is_ide) {
+                    inline $sidpba.base.write(value << 2);
+                } else {
+                    inline $abar.base.write(value);
+                }
+            }
+        }
+
+        field res [3:1] is (silent_constant) {
+            parameter value = 0;
+        }
+        field s [0:0] {
+            method read() -> (value) {
+                local bool is_ide;
+                inline $sata_is_ide_controller() -> (is_ide);
+                value = is_ide ? 1 : 0;
+            }
+            method write(value) {
+                // Silent read-only field.
+            }
+        }
+    }
+
+    register abar is (unmapped, memory_base_address_32) {
+        parameter map_func = $ahci.function;
+        parameter size_bits = 11;
+    }
+
+    register sidpba is (unmapped, io_base_address) {
+        parameter map_func = $sidp.function;
+        parameter size_bits = 4;
+    }
+
+    register abar_w7_workaround is (unmapped, memory_base_address_32) {
+        parameter map_func = $ahci_w7_workaround.function;
+        parameter size_bits = 11;
+        method pci_mapping_customize(map_info_t *info) {
+            info->priority = 0x7000;
+        }
+    }
+
+    // "Reload" the remove_mappings() and update_mappings() methods.
+    method remove_mappings(space_type) {
+        log "info", 2, PCI_config: "removing %s mappings", space_type;
+        foreach reg in ($mapped_registers) {
+            foreach name in ($base_address_registers) {
+                if (reg.name == name)
+                    if (reg.map_type == space_type)
+                        call reg.remove_map();
+            }
+            if (reg.name == "expansion_rom_base")
+                if (reg.map_type == space_type)
+                    call reg.remove_map();
+            if (reg.name == "abar_sidpba")
+                inline reg.remove_map(space_type);
+        }
+    }
+
+    method update_mappings(space_type) {
+        log "info", 2, PCI_config: "updating %s mappings", space_type;
+        foreach reg in ($mapped_registers) {
+            foreach name in ($base_address_registers) {
+                if (reg.name == name)
+                    if (reg.map_type == space_type)
+                        call reg.update_mapping();
+            }
+            if (reg.name == "expansion_rom_base")
+                if (reg.map_type == space_type)
+                    call reg.update_mapping();
+            if (reg.name == "abar_sidpba")
+                inline reg.update_mapping(space_type);
+        }
+    }
+
+    register capabilities_ptr {
+        method read_access(generic_transaction_t *memop,
+                           msb1, lsb) -> (uint64 value) {
+            local bool is_ide;
+            inline $sata_is_ide_controller() -> (is_ide);
+            value = is_ide ? 0x70 : 0x80;
+        }
+    }
+
+    register map {
+        field sms [7:6] "SATA Mode Select" {
+            method write(value) {
+                if ($this != value) {
+                    select mode in ([IDE_MODE, AHCI_MODE, RAID_MODE])
+                        where (value == mode)
+                        {
+                            inline $update_sata_mode($this, value);
+                            $this = value;
+                        } else {
+                            log "spec_violation":
+                                "bad SMS value - %d, ignored", value;
+                        }
+                    call $update_device_id();
+                    call $update_class_code();
+                }
+            }
+        }
+        field sc [5:5] "SATA Port-to-Controller Configuration";
+        field mv [1:0] "Map Value";
+    }
+    register pcs {
+        field orm [15] is (read_write);
+        field pxp [13:8] is (read_only);
+        field pxe [5:0] is (read_write);
+    }
+
+    register scgc is (silent_unimplemented);
+    register sclkgc {
+        field aie [7:7] "SATA Mode Select" {
+            is write_once;
+        }
+    }
+
+    register atc   is (silent_unimplemented);
+    register ats   is (silent_unimplemented);
+
+    register sp    is (scratch);
+    register bfcs  is (silent_unimplemented);
+    register bftd1 is (silent_unimplemented);
+    register bftd2 is (silent_unimplemented);
+
+    method update_config() {
+        call $pci_config.update_all_mappings();
+        call $pci_config.update_device_id();
+        call $pci_config.update_class_code();
+    }
+
+    method bus_reset() {
+        log "info", 2, PCI_config: "Bus reset";
+        call $dev.soft_reset();
+        call $pci_config.update_config();
+    }
+}
+
+bank ahci_w7_workaround {
+    parameter desc          = "workaround for windows 7 shutdown";
+    parameter documentation = "Windows 7 accesses AHCI ABAR memory space after "
+        + "unmapping it at shutdown. This bank is mapped to prevent unmapped "
+        + " access error.";
+    parameter function = 3;
+    parameter byte_order = "little-endian";
+    parameter register_size = 4;
+
+    method access(generic_transaction_t *memop, physical_address_t offset,
+                  physical_address_t size) {
+        log "spec_violation", 2: "Memory access to AHCI-region that has %s",
+            "been unmapped.";
+    }
+}
+
+bank bm {
+    // Access at offset 0x10 - 0x18 are redirected to bank
+    // aidp when not in IDE mode (SCC != 01h).
+    method miss_access(memop, offset, size) {
+        local bool ide_mode;
+        inline $sata_is_ide_controller() -> (ide_mode);
+        if (!ide_mode && offset >= 0x10 && offset < 0x18) {
+            call $aidp.access(memop, offset - 0x10, size);
+        } else {
+            inline $log_miss(memop, offset, size);
+            throw;
+        }
+    }
+}
+
+bank sidp {
+    parameter valid_port_index_values = [0, 1, 2, 3];
+
+    register sdata {
+        method read_sata_register(memop, pidx, ridx) -> (value) {
+            local uint32 offset;
+            inline $get_offset() -> (offset);
+            inline $ahci.read(memop, offset, 4) -> (value);
+        }
+        method write_sata_register(memop, value, pidx, ridx) {
+            local uint32 offset;
+            inline $get_offset() -> (offset);
+            inline $ahci.write(memop, offset, 4, value);
+        }
+        method get_offset() -> (offset) {
+            assert($sindex.pidx < 4);
+            assert($sindex.ridx < 3);
+
+            // 00h = Primary Master (Port 0)
+            // 01h = Primary Slave (Port 2)
+            // 02h = Secondary Master (Port 1)
+            // 03h = Secondary Slave (Port 3)
+            local int port_num;
+            //port_num = ((int []){0, 2, 1, 3})[$sindex.pidx];
+            port_num = "0213"[$sindex.pidx] - "0"[0];
+            offset = 0x100 + port_num * 0x80
+                   + 0x28  + $sindex.ridx * 4;
+        }
+    }
+}
+
+bank ahci {
+    /* Vendor specific registers */
+    register vsp @ 0xA0 "Vendor Specific" {
+        field slpd [0] is (write_once);
+    }
+}
+
+data const char * sata_mode_str[3];
+
+method update_sata_mode(old_mode, new_mode) {
+    if (old_mode != new_mode) {
+        log "info", 2:
+            "SATA is changed from %s mode to %s mode",
+            $sata_mode_str[old_mode], $sata_mode_str[new_mode];
+        if (new_mode == AHCI_MODE) {
+            /* Set ports present in PCS register */
+            $pci_config.pcs.pxp = $ahci.pi & 0x3f;
+            call $ahci.h_init();
+        }
+    }
+}
+
+method init() {
+    $sata_mode_str[0] = "IDE";
+    $sata_mode_str[1] = "AHCI";
+    $sata_mode_str[2] = "RAID";
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state($dev.obj)) {
+        call $pci_config.update_config();
+    }
+}

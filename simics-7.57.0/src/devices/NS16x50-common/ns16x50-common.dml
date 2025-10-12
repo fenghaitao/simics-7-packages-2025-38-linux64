@@ -1,0 +1,794 @@
+/*
+  ns16x50-common.dml - Common base functionality used in all models
+                    that are compatible with the NS16450 specifications.
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+    Expected overhead definitions:
+
+    Parameters
+    $dev_bank (of uart_bank)
+
+    (Methods for buffer control)
+    recv_buffer_length() -> (length)
+    recv_buffer_read() -> (empty, value)
+    recv_buffer_write(value)
+    xmit_buffer_length() -> (length) {
+    xmit_buffer_read() -> (empty, value)
+    xmit_buffer_write(value)
+    (Called when data is ready to be transmitted after baud cycle)
+    transmit.soon()
+
+    Optional Methods
+    (If this returns true, the 'Char Timeout' interrupt can happen.
+     Default: always return false)
+    method ct_int_enabled() -> (bool enabled)
+    (If you return true here, incoming data will be throttled.)
+    method should_throttle() -> (bool throttle)
+    (Will write to recv buffer by default, old hook for recorder.)
+    method before_receive(int value)
+    (Called during post_init, defaults to nothing.)
+    method uart_post_init()
+    (Called after an interrupt reevaluation.)
+    uart_after_int_reevaluate()
+    (Returns the top 4 bits of iir, defaults to zero)
+    method get_iir_top4() -> (value)
+
+    Interrupts:
+    All interrupts except modem status is expected to be handled
+    from outside. To control an internal interrupt simply use
+    $dev_bank.ii.xyz.put(1|0)
+*/
+
+dml 1.2;
+
+parameter documentation =
+"UART (Universal Asynchronous Receiver Transmitter) is a popular method " +
+"of serial asynchronous communication. Typically, the UART is connected " +
+"between a processor and a peripheral. To the processor, the UART appears " +
+"as an 8-bit read-write parallel port that performs serial-to-parallel " +
+"conversions for the processor, and vice versa for the peripheral.";
+
+// Standard imports.
+
+import "utility.dml";
+import "io-memory.dml";
+import "simics/devs/interrupt.dml";
+import "simics/devs/signal.dml";
+import "simics/devs/serial-device.dml";
+
+connect console  "Console or device connected to the serial port.";
+
+attribute irq_high  "Tracking the interrupt state.";
+attribute irq_level "The level at which interrupts are sent.";
+connect irq_dev     "The device that interrupts are sent to.";
+
+attribute xmit_time "Time delay between each character output in ns.";
+attribute interrupt_mask_out2 {
+    parameter documentation = "If set to non-zero, then the OUT2 pin is "
+                            + "used to mask the output interrupt pin, "
+                            + "meaning that no interrupt will be raised "
+                            + "unless OUT2 is high.";
+}
+attribute receive_throttled {
+    parameter documentation = "True when the incoming data is throttled "
+                            + "because it handles overruns safely "
+                            + "rather than strict.";
+}
+
+attribute receive_ready_waiting {
+    parameter documentation = "True when data has started to drop because "
+                            + "the connected device returned that it couldn't "
+                            + "receive the data during last write cycle.";
+}
+
+attribute initiator {
+    parameter type = "o|n";
+    data conf_object_t *obj;
+    parameter internal = true;
+    
+    method get() -> (attr_value_t value) {
+        if (!$obj || SIM_marked_for_deletion($obj))
+            value = SIM_make_attr_nil();
+        else
+            value = SIM_make_attr_object($obj);
+    }
+    method set(attr_value_t value) {
+        $obj = SIM_attr_object_or_nil(value);
+    }
+}
+
+attribute use_fixed_queue {
+    parameter allocate_type = "bool";
+    parameter documentation = ("Always use fixed queue for events,"
+                               + " instead of last initiator.");
+    method after_set() {
+        if (!SIM_is_restoring_state($dev.obj) && $use_fixed_queue) {
+            $initiator.obj = SIM_object_clock($dev.obj);    
+        }
+    }
+}
+
+method init() {
+    $xmit_time = 1000;
+    $receive_throttled = false;
+    $use_fixed_queue = true;
+    inline $uart_init();
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state($dev.obj)) {
+        // Some register values depend on whether 'console' is set. These
+        // register values may in theory trigger an interrupt.
+        if ($irq_dev.obj)
+            SIM_require_object($irq_dev.obj);
+        call $dev_bank.msr.update_and_interrupt();
+        if (!$initiator.obj)
+            $initiator.obj = SIM_object_clock($dev.obj);
+    }
+    inline $uart_post_init();
+}
+
+method uart_init() default {
+    // Do nothing.
+}
+
+method uart_post_init() default {
+    // Do nothing.
+}
+
+method hard_reset() {
+    call $dev_bank.hard_reset();
+    call $dev_bank.ii.reevaluate();
+}
+
+method soft_reset() {
+    call $dev_bank.soft_reset();
+    call $dev_bank.ii.reevaluate();
+}
+
+constant IID_CT = 6; // Char Timeout - supported
+constant IID_MS = 0; // Modem Status - supported
+constant IID_TE = 1; // Transmitter Empty - supported
+constant IID_RS = 3; // Receiver Status - unsupported (reception is safe)
+constant IID_RD = 2; // Receiver Data - supported
+
+// Using a non-mapped internal register for internal interrupt
+// handling, because it is well structured and checkpoint compatible.
+template uart_bank {
+    parameter iir_offset;
+
+    parameter overlapping = true;
+
+    register rtb     size 1 "Receive/Transmit Buffer Register" {
+        parameter offset default undefined;
+    }
+    register ier     size 1 "Interrupt Enable Register" {
+        parameter offset default undefined;
+    }
+
+    register drl     size 1 "Divisor Register LSB" {
+        parameter offset default undefined;
+    }
+    register drm     size 1 "Divisor Register MSB" {
+        parameter offset default undefined;
+    }
+
+    register rtb_drl size 1
+        "Pseudo register, relaying to RTB or DRL, depending on LCR.DRAB" {
+        parameter offset default 0x0000;
+    }
+    register ier_drm size 1
+        "Pseudo register, relaying to IER or DRM, depending on LCR.DRAB" {
+        parameter offset default 0x0001;
+    }
+
+    register iir     size 1 @ $iir_offset "Interrupt ID Register";
+    register lcr     size 1   "Line Control Register" {
+        parameter offset default 0x0003;
+    }
+    register mcr     size 1   "Modem Control Register" {
+        parameter offset default 0x0004;
+    }
+    register lsr     size 1   "Line Status Register" {
+        parameter offset default 0x0005;
+    }
+    register msr     size 1   "Modem Status Register" {
+        parameter offset default 0x0006;
+    }
+    register scr     size 1   "Scratch Register" {
+        parameter offset default 0x0007;
+    }
+
+    register ii size 1  "Internal Interrupts Flagging" {
+        parameter offset default undefined;
+    }
+
+    register ii {
+        field ms[4] is (updates_int) "Modem Status";
+        // Characters send via serial_device are never dropped or
+        // distorted, so this is typically zero. The only exception is
+        // loopback mode, where unbalanced reads/writes can force FIFO
+        // overruns.
+        field rs[3] is (updates_int) "Receiver Status";
+        field rd[2] is (updates_int) "Receiver Data";
+        field ct[1] is (updates_int) "Char Timeout";
+        field te[0] is (updates_int) "Transmitter Empty";
+        method reevaluate()
+        {
+            local bool isirq = true;
+            local bool enable_ct_int;
+            inline $ct_int_enabled() -> (enable_ct_int);
+            log info, 4: "INT: Re-evaluating...";
+            if ($ii.rs == 1 && $ier.erlsi == 1) {
+                $dev_bank.iir.iid = IID_RS;
+                log info, 4: "INT: 'Receiver Status' selected.";
+            } else if ($ii.rd == 1 && $ier.erdaiti == 1) {
+                $dev_bank.iir.iid = IID_RD;
+                log info, 4: "INT: 'Receiver Data' selected.";
+            } else if (enable_ct_int && $ii.ct == 1 && $ier.erdaiti == 1) {
+                $dev_bank.iir.iid = IID_CT;
+                log info, 4: "INT: 'Char Timeout' selected.";
+            } else if ($ii.te == 1 && $ier.etbei == 1) {
+                $dev_bank.iir.iid = IID_TE;
+                log info, 4: "INT: 'Transmitter Empty' selected.";
+            } else if ($ii.ms == 1 && $ier.emsi == 1) {
+                $dev_bank.iir.iid = IID_MS;
+                log info, 4: "INT: 'Modem Status' selected.";
+            } else {
+                $dev_bank.iir.iid = 0;
+                isirq = false;
+                log info, 4: "INT: Nothing selected.";
+            }
+            $dev_bank.iir.ipal = isirq ? 0 : 1;
+            if ($irq_dev.obj) {
+                if ($interrupt_mask_out2 != 0 && $mcr.out2 == 0) {
+                    if ($irq_high) {
+                        call $irq_dev.lower();
+                        $irq_high = false;
+                        log info, 3: "INT: Interrupt state masked!";
+                    }
+                } else if (isirq != $irq_high) {
+                    if (!isirq) {
+                        call $irq_dev.lower();
+                        $irq_high = false;
+                        log info, 3: "INT: Interrupt state cleared!";
+                    } else if (isirq) {
+                        call $irq_dev.raise();
+                        $irq_high = true;
+                        log info, 3: "INT: Interrupt state raised!";
+                    }
+                }
+            }
+            inline $uart_after_int_reevaluate();
+        }
+    }
+
+    register rtb is (read_write, noalloc) {
+        parameter configuration = "none";
+        method read() -> (value) {
+            local bool empty;
+            inline $recv_buffer_read() -> (empty, value);
+        }
+        method write(value) {
+            inline $xmit_buffer_write(value);
+        }
+    }
+
+    register drl is (read_write, not_soft_reset, reset_to_0);
+    register drm is (read_write, not_soft_reset, reset_to_0);
+
+    register rtb_drl is (noalloc) {
+        parameter configuration = "none";
+        method read_access(memop, msb1, lsb) -> (value)
+        {
+            if ($lcr.drab == 0)
+                inline $rtb.read_access(memop, msb1, lsb) -> (value);
+            else
+                inline $drl.read_access(memop, msb1, lsb) -> (value);
+        }
+        method write_access(memop, msb1, lsb, value)
+        {
+            if ($lcr.drab == 0)
+                inline $rtb.write_access(memop, msb1, lsb, value);
+            else
+                inline $drl.write_access(memop, msb1, lsb, value);
+        }
+    }
+
+    register ier_drm is (noalloc) {
+        parameter configuration = "none";
+        method read_access(memop, msb1, lsb) -> (value)
+        {
+            if ($lcr.drab == 0)
+                inline $ier.read_access(memop, msb1, lsb) -> (value);
+            else
+                inline $drm.read_access(memop, msb1, lsb) -> (value);
+        }
+        method write_access(memop, msb1, lsb, value)
+        {
+            if ($lcr.drab == 0)
+                inline $ier.write_access(memop, msb1, lsb, value);
+            else
+                inline $drm.write_access(memop, msb1, lsb, value);
+        }
+    }
+
+    register ier is (read_write, reset_to_0) {
+        field res[7:4] is (silent_constant) "Reserved, always zero" {
+            parameter value = 0;
+        }
+        field emsi[3] is (read_write) "Enable Modem Status Interrupt";
+        field erlsi[2] is (read_write) "Enable Receive Line Status Interrupt";
+        field etbei[1] is (read_write)
+            "Enable Transmit Buffer Empty Interrupt";
+        field erdaiti[0] is (read_write)
+            "Enable Receive Data Available Interrupt and Timeout Interrupt";
+        method after_write(memop)
+        {
+            local int len;
+            inline $xmit_buffer_length() -> (len);
+            log info, 4: "INT: IER was written, xmit_len: %d", len;
+            if (len == 0)
+                inline $dev_bank.ii.te.put(1);
+        }
+    }
+
+    register iir is (reset_to_0) {
+        field fi[7:4] is (read_only) "IIR top 4 bits." {
+            method read() -> (value) {
+                inline $get_iir_top4() -> (value);
+            }
+        }
+        field iid[3:1] is (read_only) "Interrupt ID";
+        field ipal[0] is (read_only) "Interrupt Pending, Active Low";
+
+        method after_read(unused_arg)
+        {
+            if ($iid == IID_TE) {
+                log info, 4: "INT: IIR read, TE_INT reset.";
+                inline $dev_bank.ii.te.put(0);
+            }
+        }
+    }
+    if (defined($iir_offset)) {
+        register iir {
+            is read_only;
+        }
+    }
+
+    register lcr is (read_write, reset_to_0) {
+        field drab[7] is (read_write) "Divisor registers access bit";
+        field bc[6] is (read_write) "Break condition" {
+            method write(value)
+            {
+                $this = value;
+                if (value == 0)
+                    call $transmit.soon();
+            }
+        }
+        field sp[5] is (read_write) "Stick parity";
+        field ep[4] is (read_write) "Even parity";
+        field pe[3] is (read_write) "Parity enable";
+        field sb[2] is (read_write) "Stop bits";
+        field cl[1:0] is (read_write) "Character length";
+        method before_write(memop, msb1, lsb, value) {
+            if (!$use_fixed_queue)
+                $initiator.obj = SIM_get_mem_op_initiator(memop);
+        }
+    }
+    register lsr is (noalloc) {
+        parameter configuration = "pseudo";
+        // This register is mostly unused since it indicates serial data
+        // errors (from noise etc) that never occur in simulation.
+
+        field ef[7] is (read_only, read_constant) "Error flag" {
+            parameter value = 0;
+        }
+        field tef[6] is (read_only, noalloc) "Transmitter empty flag" {
+            method get() -> (value) {
+                local int len;
+                inline $xmit_buffer_length() -> (len);
+                value = (len == 0);
+            }
+            method read() -> (value) {
+                inline $get() -> (value);
+            }
+        }
+        field tbef[5] is (read_only, noalloc) "Transmit buffer empty flag" {
+            method get() -> (value)
+            {
+                local int len;
+                inline $xmit_buffer_length() -> (len);
+                value = (len == 0);
+            }
+            method read() -> (value) {
+                inline $get() -> (value);
+            }
+        }
+        field bi[4] is (zeros) "Break indication";
+        field fe[3] is (zeros) "Framing error";
+        field pe[2] is (zeros) "Parity error";
+        field oe[1] is (read_only, noalloc) "Overrun error" {
+            method get() -> (value) {
+                value = $ii.rs;
+            }
+            method read() -> (value) {
+                inline $get() -> (value);
+            }
+        }
+        field rdr[0] is (read_only, noalloc) "Receiver data ready" {
+            method get() -> (value)
+            {
+                local int len;
+                inline $recv_buffer_length() -> (len);
+                value = (len > 0);
+            }
+            method read() -> (value) {
+                inline $get() -> (value);
+            }
+        }
+
+        method after_read(memop) {
+            inline $dev_bank.ii.rs.put(0);
+        }
+    }
+    register mcr is (read_write) {
+        field res[7:5] is (silent_constant) "Constant, model signature" {
+            parameter value = 0;
+        }
+        field loop[4] is (read_write, updates_msr) "Loopback bit";
+        field out2[3] is (read_write, updates_msr) "Out 2";
+        field out1[2] is (read_write, updates_msr) "Out 1";
+        field rts[1] is (read_write, updates_msr) "Request to Send";
+        field dtr[0] is (read_write, updates_msr) "Data Terminal Ready";
+        method hard_reset() {
+            inline $set(0);
+            call $msr.update;
+        }
+        method soft_reset() {
+            inline $hard_reset();
+        }
+        method update_msr_state(field_name) default {
+            call $dev_bank.msr.update_and_interrupt;
+        }
+    }
+    register msr is (read_only) {
+        method update default
+        {
+            // The top bits in the MSR are controlled by the MCR if
+            // loopback is enabled. If not, they indicate if the device
+            // at the other end is connected and ready to receive data.
+            if ($mcr.loop == 1) {
+                inline $cts.put($mcr.rts);
+                inline $dsr.put($mcr.dtr);
+                inline $ri.put($mcr.out1);
+                inline $dcd.put($mcr.out2);
+                log info, 3: "MSR: DEV ignored, loopbacked by MCR.";
+            } else if ($console.obj) {
+                local int rdy = $receive_ready_waiting ? 0 : 1;
+                inline $cts.put(rdy);
+                inline $dsr.put(rdy);
+                inline $ri.put(0);
+                inline $dcd.put(rdy);
+                if (rdy == 1) {
+                    log info, 3: "MSR: DEV is set. Clear to send.";
+                } else {
+                    log info, 3: "MSR: DEV is not receive ready.";
+                }
+            } else {
+                inline $cts.put(0);
+                inline $dsr.put(0);
+                inline $ri.put(0);
+                inline $dcd.put(0);
+                log info, 3: "MSR: DEV is disconnected.";
+            }
+        }
+
+        method update_and_interrupt() default {
+            call $update;
+            call $dev_bank.ii.reevaluate;
+        }
+
+        field dcd[7] is (read_only) {
+            method put(value)
+            {
+                if (value != $this) {
+                    $this = value;
+                    $ddcd = 1;
+                    $dev_bank.ii.ms = 1;
+                }
+            }
+        }
+        field ri[6] is (read_only) {
+            method put(value)
+            {
+                if (value == 1 && $this == 0) {
+                    $teri = 1;
+                    $dev_bank.ii.ms = 1;
+                }
+                $this = value;
+            }
+        }
+        field dsr[5] is (read_only) {
+            method put(value)
+            {
+                if (value != $this) {
+                    $this = value;
+                    $ddsr = 1;
+                    $dev_bank.ii.ms = 1;
+                }
+            }
+        }
+        field cts[4] is (read_only) {
+            method put(value)
+            {
+                if (value != $this) {
+                    $this = value;
+                    $dcts = 1;
+                    $dev_bank.ii.ms = 1;
+                }
+            }
+        }
+        field ddcd[3] is (read_only);
+        field teri[2] is (read_only);
+        field ddsr[1] is (read_only);
+        field dcts[0] is (read_only);
+        method hard_reset() {
+            $ddcd = $teri = $ddsr = $dcts = 0;
+        }
+        method soft_reset() {
+            inline $hard_reset();
+        }
+        method after_read(memop)
+        {
+            call $hard_reset();
+            inline $dev_bank.ii.ms.put(0);
+        }
+    }
+    register scr is (scratch, not_soft_reset, reset_to_0);
+}
+
+method uart_after_int_reevaluate() default {
+    // Do nothing.
+}
+
+method get_iir_top4() -> (value) default {
+    value = 0;
+}
+
+attribute irq_high {
+    parameter allocate_type = "bool";
+}
+
+connect irq_dev {
+    method raise() {
+        if ($simple_interrupt) {
+            $simple_interrupt.interrupt($irq_level);
+        } else if ($signal) {
+            $signal.signal_raise();
+        }
+    }
+
+    method lower() {
+        if ($simple_interrupt) {
+            $simple_interrupt.interrupt_clear($irq_level);
+        } else if ($signal) {
+            $signal.signal_lower();
+        }
+    }
+
+    interface simple_interrupt {
+        parameter required = false;
+    }
+    interface signal {
+        parameter required = false;
+    }
+    method after_set() {
+        if ($obj != NULL && !$simple_interrupt && !$signal)
+            log error:
+                "setting attribute irq_dev: object %s neither implements the simple_interrupt nor the signal interface",
+                SIM_object_name($obj);
+    }
+}
+
+attribute irq_level {
+    parameter allocate_type = "int64";
+    is optional;
+}
+
+attribute interrupt_mask_out2 {
+    parameter allocate_type = "uint32";
+    is optional;
+}
+
+attribute receive_throttled {
+    parameter allocate_type = "bool";
+}
+
+attribute receive_ready_waiting {
+    parameter allocate_type = "bool";
+}
+
+connect console {
+    interface serial_device;
+    is optional;
+
+    method after_set {
+        if (SIM_object_is_configured($dev.obj)
+            && !SIM_is_restoring_state($dev.obj)) {
+            call $dev_bank.msr.update_and_interrupt();
+        }
+    }
+}
+
+implement serial_device {
+    method write(int value) -> (int success)
+    {
+        if ($dev_bank.mcr.loop == 0) {
+            local bool throttle;
+            inline $should_throttle() -> (throttle);
+            if (!throttle) {
+                local uint8 mask;
+                log info, 4: "RECV: Incoming serial data: %#x.", value;
+                mask = (0x20 << $regs.lcr.cl) - 1;
+                log info, 4: "RECV: Masking data with %#x.", mask;
+                value &= mask;
+                inline $before_receive(value);
+            } else {
+                $receive_throttled = true;
+                success = 0;
+                log info, 3: "RECV: Fifo is full, refusing incoming data.";
+                return;
+            }
+        } else {
+            log info, 3: "RECV: Data dropped: Loopback Mode.";
+        }
+        success = 1;
+    }
+    method receive_ready()
+    {
+        call $transmit.soon();
+        $receive_ready_waiting = false;
+        call $dev_bank.msr.update_and_interrupt;
+    }
+}
+
+method ct_int_enabled() -> (bool enabled) default {
+    enabled = false;
+}
+
+method should_throttle() -> (bool throttle) default {
+    throttle = false;
+}
+
+method before_receive(int value) default {
+    inline $recv_buffer_write(value);
+}
+
+event transmit {
+    parameter timebase = "seconds";
+    
+    method is_posted() -> (bool wasposted) {
+        wasposted = $initiator.obj != NULL
+            ? SIM_event_find_next_time($initiator.obj, $transmit.evclass,
+                                       $dev.obj, NULL, NULL) != - 1
+            : false;
+    }
+
+    method post_time(double seconds) {
+        // Take fixed queue if last memory transaction had no initiator
+        if (!$initiator.obj)
+            $initiator.obj = SIM_object_clock($dev.obj);
+        log info, 4: "Using %s as transmit event queue",
+            SIM_object_name($initiator.obj);
+        SIM_event_post_time(
+            $initiator.obj, $transmit.evclass, $dev.obj, seconds, NULL);
+    }
+    
+    method soon()
+    {
+        // Block posting transmit event if break condition is set.
+        if ($dev_bank.lcr.bc == 0) {
+            local bool wasposted;
+            inline $transmit.is_posted() -> (wasposted);
+            if (!wasposted) {
+                local float swait;
+                inline $xmit_time.in_seconds() -> (swait);
+                inline $transmit.post_time(swait);
+                log info, 4:
+                    "XMIT: Data will transmit in one baud cycle (%f ms)",
+                    swait * 1000;
+            }
+        } else {
+            log info, 4: "XMIT: Transmit halted by break condition.";
+        }
+    }
+    method event(nodata)
+    {
+        local uint8 idata;
+        local uint8 mask;
+        local uint32 length;
+        local bool empty;
+        local int wasready = 1;
+        inline $xmit_buffer_read() -> (empty, idata);
+        if (empty) return;
+        // Losing data if character length is set lower than 8 bit/frame.
+        mask = ((0x1E << $dev_bank.lcr.cl) | 0x0F);
+        idata &= mask;
+        if ($dev_bank.mcr.loop == 1) {
+            // When loopback is enabled, instantly transmitting to myself.
+            inline $recv_buffer_write(idata);
+            log info, 3: "XMIT: Data '%#x' sent to loopback.", idata;
+        } else if ($console.obj) {
+            wasready = $console.serial_device.write(idata);
+            log info, 3: "XMIT: Data '%#x' sent to console.", idata;
+        } else {
+            log info, 3:
+            "XMIT: Data '%#x' dropped. No serial device connected.", idata;
+            wasready = 1;
+        }
+        if (wasready == 0) {
+            $receive_ready_waiting = true;
+            call $dev_bank.msr.update_and_interrupt;
+            log info, 3:
+            "XMIT: Device replied not ready. Data '%#x' dropped.", idata;
+            return;
+        } else {
+            $receive_ready_waiting = false;
+            call $dev_bank.msr.update_and_interrupt;
+        }
+        inline $xmit_buffer_length() -> (length);
+        if (length > 0)
+            call $transmit.soon();
+    }
+}
+
+attribute xmit_time {
+    parameter allocate_type = "uint64";
+    method in_seconds() -> (float value) {
+        value = $this / 1000000000.0;
+    }
+}
+
+template updates_msr {
+    method write(value)
+    {
+        if (value != $this) {
+            $this = value;
+            inline $dev_bank.mcr.update_msr_state($name);
+        }
+    }
+}
+template updates_int {
+    method put(value) {
+        $this = value;
+        call $dev_bank.ii.reevaluate();
+    }
+}
+template reset_to_0 {
+    parameter hard_reset_value = 0x00;
+}
+template not_soft_reset {
+    method soft_reset() {
+        return;
+    }
+}
+template optional {
+    parameter configuration = "optional";
+}
+template required {
+    parameter configuration = "required";
+}
+

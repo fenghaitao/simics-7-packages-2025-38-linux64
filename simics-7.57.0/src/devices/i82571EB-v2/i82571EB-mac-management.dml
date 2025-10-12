@@ -1,0 +1,51 @@
+/*
+  i82571EB-mac-management.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+/*
+ * NOTE: Wakeup control/filter is unimplemented.
+ */
+
+bank csr {
+    register ipav       @ 0x05838 "IP Address Valid";
+    register ip4at[i < 4]   @ 0x05840 + i * 8 "IPv4 Address Table";
+    register ip6at[i < 4]   @ 0x05880 + i * 4 "IPv6 Address Table";
+    register wupl       @ 0x05900 "Wakeup Packet Length";
+    register wupm[i < 32]   @ 0x05a00 + i * 4 "Wakeup Packet Memory";
+    register fflt[i < 4]    @ 0x05f00 + i * 8 "Flexible Filter Length Table";
+    register ffmt[i < 128]  @ 0x09000 + i * 8 "Flexible Filter Mask Table";
+    register ffvt[i < 128]  @ 0x09800 + i * 8 "Flexible Filter Value Table";
+
+    register pb_ecc     @ 0x01100 "Packet Buffer ECC";
+
+
+    register ipav {
+        field v40 @ [3:0] is (unimpl) "IPv4 Address 0~3 Valid";
+        // reserved[15:4]
+        field v60 @ [16]  is (unimpl) "IPv6 Address Valid";
+        // reserved[31:17]
+    }
+    register ip4at[i < 4] is (unimpl);
+    register ip6at[i < 4] is (unimpl);
+    register wupl is (unimpl);
+    register wupm[i < 32] is (unimpl);
+
+    register fflt[i < 4] is (unimpl);
+    register ffmt[i < 128] is (unimpl);
+    register ffvt[i < 128] is (unimpl);
+
+    register pb_ecc is (unimpl);
+}

@@ -1,0 +1,195 @@
+/*
+  sample-interrupt-device.dml - sample DML code for a Simics interrupt device
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device sample_interrupt_device;
+parameter desc = "sample interrupt device";
+parameter documentation = "Sample interrupt device.";
+
+import "simics/devs/signal.dml";
+
+typedef struct {
+    bool   high;  // current status of this interrupt set
+    uint32 mask;  // interrupts enabling mask
+    uint32 intr;  // interrupts status
+    uint32 isrd;  // interrupts disabling mask
+} interrupt_state_t;
+
+data interrupt_state_t states[NUM_INTERRUPT_SETS];
+
+constant INTERRUPT_SET_0    = 0;
+constant NUM_INTERRUPT_SETS = 1;
+
+connect irq_dev {
+    parameter documentation = "The interrupt destination.";
+    parameter configuration = "required";
+    interface signal {
+        parameter required = true;
+    }
+
+    method raise() {
+        log info, 3: "raising interrupt signal";
+        $irq_dev.signal.signal_raise();
+    }
+
+    method lower() {
+        log info, 3: "lowering interrupt signal";
+        $irq_dev.signal.signal_lower();
+    }
+}
+
+port generate_interrupt[32] {
+    implement signal {
+        method signal_raise() {
+            inline $regs.cause.set_interrupt_bits(1 << $i);
+        }
+        method signal_lower() {
+        }
+    }
+}
+
+bank regs {
+    parameter register_size = 4;
+    register cause @ 0x0 {
+        is interrupt_write_1_clears;
+        parameter interrupt_id = INTERRUPT_SET_0;
+    }
+    register mask @ 0x4 {
+        is level_interrupt_mask;
+        parameter interrupt_id = INTERRUPT_SET_0;
+    }
+}
+
+attribute interrupt_state {
+    parameter documentation = "The interrupt state";
+    parameter type = "[[biii]*]";
+    method get() -> (val) {
+        local int i;
+        val = SIM_alloc_attr_list(NUM_INTERRUPT_SETS);
+        for (i = 0; i < NUM_INTERRUPT_SETS; i++) {
+            SIM_attr_list_set_item(
+                &val, i,
+                SIM_make_attr_list(
+                    4,
+                    SIM_make_attr_boolean($states[i].high),
+                    SIM_make_attr_uint64($states[i].mask),
+                    SIM_make_attr_uint64($states[i].intr),
+                    SIM_make_attr_uint64($states[i].isrd)));
+        }
+    }
+
+    method set(val) {
+        local int items = SIM_attr_list_size(val);
+        if (items <= 0)
+            return;
+
+        local int i;
+        for (i = 0; i < items && i < NUM_INTERRUPT_SETS; i++) {
+            local attr_value_t elem = SIM_attr_list_item(val, i);
+            $states[i].high = SIM_attr_boolean(SIM_attr_list_item(elem, 0));
+            $states[i].mask = SIM_attr_integer(SIM_attr_list_item(elem, 1));
+            $states[i].intr = SIM_attr_integer(SIM_attr_list_item(elem, 2));
+            $states[i].isrd = SIM_attr_integer(SIM_attr_list_item(elem, 3));
+        }
+    }
+
+    method update_interrupts(int id) {
+        local uint32 res = $states[id].intr & $states[id].mask;
+        log info, 3: "update interrupts intr 0x%x, mask 0x%x",
+            $states[id].intr, $states[id].mask;
+        if (res != 0 && !$states[id].high) {
+            call $irq_dev.raise();
+            $states[id].high = true;
+        } else if (res == 0 && $states[id].high) {
+            call $irq_dev.lower();
+            $states[id].high = false;
+        }
+    }
+
+    method set_interrupt_mask(int id, uint32 val, bool update) {
+        if (id > NUM_INTERRUPT_SETS) {
+            log error: "interrupt state not setup correctly";
+            return;
+        }
+        $states[id].mask = val;
+        if (update)
+            inline $update_interrupts(id);
+    }
+
+    method set_interrupt(int id, uint32 val, bool update, bool force) {
+        if (id > NUM_INTERRUPT_SETS) {
+            log error: "interrupt state not setup correctly";
+            return;
+        }
+        if (!force)
+            val &= ~$states[id].isrd;
+
+        $states[id].intr = val;
+        if (update)
+            inline $update_interrupts(id);
+    }
+
+    method init_register_sets() {
+        local int i;
+        for (i = 0; i < NUM_INTERRUPT_SETS; i++) {
+            memset(&$states[i], 0, sizeoftype(interrupt_state_t));
+        }
+    }
+}
+
+
+method init() {
+    inline $interrupt_state.init_register_sets();
+}
+
+template interrupt_write_1_clears {
+    parameter interrupt_id default undefined;
+
+    method after_set() {
+        inline $interrupt_state.set_interrupt($interrupt_id,
+                                              $this, false, true);
+    }
+
+    method set_interrupt_bits(value) {
+        $this |= value;
+        inline $interrupt_state.set_interrupt($interrupt_id,
+                                              $this, true, true);
+    }
+
+    method write(value) {
+        if (($this & ~value) != $this) {
+            $this &= ~value;
+            inline $interrupt_state.set_interrupt($interrupt_id,
+                                                  $this, true, true);
+        }
+    }
+}
+
+template level_interrupt_mask {
+    parameter interrupt_id default undefined;
+
+    method write(value) {
+        if ($this != value) {
+            $this = value;
+            inline $interrupt_state.set_interrupt_mask($interrupt_id,
+                                                       $this, true);
+        }
+    }
+
+    method after_set() {
+        inline $interrupt_state.set_interrupt_mask($interrupt_id,
+                                                   $this, false);
+    }
+}

@@ -1,0 +1,21 @@
+ICH10 8254 Timer Test Description
+=================================
+
+Included Cases
+--------------
+The ICH10 8254 timer test totally includes 9 cases:
+(1) s-8254-reset.py: tests default states of 8254 timer
+(2) s-8254-latch-cmd.py: tests the latch command of 8254 timer
+(3) s-8254-read-back-cmd.py: tests the read back command of 8254 timer
+(4) s-8254-mode-0.py: tests mode 0 triggering of 8254 timer
+(5) s-8254-mode-1.py: tests mode 1 triggering of 8254 timer
+(6) s-8254-mode-2.py: tests mode 2 triggering of 8254 timer
+(7) s-8254-mode-3.py: tests mode 3 triggering of 8254 timer
+(8) s-8254-mode-4-5.py: tests mode 4 and 5 triggering of 8254 timer
+(9) s-8254-bcd.py: tests the BCD coded command of 8254 timer
+
+
+
+Not Tested Features
+-------------------
+None 

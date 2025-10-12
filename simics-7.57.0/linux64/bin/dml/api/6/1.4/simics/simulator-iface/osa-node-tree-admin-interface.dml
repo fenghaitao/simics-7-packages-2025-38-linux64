@@ -1,0 +1,22 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/simulator-iface/osa-node-tree-admin-interface.h>
+%}
+
+import "simics/device-api.dml";
+
+extern typedef struct { transaction_id_t (*begin)(conf_object_t *obj, conf_object_t *initiator); void (*end)(conf_object_t *obj, transaction_id_t transaction_id); node_id_t (*create)(conf_object_t *obj, conf_object_t *mapper, attr_value_t props); node_id_t (*add)(conf_object_t *obj, node_id_t parent_id, attr_value_t props); void (*update)(conf_object_t *obj, node_id_t node_id, attr_value_t props); void (*remove)(conf_object_t *obj, node_id_t node_id); void (*event)(conf_object_t *obj, node_id_t node_id, char const *event_name, attr_value_t event_data); void (*activate)(conf_object_t *obj, node_id_t node_id, conf_object_t *cpu); void (*deactivate)(conf_object_t *obj, node_id_t node_id, conf_object_t *cpu); cancel_id_t (*register_formatter)(conf_object_t *obj, node_id_t node_id, char const *key, bool recursive, attr_value_t (*formatter)(attr_value_t val)); void (*unregister_formatter)(conf_object_t *obj, cancel_id_t node_id); void (*reset)(conf_object_t *obj, node_id_t node_id, attr_value_t props); void (*set_property)(conf_object_t *obj, node_id_t node_id, char const *key, attr_value_t value); } osa_node_tree_admin_interface_t;

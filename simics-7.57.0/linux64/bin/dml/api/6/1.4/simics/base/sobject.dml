@@ -1,0 +1,27 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/base/sobject.h>
+%}
+
+import "simics/host-info.dml";
+
+extern sclass_t *sobject_class(sobject_t const *sobj);
+extern struct { } *sobject_props(sobject_t const *sobj);
+extern typedef struct { sclass_t *isa; struct { } *props; } sobject_t;
+extern typedef struct { } sclass_t;
+extern typedef struct { } interface_type_t;
+extern typedef interface_type_t *interface_key_t;

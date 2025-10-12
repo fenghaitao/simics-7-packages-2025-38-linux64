@@ -1,0 +1,30 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/devs/i3c.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/pywrap.dml";
+
+extern typedef int i3c_ack_t;
+constant I3C_ack = 0;
+constant I3C_noack = 1;
+extern typedef struct { void (*acknowledge)(conf_object_t *obj, i3c_ack_t ack); void (*read_response)(conf_object_t *obj, uint8 value, bool more); void (*daa_response)(conf_object_t *obj, uint64 id, uint8 bcr, uint8 dcr); void (*ibi_request)(conf_object_t *obj); void (*ibi_address)(conf_object_t *obj, uint8 address); } i3c_master_interface_t;
+extern typedef struct { void (*start)(conf_object_t *obj, uint8 address); void (*write)(conf_object_t *obj, uint8 value); void (*sdr_write)(conf_object_t *obj, bytes_t data); void (*read)(conf_object_t *obj); void (*daa_read)(conf_object_t *obj); void (*stop)(conf_object_t *obj); void (*ibi_start)(conf_object_t *obj); void (*ibi_acknowledge)(conf_object_t *obj, i3c_ack_t ack); } i3c_slave_interface_t;
+extern typedef struct { void (*assigned_address)(conf_object_t *obj, uint64 id, uint8 bcr, uint8 dcr, uint8 address); } i3c_daa_snoop_interface_t;
+extern typedef struct { void (*hdr_write)(conf_object_t *obj, bytes_t data); void (*hdr_read)(conf_object_t *obj, uint32 max_len); void (*hdr_restart)(conf_object_t *obj); void (*hdr_exit)(conf_object_t *obj); } i3c_hdr_slave_interface_t;
+extern typedef struct { void (*hdr_read_response)(conf_object_t *obj, bytes_t bytes, bool more); void (*hdr_acknowledge)(conf_object_t *obj, i3c_ack_t ack); } i3c_hdr_master_interface_t;

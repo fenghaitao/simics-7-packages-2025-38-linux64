@@ -1,0 +1,9 @@
+These tests are not to be run directly. They are referenced from the individual
+test suites for each NIC. See for example i210/test/s-lan-rx-single-queue.py.
+
+scripts for testing calculation of Ethernet packages checksums:
+
+s-lan-rx-checksum-offloading.py
+s-lan-tx-checksum-offloading.py
+
+run from folder ../../ich10-lan-v2/test

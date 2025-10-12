@@ -1,0 +1,19 @@
+ICH10 SPI Test Description
+==========================
+
+Included Cases
+--------------
+The ICH10 SPI test totally includes 6 cases:
+(1) s-spi-reset.py: tests default states of SPI
+(2) s-spi-prog-access.py: tests accessing of SPI flash through programming SPI registers
+(3) s-spi-erase.py: tests the sector, bulk or chip erasing commands of SPI flash
+(4) s-spi-write.py: tests the writing of 1, 2, 3, or 4 bytes to SPI flash
+(5) s-spi-status-preop.py: tests misc FLASH commands such as WRSR, RDSR, DP, RES
+(6) s-spi-boot-access.py: tests accessing of SPI flash during the boot process
+
+
+
+Not Tested Features
+-------------------
+(1) Mapping GbE section to a memory space
+(2) Initialization of GbE or BIOS section registers from flash header during boot

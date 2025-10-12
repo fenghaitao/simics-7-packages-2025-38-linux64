@@ -1,0 +1,35 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "pcie/common.dml";
+import "pcie/bridge.dml";
+
+template x58_config {
+    param pcie_version = 2.0;
+    register vendor_id { param init_val = 0x8086; }
+    register revision_id { param init_val default 0x13; }
+    register device_id is hwinit {
+        method hard_reset() {
+            /* do nothing */
+        }
+    }
+}
+
+template x58_ep_config is (x58_config, type_0_bank) {
+    register class_code {
+        field base_class_code { param init_val default 8; }
+    }
+}

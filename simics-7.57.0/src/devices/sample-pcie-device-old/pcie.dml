@@ -1,0 +1,100 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device sample_pcie_device_old;
+parameter desc = "sample PCIe device";
+parameter documentation = "A sample PCI Express device";
+
+import "pci/common.dml";
+is pcie_device;
+
+/* Internal integer values for the state, converted to strings when attributes
+   are get or set. */
+constant OFF = 0;     /* default value after object creation */
+constant BLINK = 1;
+constant ON = 2;
+
+/* This device supports hotplugging */
+parameter pci_hotplug = true;
+
+attribute attention_indicator {
+    parameter documentation = "This attribute represents the attention"
+        + " indicator, which software can program to be OFF/BLINK/ON";
+    parameter configuration = "optional";
+    is indicator_attribute;
+}
+
+attribute power_indicator {
+    parameter documentation = "This attribute represents the power indicator,"
+        + " which software can program to be OFF/BLINK/ON";
+    parameter configuration = "optional";
+    is indicator_attribute;
+}
+
+implement pci_express {
+    method send_message(conf_object_t *src, pcie_message_type_t type,
+                        byte_string_t payload) -> (int h) {
+        switch (type) {
+        case PCIE_HP_Power_Indicator_On:
+            log info, 2: "power indicator set to ON";
+            $power_indicator = ON;
+            break;
+
+        case PCIE_HP_Power_Indicator_Blink:
+            log info, 2: "power indicator set to BLINK";
+            $power_indicator = BLINK;
+            break;
+
+        case PCIE_HP_Power_Indicator_Off:
+            log info, 2: "power indicator set to OFF";
+            $power_indicator = OFF;
+            break;
+
+        case PCIE_HP_Attention_Indicator_On:
+            log info, 2: "attention indicator set to ON";
+            $attention_indicator = ON;
+            break;
+
+        case PCIE_HP_Attention_Indicator_Blink:
+            log info, 2: "attention indicator set to BLINK";
+            $attention_indicator = BLINK;
+            break;
+
+        case PCIE_HP_Attention_Indicator_Off:
+            log info, 2: "attention indicator set to OFF";
+            $attention_indicator = OFF;
+            break;
+
+        default:
+            log unimpl: "PCI Express message: %d", type;
+            break;
+        }
+
+        h = 0;
+    }
+}
+
+template indicator_attribute {
+    parameter allocate_type = "int";
+    parameter type = "s";
+    method get() -> (attr_value_t ret) {
+        ret = SIM_make_attr_string($this == BLINK ? "BLINK"
+                                   : $this == ON ? "ON" : "OFF");
+    }
+    method set(attr_value_t a) {
+        $this = strcmp(SIM_attr_string(a), "BLINK") == 0 ? BLINK
+            : strcmp(SIM_attr_string(a), "ON") == 0 ? ON : OFF;
+    }
+}

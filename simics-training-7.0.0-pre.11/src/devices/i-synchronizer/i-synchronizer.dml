@@ -1,0 +1,123 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i_synchronizer;
+
+param desc = "device to enable a synchronized start of SW";
+
+param documentation = "Contains a decrementer that signals an edge IRQ once it reaches zero.";
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+
+connect irq is signal_connect "IRQ signal." {
+    method edge_irq() {
+        signal.signal_raise();
+        signal.signal_lower();
+        // Signal a notifier that we release
+        // the connected devices, for the benefit of
+        // scripting. 
+        SIM_notify(dev.obj, release_notifier());
+    }
+}
+
+attribute irq_delay is uint64_attr {
+    param documentation = "Delay in cycles between decrementer hitting zero and the edge IRQ being triggered.";
+    param init_val = 1000;
+}
+
+/*
+ Automating the setting of the decrement counter to the correct value for a 
+ certain system setup.  This attribute is expected to be configured from 
+ the system setup code. 
+*/
+attribute num_sub_systems is uint64_attr {
+    param documentation = "Number of subsystems in the overall system. " +
+                          "Expected to be set from the system component " +
+                          "or other scripting when creating the system. " +
+                          "Apply reset on the device to set the decrement " +
+                          "counter to this value.";
+    param init_val = 0;
+}
+
+port reset "reset the device and the decrement counter" {
+    saved bool this_signal_is_raised = false;
+    implement signal {
+        method signal_raise() {
+            if(this_signal_is_raised) {
+                log spec_viol, 2 : "Reset signal raised while already raised, ignoring";
+            } else {
+                local uint64 n = num_sub_systems.val;
+                log info, 3 : "Reset signal raised, resetting device decrement counter (to %d)", n;
+                regs.decrementer_value.val = n;
+                this_signal_is_raised = true;
+            }
+        }
+        method signal_lower() {
+            if(!this_signal_is_raised) {
+                log spec_viol, 2 : "Reset signal lowered while already lowered, ignoring";
+            } else {
+                log info, 3 : "Reset signal lowered";
+                this_signal_is_raised = false;                
+            }
+        }
+    }
+
+}
+
+/*
+ We have to use an edge here, as we are signalling an "event" to different processors.
+ If we would level trigger that, we either clear it by the first receiver (which
+ would lower it before others can see it) or we clear it by the last (which could
+ lead to double triggers for earlier processors). Either approach is wrong.
+ So the idea is we broadcast an edge into the local domains, where they can
+ latch it into a local level triggered IRQ and process it without interfering
+ with others.
+*/
+bank regs {
+    register decrementer_value size 4 @ 0x0000 is (read, write) "Decrementer value";
+    register decrement         size 4 @ 0x0004 is (write) "Write to decrement" {
+        method write(uint64 value) {
+            if (decrementer_value.val > 0) {
+                decrementer_value.val -= 1;
+                if (decrementer_value.val == 0) {
+                    log info, 2 : "Decrementer reached zero. Raise IRQ.";
+                    // Break this out into its own method! 
+                    after irq_delay.val cycles: irq.edge_irq();
+                }
+            }
+        }
+    }
+}
+
+/*
+ Add a notifier to the device class so that a user can stop when the release
+ IRQ gets raised. 
+*/
+independent startup memoized method release_notifier() -> (notifier_type_t) {
+    // Runs at module load time to create the notifier
+    //
+    // All future calls to method will return the same value,
+    //   cached automatically in DML  
+    local notifier_type_t t = SIM_notifier_type("i-synchronizer-release");
+
+    SIM_register_notifier(SIM_get_class(dev.classname),
+                          t,
+                          "Triggered when the decrementer reaches zero " +
+                          "and the release interrupt is sent to the " +
+                          "connected processors.");
+
+    return t;
+}

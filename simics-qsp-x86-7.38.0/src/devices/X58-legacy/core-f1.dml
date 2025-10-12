@@ -1,0 +1,73 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device x58_core_f1_legacy;
+parameter classname = "x58-core-f1-legacy";
+
+parameter desc = "model of scratchpads and GPIO unit";
+parameter documentation = "Scratchpads and GPIO unit in the "
+    + "Intel® X58 Express Chipset. - legacy variant, using old PCIe libraries";
+
+parameter limitations = "<ul>"
+    + "<li>The device is mostly dummy.</li>"
+    + "</ul>";
+
+import "pci/common.dml";
+import "x58-pcie-header.dml";
+
+is pcie_device;
+
+bank pci_config {
+    register device_id { parameter hard_reset_value = 0x3422; }
+    register status {
+        field c { parameter hard_reset_value = 1; }
+    }
+    register class_code { parameter hard_reset_value = 0x080000; }
+    register header_type {
+        field mf   { parameter hard_reset_value = 1; }
+    }
+    register base_address_0 @ 0x10 is (no_base_address_32);
+    register base_address_1 @ 0x14 is (no_base_address_32);
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1c is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+
+    register capabilities_ptr { parameter hard_reset_value = 0x40; }
+
+    is defining_pcie_capability_v2;
+    parameter exp_offset = 0x40;
+    parameter exp_next_ptr = 0x0;
+    register exp_dev_cap {
+        field rber { parameter hard_reset_value = 0x1; }
+    }
+    register exp_link_cap {
+        field l1el   { parameter hard_reset_value = 0x7; }
+        field sder   { parameter hard_reset_value = 0x1; }
+        field dlllar { parameter hard_reset_value = 0x1; }
+        field lbn    { parameter hard_reset_value = 0x1; }
+    }
+    register exp_link_status {
+        field scc { parameter hard_reset_value = 0x1; }
+    }
+    register exp_slot_control {
+        field aic { parameter hard_reset_value = 0x3; }
+        field pic { parameter hard_reset_value = 0x3; }
+        field pcc { parameter hard_reset_value = 0x1; }
+    }
+    register exp_root_cap {
+        field csv  { parameter hard_reset_value = 0x1; }
+    }
+}

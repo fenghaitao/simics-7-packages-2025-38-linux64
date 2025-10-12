@@ -1,0 +1,82 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+// This module implements the i2c wire device between two i2c-link-v2 endpoints
+
+dml 1.4;
+device i2c_wire;
+
+param desc = "model of I2C wire";
+param documentation
+    = "The i2c_wire class implements bridge functionality between two"
+    + " i2c-link-v2 endpoints. It will forward everything from one side"
+    + " to another without analyzing. To use this device, connect"
+    + " i2c_link[0]/i2c_port[0] to one endpoint and i2c_link[1]/i2c_port[1]"
+    + " to another endpoint";
+
+import "simics/devs/i2c.dml";
+
+connect i2c_link_v2[i < 2] {
+    param documentation =
+        "These connectors are used to connect two i2c-link-v2 objects.";
+    param configuration = "optional";
+    interface i2c_slave_v2 { param required = false; }
+    interface i2c_master_v2 { param required = false; }
+}
+
+port i2c_port[i < 2] {
+    // The i2c_slave interface forwards all slaves' functions to
+    // another i2c_link_v2 object
+    implement i2c_slave_v2 {
+        method start(uint8 addr) {
+            if (i2c_link_v2[1 - i].obj && i2c_link_v2[1 - i].i2c_slave_v2.val)
+                i2c_link_v2[1 - i].i2c_slave_v2.start(addr);
+            else
+                i2c_link_v2[i].i2c_master_v2.acknowledge(I2C_noack);
+        }
+
+        method read() {
+            i2c_link_v2[1 - i].i2c_slave_v2.read();
+        }
+
+        method write(uint8 value) {
+            i2c_link_v2[1 - i].i2c_slave_v2.write(value);
+        }
+
+        method stop() {
+            if (i2c_link_v2[1 - i].obj && i2c_link_v2[1 - i].i2c_slave_v2.val)
+                i2c_link_v2[1 - i].i2c_slave_v2.stop();
+        }
+
+        method addresses() -> (attr_value_t) {
+            local attr_value_t val;
+            if (i2c_link_v2[1 - i].obj && i2c_link_v2[1 - i].i2c_slave_v2.val)
+                val = i2c_link_v2[1 - i].i2c_slave_v2.addresses();
+            else
+                val = SIM_make_attr_list(0);
+            return val;
+        }
+    }
+
+    // The i2c_master interface forwards all masters' functions to
+    // another i2c_link_v2 object
+    implement i2c_master_v2 {
+        method acknowledge(i2c_ack_t status) {
+            i2c_link_v2[1 - i].i2c_master_v2.acknowledge(status);
+        }
+
+        method read_response(uint8 value) {
+            i2c_link_v2[1 - i].i2c_master_v2.read_response(value);
+        }
+    }
+}

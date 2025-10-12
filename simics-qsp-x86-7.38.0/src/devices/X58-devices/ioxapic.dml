@@ -1,0 +1,89 @@
+/*
+
+  ioxapic.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device x58_ioxapic;
+param classname = "x58-ioxapic";
+
+param desc = "Intel® X58 IOxAPIC";
+param documentation =
+    "Intel® X58 Express Chipset I/OxAPIC Interrupt Controller.";
+
+import "x58-common.dml";
+is pcie_endpoint;
+
+connect ioapic is init_as_subobj "IOAPIC object" {
+    param classname = "io-apic";
+    method init() {
+        default();
+        SIM_set_attribute_default(
+            this.obj, "ioapic_id", SIM_make_attr_uint64(9 << 24));
+        SIM_set_attribute_default(
+            this.obj, "ioapic_version", SIM_make_attr_uint64(0x170020));
+    }
+}
+
+bank pcie_config is x58_ep_config {
+    register device_id { param init_val = 0x342d; }
+    register mbar @ 0x10 is memory_base_address_32 {
+        param map_obj = ioapic.obj;
+    }
+
+    register class_code {
+        field programming_interface { param init_val = 0x20; }
+    }
+
+    register capabilities_ptr { param init_val = 0x6c; }
+
+    group pm is pm_capability {
+        param base = 0x6c;
+        param next_ptr = 0;
+        register capability {
+            field v is hwinit {
+                param writable_after_hreset = true;
+                param init_val = 0x3;
+            }
+            field pmes { param init_val = 0x19; }
+        }
+    }
+
+    register abar size 2 @ 0x40 is abstract_base_address "Alternate BAR" {
+        field enable @ [15]   "Enable";
+        field xbad   @ [11:8] "Base Address [19:16]";
+        field ybad   @ [7:4]  "Base Address [15:12]";
+        field zbad   @ [3:0]  "Base Address [11:8]";
+
+        param type = PCIE_Type_Mem;
+        param map_obj = ioapic.obj;
+        method enabled() -> (bool) {
+            return enable.val;
+        }
+        method get_map_info() -> (map_info_t) {
+            local map_info_t nfo;
+            nfo.base[19:8] = this.val[11:0];
+            nfo.length = 1 << 8;
+            return nfo;
+        }
+        method write_register(uint64 value, uint64 bytes, void *aux) {
+            default(value, bytes, aux);
+            update_map();
+        }
+    }
+    register rdindex     size 1 @ 0x80 is (design_limitation);
+    register rdwindow    size 4 @ 0x90 is (design_limitation);
+    register ioapictetpc size 4 @ 0xA0 is (unimpl);
+}

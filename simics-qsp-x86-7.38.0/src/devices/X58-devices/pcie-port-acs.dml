@@ -1,0 +1,29 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device x58_pcie_port;
+param classname = "x58-pcie-port-acs";
+param desc = "Intel® X58 PCIe Root Port";
+param documentation = "PCI Express Root Port unit in the "
+    + "Intel® X58 Express Chipset modified to include an ACS capability.";
+
+import "pcie-port-common.dml";
+
+bank pcie_config {
+    group acs is acs_capability {
+        param base = 0x100;
+        param next_ptr = 0;
+    }
+}

@@ -1,0 +1,240 @@
+/*
+  usb-tablet.dml - standard USB tablet device
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device usb_tablet;
+
+parameter USB_DEVICE_SPEED = USB_Speed_Low;
+
+import "usb/device.dml";
+import "simics/model-iface/abs-pointer.dml";
+
+parameter desc = "model of USB tablet";
+parameter documentation = "A USB tablet device.";
+
+constant USB_bRequest_Class_Get_Report     =  1;
+constant USB_bRequest_Class_Get_Idle       =  2;
+constant USB_bRequest_Class_Get_Protocol   =  3;
+constant USB_bRequest_Class_Set_Report     =  9;
+constant USB_bRequest_Class_Set_Idle       =  10;
+constant USB_bRequest_Class_Set_Protocol   =  11;
+
+constant Tablet_HID_Data_Size = 6;
+constant Event_FIFO_Length = 256;
+
+typedef struct {
+    uint8 val[Tablet_HID_Data_Size];
+} event_t;
+
+
+attribute tablet_hid_data {
+    parameter documentation = "The USB HID report data";
+    parameter type = "[iiiiii]";
+    data event_t e;
+
+    method set(attr_value_t attr) {
+        local int i;
+        for (i = 0; i < Tablet_HID_Data_Size; i++)
+            $e.val[i] = SIM_attr_integer(SIM_attr_list_item(attr, i));
+    }
+    method get() -> (attr_value_t attr) {
+        local int i;
+        attr = SIM_alloc_attr_list(Tablet_HID_Data_Size);
+        for (i = 0; i < Tablet_HID_Data_Size; i++)
+            SIM_attr_list_set_item(&attr, i, SIM_make_attr_uint64($e.val[i]));
+    }
+}
+
+attribute event_fifo {
+    parameter type = "d";
+    data event_t fifo[Event_FIFO_Length];
+    data int len;
+    data int rpoint;
+
+    method push(event_t value) {
+        local int wpoint;
+        if ($len == Event_FIFO_Length) {
+            $rpoint = ($rpoint + 1) % Event_FIFO_Length;
+            $len--;
+        }
+        wpoint = ($rpoint + $len) % Event_FIFO_Length;
+        $fifo[wpoint] = value;
+        $len++;
+        log "info", 4, usb_dev_lg: "FIFO: '%s' pushed, new length: %d",
+                                    $qname, $len;
+    }
+
+    method pop() -> (event_t value) {
+        if ($len > 0) {
+            value = $fifo[$rpoint];
+            $rpoint = ($rpoint + 1) % Event_FIFO_Length;
+            $len--;
+            log "info", 4, usb_dev_lg: "FIFO: '%s' pop'd, new length: %d",
+                                        $qname, $len;
+        } else {
+            log "info", 4, usb_dev_lg: "FIFO: '%s' is empty", $qname;
+        }
+    }
+
+    method get() -> (attr_value_t value) {
+        local uint32 plain_len = $len * sizeoftype(event_t);
+        local uint8 dblock[plain_len];
+        local uint8 *plain_fifo = cast($fifo, uint8 *);
+        local int i;
+        local int o;
+        for (i = 0, o = ($rpoint * sizeoftype(event_t)); i < plain_len;
+            i++, o = (o + 1) % (Event_FIFO_Length * sizeoftype(event_t)))
+            dblock[i] = plain_fifo[o];
+        value = SIM_make_attr_data(plain_len, dblock);
+    }
+
+    method set(attr_value_t value) {
+        local uint32 plain_len = SIM_attr_data_size(value);
+        local const uint8 *dblock = SIM_attr_data(value);
+        local uint8 *plain_fifo = cast($fifo, uint8 *);
+        $len = plain_len / sizeoftype(event_t);
+        $rpoint = 0;
+        memcpy(plain_fifo, dblock, plain_len);
+    }
+}
+
+implement abs_pointer {
+    method set_state(abs_pointer_state_t state) {
+        call $playback_abs_pointer_set_state(state);
+    }
+}
+
+method playback_abs_pointer_set_state(abs_pointer_state_t state) {
+    local uint16 x = state.x >> 1;
+    local uint16 y = state.y >> 1;
+    local int8 z;
+    local event_t e;
+
+    log info, 3, usb_dev_lg:
+        "abs_pointer_state (buttons=0x%x x=0x%x y=0x%x z=0x%x)",
+         state.buttons, state.x, state.y, state.z;
+
+    e.val[0][2] = (state.buttons & Abs_Pointer_Button_Middle) != 0 ? 1 : 0;
+    e.val[0][1] = (state.buttons & Abs_Pointer_Button_Right) != 0 ? 1 : 0;
+    e.val[0][0] = (state.buttons & Abs_Pointer_Button_Left) != 0 ? 1 : 0;
+    e.val[1] = x[7:0];
+    e.val[2] = x[15:8];
+    e.val[3] = y[7:0];
+    e.val[4] = y[15:8];
+    if (state.z == 0x7fff)
+        e.val[5] = 1;
+    else if (state.z == 0x8001)
+        e.val[5] = -1;
+    else
+        e.val[5] = 0;
+
+    inline $event_fifo.push(e);
+}
+
+method copy_hid_data(usb_transfer_t *transfer) {
+    /* if fifo is empty we send the previous hid data */
+    if ($event_fifo.len > 0)
+        call $event_fifo.pop() -> ($tablet_hid_data.e);
+    log "info", 3, usb_dev_lg:
+        "send tablet data (touch=0x%x, x=0x%02x%02x, y=0x%02x%02x, z=0x%x)",
+        $tablet_hid_data.e.val[0],
+        $tablet_hid_data.e.val[2], $tablet_hid_data.e.val[1],
+        $tablet_hid_data.e.val[4], $tablet_hid_data.e.val[3],
+        $tablet_hid_data.e.val[5];
+    memcpy(dbuffer_append(transfer->buf, Tablet_HID_Data_Size),
+           $tablet_hid_data.e.val, Tablet_HID_Data_Size);
+    transfer->size = Tablet_HID_Data_Size;
+    $tablet_hid_data.e.val[5] = 0;
+}
+
+method usb_dev_new_transfer(usb_transfer_t *transfer) -> (usb_transfer_completion_t comp) {
+    comp = USB_Transfer_Completed;
+
+    if (transfer->type == USB_Type_Control &&
+        transfer->endpoint_number == 0 &&
+        transfer->u.control_request.bmRequestType[6:5] == 1) {
+
+        log info, 2, usb_dev_lg: "received HID class control transfer";
+
+        switch (transfer->u.control_request.bRequest) {
+            case USB_bRequest_Class_Get_Report:
+                log info, 4, usb_dev_lg: "Get Report request";
+                inline $copy_hid_data(transfer);
+                break;
+
+            case USB_bRequest_Class_Set_Report:
+                log unimpl, 1, usb_dev_lg: "Set Report request";
+                break;
+
+            case USB_bRequest_Class_Get_Idle:
+                log unimpl, 1, usb_dev_lg: "Get Idle request";
+                break;
+
+            case USB_bRequest_Class_Set_Idle:
+                log info, 2, usb_dev_lg: "Set Idle request";
+                break;
+
+            case USB_bRequest_Class_Get_Protocol:
+                log unimpl, 1, usb_dev_lg: "Get Protocol request";
+                break;
+
+            case USB_bRequest_Class_Set_Protocol:
+                log unimpl, 1, usb_dev_lg: "Set Protocol request";
+                break;
+        }
+    } else if (transfer->type == USB_Type_Bulk &&
+               transfer->direction == USB_Direction_In &&
+               transfer->endpoint_number == 1) {
+        log info, 4, usb_dev_lg: "received Bulk In transfer (size %d) to EP1",
+            transfer->size;
+        inline $copy_hid_data(transfer);
+    } else if (transfer->type == USB_Type_Bulk &&
+               transfer->direction == USB_Direction_In &&
+               transfer->endpoint_number == 0) {
+        log "info", 2, usb_dev_lg:
+            "Bulk In transfer (size %d) to EP0 was ignored", transfer->size;
+    } else if (transfer->type == USB_Type_Bulk &&
+               transfer->direction == USB_Direction_Out &&
+               transfer->endpoint_number == 0) {
+        log "info", 2, usb_dev_lg:
+            "Bulk Out transfer (size %d) to EP0 was ignored", transfer->size;
+    } else {
+        log error, 1, usb_dev_lg: "transfer type unsupported";
+    }
+
+    transfer->status = USB_Status_Ack;
+}
+
+method usb_dev_abort_transfer(usb_transfer_t *transfer) {
+    /* do nothing */
+    assert false;
+}
+
+method usb_dev_reset() {
+    /* do nothing */
+}
+
+method init() {
+    $tablet_hid_data.e.val[0] = 0x00;
+    $tablet_hid_data.e.val[1] = 0xff;
+    $tablet_hid_data.e.val[2] = 0x3f;
+    $tablet_hid_data.e.val[3] = 0xff;
+    $tablet_hid_data.e.val[4] = 0x3f;
+    $tablet_hid_data.e.val[5] = 0x00;
+}
+
+method post_init() {
+    call $usb_dev_post_init();
+}

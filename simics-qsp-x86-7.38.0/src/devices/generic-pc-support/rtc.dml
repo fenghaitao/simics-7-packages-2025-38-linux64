@@ -1,0 +1,995 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device generic_rtc;
+
+param desc = "generic x86 RTC";
+param documentation = "RTC to be connected to IO ports 0x70 to 0x77.";
+
+import "utility.dml";
+import "simics/devs/interrupt.dml";
+
+is (hreset, sreset);
+
+header %{
+    static const uint8 days_of_month[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    static uint8 days_in_month(uint8 year, uint8 month) {
+        if (month == 1 && (year % 4) == 0)
+            return 29;
+        return days_of_month[month];
+    }
+    static uint8 binary_to_bcd(uint8 bin) {
+        return (bin % 10) | ((bin / 10) << 4);
+    }
+    static uint8 bcd_to_binary(uint8 bcd) {
+        return (bcd & 0xf) + 10 * (bcd >> 4);
+    }
+    static bool is_valid_bcd(uint8 bcd) {
+        return ((bcd & 0xf) <= 9 && (bcd >> 4) <= 9);
+    }
+%}
+
+extern int sprintf(char *str, const char *format, ...);
+extern int sscanf(const char *str, const char *format, ...);
+extern uint8 days_in_month(uint8 year, uint8 month);
+extern uint8 binary_to_bcd(uint8 bin);
+extern uint8 bcd_to_binary(uint8 bcd);
+extern bool is_valid_bcd(uint8 bcd);
+
+param RTC_PERIODIC_TIME = 1.2207e-4;
+param RTC_UIP_TIME      = 4.88e-4;
+param RTC_SECOND        = 1.0;
+param RTC_MINUTE        = 60.0;
+param RTC_HOUR          = 3600.0;
+param RTC_DAY           = 86400.0;
+param RTC_IGNORED_ALARM = 0xC0;
+
+param RTYPE_T           = 0; // time register
+param RTYPE_A           = 1; // alarm register
+param DISABLED_DATE     = 0x3F;
+
+param RAM_SIZE          = 242;
+
+connect irq_dev {
+    param documentation = "Connect to HPET for forwarding to IO-APIC.";
+    param configuration = "optional";
+    interface simple_interrupt;
+
+    method raise(uint32 level) {
+        if (irq_dev.obj)
+            simple_interrupt.interrupt(level);
+    }
+
+    method lower(uint32 level) {
+        if (irq_dev.obj)
+            simple_interrupt.interrupt_clear(level);
+    }
+}
+
+attribute irq_level is uint64_attr {
+    param documentation = "Interrupt level for RTC device";
+}
+
+attribute time {
+    param documentation = "Time of RTC in format \"YY-MM-DD hh:mm:ss\".";
+    param configuration = "pseudo";
+    param type = "s";
+
+    method get() -> (attr_value_t) {
+        local attr_value_t val;
+        local char *str;
+
+        if (   rtc.reg_b.SET.val == 0
+            && rtc.reg_a.DV.val  == 0b010
+            && SIM_time(dev.obj) >= next_update_time.val)
+            rtc.sync_with_sim_time();
+        if (rtc.reg_b.SET.val == 1)
+            rtc.initiate_time_registers();
+        str = get_rtc_time();
+        return SIM_make_attr_string(str);
+    }
+
+    method set(attr_value_t value) throws {
+        local int params;
+        local int tm_year;
+        local int tm_month;
+        local int tm_date;
+        local int tm_hour;
+        local int tm_min;
+        local int tm_sec;
+
+        params = sscanf(SIM_attr_string(value), "%d-%d-%d %d:%d:%d", &tm_year,
+                                                             &tm_month,
+                                                             &tm_date,
+                                                             &tm_hour,
+                                                             &tm_min,
+                                                             &tm_sec);
+        if (   params != 6 || tm_year < 0  || tm_month < 1 || tm_month > 12
+            || tm_date < 1 || tm_date > 31 || tm_hour  < 0 || tm_hour  > 23
+            || tm_min  < 0 || tm_min  > 59 || tm_sec   < 0 || tm_sec   > 59) {
+            log error: "configure time with illegal values, ignored";
+            return;
+        }
+
+        if (tm_date > days_in_month(tm_year, tm_month - 1)) {
+            log error: "configure time with illegal values, ignored";
+            return;
+        }
+
+        rtc.tm_year.val  = tm_year % 100;
+        rtc.tm_month.val = tm_month - 1;
+        rtc.tm_date.val  = tm_date - 1;
+        rtc.tm_hour.val  = tm_hour;
+        rtc.tm_min.val   = tm_min;
+        rtc.tm_sec.val   = tm_sec;
+
+        rtc.set_time_registers();
+    }
+
+    method get_rtc_time() -> (char *) {
+        session char tstr[64];
+        sprintf(tstr, "%02llu-%02llu-%02llu %02llu:%02llu:%02llu",
+                cast(rtc.tm_year.val, uint64),
+                cast(rtc.tm_month.val + 1, uint64),
+                cast(rtc.tm_date.val + 1, uint64),
+                cast(rtc.tm_hour.val, uint64),
+                cast(rtc.tm_min.val, uint64),
+                cast(rtc.tm_sec.val, uint64));
+        return tstr;
+    }
+}
+
+attribute next_update_time is double_attr {
+    param documentation = "Simulation time to update ram values again";
+}
+
+attribute next_alarm_time is double_attr {
+    param documentation = "Simulation time to alarm again";
+}
+
+
+attribute next_periodic_time is double_attr {
+    param documentation = 
+        "Simulation time to set periodic interrupt flag bit again";
+}
+
+// RTC access register in fixed IO bank
+bank fixed_io {
+    param register_size = 1;
+
+    register rtc_idx0  @ 0x0 "Real-Time Clock Index register 0";
+    register rtc_da0   @ 0x1 "Real-Time Clock Data register 0";
+    register rtc_idx1  @ 0x2 "Real-Time Clock Index register 1";
+    register rtc_da1   @ 0x3 "Real-Time Clock Data register 1";
+
+    register rtc_da0 is (rtc_data_reg) { param index_reg = rtc_idx0; }
+    register rtc_da1 is (rtc_data_reg) {
+        param index_reg = rtc_idx1;
+        param base_addr = 0x100;
+    }
+}
+
+bank rtc {
+    param documentation = "RTC RAM registers";
+    param register_size = 1;
+
+    register seconds     @ 0x0 "Seconds register";
+    register sec_alrm    @ 0x1 "Seconds Alarm register";
+    register minutes     @ 0x2 "Minutes register";
+    register min_alrm    @ 0x3 "Minutes Alarm register";
+    register hours       @ 0x4 "Hours register";
+    register hour_alrm   @ 0x5 "Hours Alarm register";
+    register day_of_week @ 0x6 "Day of Week register";
+    register day_of_mon  @ 0x7 "Day of Month register";
+    register month       @ 0x8 "Month register";
+    register year        @ 0x9 "Year register";
+    register reg_a       @ 0xa "Register A";
+    register reg_b       @ 0xb "Register B";
+    register reg_c       @ 0xc "Register C";
+    register reg_d       @ 0xd "Register D";
+
+    //0E ~ FFh, 114 + 128 Bytes of User RAM
+    register ram[i < RAM_SIZE]   @ 0xe + i
+        "Non-volatile RAM Register. See also ram_ctrl.";
+
+    // Unmapped registers
+    register volatile_ram[i < RAM_SIZE] is (unmapped)
+        "Volatile RAM Register. Writes to the RAM register will also update"
+        + " the corresponding volatile_ram register. See also ram_ctrl.";
+
+    register ram_ctrl[i < RAM_SIZE] is (unmapped)
+        "Volatile RAM Control Register. If an entry in this attribute is non"
+        + "-zero a read from the ram register will read the corresponding"
+        + " entry in the volatile_ram attribute instead.";
+
+    register irq_raised is (unmapped) "IRQ Raised";
+
+    register tm_year  is (intern_time_reg) "Internal Year, 0~99" {
+        param range = 100;
+    }
+    register tm_month is (intern_time_reg) "Internal Month, 0~11" {
+        param range = 12;
+        param p_reg = tm_year;
+    }
+    register tm_day   is (intern_time_reg) "Internal Week Day, 0~6" {
+        param range = 7;
+    }
+    register tm_date  is (intern_time_reg) "Internal Month Day, 0~30" {
+        method add_value(uint8 value) {
+            local uint8 dim = days_in_month(tm_year.val, tm_month.val);
+            this.val += value;
+            if (this.val >= dim) {
+                //following looks unreasonable, but it should be correct for one month
+                tm_month.add_value(this.val / dim);
+                this.val %= dim;
+            }
+        }
+    }
+    register tm_hour  is (intern_time_reg) "Internal Hours, 0~23" {
+        param range = 24;
+        method add_value(uint8 value) {
+            this.val += value;
+            if (this.val >= range) {
+                tm_date.add_value(this.val / range);
+                tm_day.add_value(this.val / range);
+                this.val %= range;
+            }
+        }
+    }
+    register tm_min   is (intern_time_reg) "Internal Minute, 0~59" {
+        param range = 60;
+        param p_reg = tm_hour;
+    }
+    register tm_sec   is (intern_time_reg) "Internal Second, 0~59" {
+        param range = 60;
+        param p_reg = tm_min;
+    }
+
+    register tm_sec_alrm is (unmapped);
+    register tm_min_alrm is (unmapped);
+    register tm_hour_alrm is (unmapped);
+    register tm_date_alrm is (unmapped) {
+        param init_val = DISABLED_DATE;
+    }
+
+    // RTC event
+    event rtc_periodic is simple_time_event {
+        method event() {
+            reg_c.PF.val = 1;
+            update_interrupt();
+            start_periodic();
+        }
+        method stop_periodic() default {
+            local bool is_posted;
+            is_posted = posted();
+            if (is_posted) {
+                remove();
+                log info, 3: "periodic interrupt is stopped";
+            }
+        }
+        method periodic_time() -> (double) {
+            local double periodic;
+            if (reg_a.RS.val < 3)
+                periodic = reg_a.RS.val * 3.90625e-3;
+            else
+                periodic = RTC_PERIODIC_TIME * (1 << (reg_a.RS.val - 3));
+            return periodic;
+        }
+        method start_periodic() default {
+            local double periodic;
+            periodic = periodic_time();
+
+            if (periodic > 1.0e-6) {
+                if (reg_b.PIE.val == 1) {
+                    post(periodic);
+                    log info, 3: "periodic interrupt is started";
+                }
+                else
+                    next_periodic_time.val = SIM_time(dev.obj) + periodic;
+            }
+        }
+    }
+
+    event rtc_timer is simple_time_event {
+        method event() {
+            log info, 3:
+                "the alarm timer is triggered at simulation time %f",
+                SIM_time(dev.obj);
+            // Generate the alarm interrupt
+            reg_c.AF.val = 1;
+            update_interrupt();
+        }
+
+        method next_alarm() default {
+            local bool is_posted;
+            is_posted = posted();
+            if (is_posted)
+                remove();
+            if (next_alarm_time.val > 1.0e-6) {
+                local double when = next_alarm_time.val - SIM_time(dev.obj);
+                post(when);
+                log info, 4: "post an alarm after %f seconds", when;
+            }
+        }
+    }
+
+    event rtc_update_ended is simple_time_event {
+        method event() {
+            reg_c.UF.val = 1;
+            update_interrupt();
+            post(1.0);
+        }
+    }
+
+    // Detailed information of registers
+    register ram[i < RAM_SIZE] {
+        param persistent = true;
+
+        is read;
+        method read() -> (uint64) {
+            local uint64 value;
+            if (ram_ctrl[i].val == 0)
+                value = this.val;
+            else
+                value = volatile_ram[i].val;
+            return value;
+        }
+
+        is write;
+        method write(uint64 value) {
+            this.val = value;
+            volatile_ram[i].val = value;
+        }
+    }
+
+    register seconds is (rtc_time_reg) {
+        param min = 0;
+        param max = 59;
+    }
+    register minutes is (rtc_time_reg) {
+        param min = 0;
+        param max = 59;
+    }
+    register hours is (rtc_time_reg) {
+        // min and max don't work well for checks: we check hours specially
+    }
+    register day_of_week is (rtc_time_reg) {
+        // TODO: min should be 1 (Sunday), max - 7 (Saturday). For now we
+        // set min = 0 to make tests work.
+        param min = 0;
+        param max = 7;
+    }
+    register day_of_mon  is (rtc_time_reg) {
+        param min = 1;
+        param max = 31;
+    }
+    register month is (rtc_time_reg) {
+        param min = 1;
+        param max = 12;
+    }
+    register year is (rtc_time_reg) {
+        param min = 00;
+        param max = 99;
+    }
+
+    register sec_alrm is (rtc_time_reg) {
+        param type = RTYPE_A;
+        param m_reg = tm_sec_alrm;
+    }
+    register min_alrm is (rtc_time_reg) {
+        param type = RTYPE_A;
+        param m_reg = tm_min_alrm;
+    }
+    register hour_alrm is (rtc_time_reg) {
+        param type = RTYPE_A;
+        param m_reg = tm_hour_alrm;
+    }
+
+    register reg_a {
+        field UIP @ [7] "Update In Progress" {
+            is read;
+            method read() -> (uint64) {
+                // not implemented
+                return 0;
+            }
+        }
+
+        field DV @ [6:4] "Division Chain Select" {
+            is write;
+            method write(uint64 value) {
+                local uint3 cur_val = this.val;
+
+                this.val = value;
+                if (cur_val == 0b010 && value != 0b010) {
+                    log info, 4: "oscillator disabled, clock stopped";
+                    if (   reg_b.SET.val == 0 
+                        && SIM_time(dev.obj) > next_update_time.val) {
+                        // Synchronize time to present newest time in the regs
+                        sync_with_sim_time();
+                    }
+                    rtc_update_ended.remove();
+                    rtc_timer.remove();
+                }
+                if (cur_val != 0b010 && value == 0b010) {
+                    log info, 4: "oscillator enabled, clock started";
+                    if (reg_b.SET.val == 0
+                        && SIM_time(dev.obj) > next_update_time.val) {
+                        // Synchronize time to present newest time in the regs
+                        sync_with_sim_time();
+                        if (reg_b.UIE.val == 1)
+                            rtc_update_ended.post(
+                                next_update_time.val - SIM_time(dev.obj));
+                    }
+                }
+            }
+        }
+
+        field RS @ [3:0] "Rate Select";
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            rtc_periodic.stop_periodic();
+            if (DV.val == 0b10)
+                rtc_periodic.start_periodic();
+        }
+    }
+
+    register reg_b is init {
+        field SET @ [7] "Update Cycle Inhibit" {
+            session bool initiate_regs = false;
+            is write;
+            method write(uint64 val) {
+                if (val != this.val) {
+                    if (val == 1) { // 0 -> 1, synchronize the time if needed
+                        if (SIM_time(dev.obj) > next_update_time.val) {
+                            sync_with_sim_time();
+                            log info, 3:
+                                "sync the simulation time to the registers";
+                        }
+                    } else { // 1 -> 0
+                        // Read the user configured regs into the internal regs.
+                        initiate_regs = true;
+                    }
+                    this.val = val;
+                }
+            }
+        }
+        field PIE @ [6] "Periodic Interrupt Enable" {
+            is write;
+            method write(uint64 value) {
+                local bool  posted;
+                local uint1 old_val = this.val;
+
+                this.val = value;
+                if (value == 1 && old_val == 0) {
+                    posted = rtc_periodic.posted();
+                    if (!posted) {
+                        rtc_periodic.start_periodic();
+                    }
+                }
+            }
+        }
+
+        field AIE @ [5] "Alarm Interrupt Enable";
+        field UIE @ [4] "Update-Ended Interrupt Enable" {
+            is write;
+            method write(uint64 value) {
+                if (this.val != value && reg_a.DV.val == 0b010) {
+                    sync_with_sim_time();
+                    if (this.val == 1 && value == 0)
+                        rtc_update_ended.remove();
+                    else
+                        rtc_update_ended.post(
+                            next_update_time.val - SIM_time(dev.obj));
+                    this.val = value;
+                } else
+                    this.val = value;
+            }
+        }
+        field SQWE @ [3]    "Square Wave Enable";
+        field DM @ [2]      "Data Mode";
+        field HOURFMT @ [1] "Hour Format";
+        field DSLSWS @ [0]  "Daylight Savings";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (SET.initiate_regs) {
+                /* read in registers once all fields in reg_b were set */
+                initiate_time_registers();
+                log info, 3:
+                    "read the user configured regs into the inner regs";
+                SET.initiate_regs = false;
+            }
+            update_interrupt();
+        }
+
+        method init() {
+            default();
+            // TODO: check if this condition should be removed, see SIMICS-9496
+            if (!SIM_object_is_configured(dev.obj)) {
+                // The following settings have undefined initial value, but set
+                // a sensible default
+                HOURFMT.val = 1;
+                DM.val = 1;
+            }
+        }
+    }
+
+    register reg_c {
+        field IRQF @ [7] is (clear_on_read) "Interrupt Request Flag";
+        field PF @ [6]   is (clear_on_read) "Periodic Interrupt Flag";
+        field AF @ [5]   is (clear_on_read) "Alarm Flag";
+        field UF @ [4]   is (clear_on_read) "Update-Ended Flag";
+        method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+            local double cur_time = SIM_time(dev.obj);
+            if (reg_b.PIE.val == 0 && cur_time > next_periodic_time.val) {
+                sync_periodic_with_sim_time();
+            }
+            if (reg_b.UIE.val == 0) {
+                if (cur_time > (next_update_time.val + 1.984e-3)) {
+                    UF.val = 1;
+                    sync_with_sim_time();
+                }
+            }
+            local uint64 value = default(enabled_bytes, aux);
+            update_interrupt();
+            return value;
+        }
+    }
+
+    register reg_d {
+        field VRT @ [7] "Valid RAM and Time Bit" {
+            is read;
+            method read() -> (uint64) {
+                return 1;//always return 1 for read cycles
+            }
+        }
+        field DA @ [5:0] "Date Alarm" {
+            is write;
+            method write(uint64 val) {
+                this.val = val;
+                if (val == 0) {
+                    tm_date_alrm.val = DISABLED_DATE;
+                }
+                else if (val > 0x1F) {
+                    log spec_viol, 1:
+                        "value %d for %s is larger than %s, adjusted to 31",
+                        val, "date alarm", "maximum value";
+                    tm_date_alrm.val = 30;
+                } else {
+                    tm_date_alrm.val = val - 1;
+                }
+                check_alarm();
+            }
+        }
+    }
+
+    method get_alarm_time() -> (double) default {
+        local double alarm_time;
+        local uint8  delta = 0;
+        local double tod;
+
+        alarm_time = 0;
+
+        if (tm_sec_alrm.val >= RTC_IGNORED_ALARM)
+            return alarm_time;
+        alarm_time = RTC_SECOND * (cast(tm_sec_alrm.val - tm_sec.val, int64));
+        if (alarm_time < 0.0) {
+            alarm_time += 60 * RTC_SECOND;
+            delta = 1;
+        }
+
+        if (tm_min_alrm.val >= RTC_IGNORED_ALARM)
+            return alarm_time;
+        alarm_time += RTC_MINUTE * (cast(tm_min_alrm.val - tm_min.val - delta, int64));
+        delta = 0;
+        if (alarm_time < 0.0) {
+            alarm_time += 60 * RTC_MINUTE;
+            delta = 1;
+        }
+
+        if (tm_hour_alrm.val >= RTC_IGNORED_ALARM)
+            return alarm_time;
+        alarm_time += RTC_HOUR * (cast(tm_hour_alrm.val - tm_hour.val - delta, int64));
+        delta = 0;
+        if (alarm_time < 0.0) {
+            alarm_time += 24 * RTC_HOUR;
+            delta = 1;
+        }
+
+        if (tm_date_alrm.val == 0x3f)
+            return alarm_time;
+
+        tod = get_date_alarm(alarm_time);
+        alarm_time += tod;
+        return alarm_time;
+    }
+
+    method get_date_alarm(double alarm_time) -> (double) {
+        local double time_of_days;
+        if (   (tm_date_alrm.val < tm_date.val)
+            || (tm_date_alrm.val == tm_date.val && alarm_time < 0.0)) {
+            local uint8 dim;
+            local uint8 year  = tm_year.val;
+            local uint8 month = tm_month.val + 1;
+            local uint16 days
+                = days_in_month(tm_year.val, tm_month.val) - tm_date.val - 1;
+            while (true) {
+                dim = days_in_month(year, month);
+                if (dim >= (tm_date_alrm.val + 1))
+                    break;
+                days += dim;
+                month ++;
+                if (month == 12) {
+                    month = 0;
+                    year ++;
+                }
+                if (month == tm_month.val) {
+                    log spec_viol, 1:
+                        "can't get good alarm timing in configured year %d, %s",
+                        tm_year.val, "alarm may not work well.";
+                    break;
+                }
+            }
+            days += tm_date_alrm.val;
+            time_of_days = RTC_DAY * days;
+        }
+        else if (tm_date_alrm.val > tm_date.val)
+            time_of_days = RTC_DAY * (tm_date_alrm.val - tm_date.val);
+        else
+            time_of_days = 0.0;
+        return time_of_days;
+    }
+
+    method sync_with_sim_time() {
+        local char  *str;
+        local uint8  cnt;
+        local double delta = SIM_time(dev.obj) - next_update_time.val + 1.0;
+
+        if (delta <= 1.0e-6) {
+            log info, 2: "the time synchronization is called %s",
+                "before the start of simulation";
+        }
+
+        if (delta >= RTC_DAY) {
+            cnt = cast(delta / RTC_DAY, uint8);
+            tm_date.add_value(cnt);
+            tm_day.add_value(cnt);
+            delta -= cnt * RTC_DAY;
+        }
+        if (delta >= RTC_HOUR) {
+            cnt = cast(delta / RTC_HOUR, uint8);
+            tm_hour.add_value(cnt);
+            delta -= cnt * RTC_HOUR;
+        }
+        if (delta >= RTC_MINUTE) {
+            cnt = cast(delta / RTC_MINUTE, uint8);
+            tm_min.add_value(cnt);
+            delta -= cnt * RTC_MINUTE;
+        }
+        if (delta >= RTC_SECOND) {
+            cnt = cast(delta / RTC_SECOND, uint8);
+            tm_sec.add_value(cnt);
+            delta -= cnt;
+        }
+
+        str = time.get_rtc_time();
+        log info, 4: "current RTC time: %s", str;
+        set_time_registers();
+        next_update_time.val = SIM_time(dev.obj) - delta + 1.0;
+    }
+
+    // Synchronize next periodic time with current simulation time
+    method sync_periodic_with_sim_time() {
+        local int    cnt;
+        local double cur_time = SIM_time(dev.obj);
+        local double periodic;
+
+        periodic = rtc_periodic.periodic_time();
+        if (cur_time > next_periodic_time.val) {
+            reg_c.PF.val = 1;
+            cnt = (cur_time - next_periodic_time.val) / periodic;
+            next_periodic_time.val += (cnt + 1) * periodic;
+            update_interrupt();
+        }
+    }
+
+    method check_alarm() {
+        local bool   to_update = false;
+        local double cur_time  = SIM_time(dev.obj);
+
+        next_alarm_time.val = get_alarm_time();
+
+        if (next_alarm_time.val < 1.0e-6) {
+            log info, 3: "no alarm now";
+            return;
+        }
+
+        if (cur_time >= next_alarm_time.val) {
+            reg_c.AF.val = 1;
+            to_update = true;
+            log info, 3: "current time %f goes over the alarm time %f",
+                cur_time, next_alarm_time.val;
+        } else {
+            rtc_timer.next_alarm();
+        }
+
+        if (to_update)
+            update_interrupt();
+    }
+
+    method initiate_time_registers() default {
+        local bool is_bcd = (reg_b.DM.val == 0);
+
+        /* Documentation says "it is up to the programmer to make sure that
+           data stored in these locations is within the reasonable values
+           ranges and represents a possible date and time". So we check data
+           and, if needed, adjust it and issue spec violation warnings. */
+        if (is_bcd) {
+            #foreach reg in ([year, month, day_of_mon, day_of_week,
+                             minutes, seconds]) {
+                if (!is_valid_bcd(reg.val)) {
+                    log spec_viol, 1:
+                         ("%s: value %#x is not a valid binary-coded"
+                          + " decimal and was adjusted"),
+                        reg.name, reg.val;
+                    reg.val = binary_to_bcd(reg.min);
+                }
+            }
+        }
+        #foreach reg in ([year, month, day_of_week, minutes, seconds]) {
+            local uint8 value = is_bcd ? bcd_to_binary(reg.val) : reg.val;
+            if (reg.min > 0 && value < reg.min) {
+                log spec_viol, 1:
+                    "%s: value %d is less than minimum (%d) and was adjusted",
+                    reg.name, value, reg.min;
+                    reg.val = is_bcd ? binary_to_bcd(reg.min) : reg.min;
+                 }
+                if (reg.max < 0xFF && value > reg.max) {
+                    log spec_viol, 1:
+                         "%s: value %d exceeds maximum %d and was adjusted",
+                         reg.name, value, reg.max;
+                     reg.val = is_bcd ? binary_to_bcd(reg.max) : reg.max;
+                }
+        }
+        /* Special handling for hours */
+        local uint8 value_hours = is_bcd
+            ? bcd_to_binary(hours.val[6:0]) : hours.val[6:0];
+        local bool is_twelve_hour_mode = (reg_b.HOURFMT.val == 0);
+
+        if ((is_bcd && !is_valid_bcd(hours.val[6:0]))
+            || (!is_twelve_hour_mode && (hours.val[7] == 1 || value_hours > 23))
+            || (is_twelve_hour_mode && (value_hours == 0 || value_hours > 12))) {
+                log spec_viol, 1:
+                    "%s: value %#x is incorrect and was adjusted",
+                    hours.name, hours.val;
+                hours.val = value_hours = 1;
+        } else if (is_twelve_hour_mode) {
+            local bool is_pm = (hours.val[7] == 1);
+            if (value_hours == 12 && !is_pm)
+                value_hours = 0;  /* midnight is 12 a.m. not 0 */
+            if (is_pm && value_hours != 12)
+                value_hours += 12;
+        }
+
+        /* Special handling for day of month */
+        local uint8 value_dom = is_bcd
+            ? bcd_to_binary(day_of_mon.val) : day_of_mon.val;
+        local uint8 max_dom = is_bcd
+            ? days_in_month(bcd_to_binary(year.val), bcd_to_binary(month.val)-1)
+            : days_in_month(year.val, month.val-1);
+        if (value_dom < 1 || value_dom > max_dom) {
+            log spec_viol, 1:
+                "%s: value %d is not valid was adjusted",
+                day_of_mon.name, value_dom;
+            day_of_mon.val = 1;
+        }
+
+        /* Checks are over: write data to internal registers. */
+        if (is_bcd) {
+            tm_year.val = bcd_to_binary(year.val);
+            tm_month.val = bcd_to_binary(month.val) - 1;
+            tm_date.val = bcd_to_binary(day_of_mon.val) - 1;
+            tm_day.val = bcd_to_binary(day_of_week.val);
+            tm_hour.val = value_hours;
+            tm_min.val = bcd_to_binary(minutes.val);
+            tm_sec.val = bcd_to_binary(seconds.val);
+        } else {
+            tm_year.val = year.val;
+            tm_month.val = month.val - 1;
+            tm_date.val = day_of_mon.val - 1;
+            tm_day.val = day_of_week.val;
+            tm_hour.val = value_hours;
+            tm_min.val = minutes.val;
+            tm_sec.val = seconds.val;
+        }
+    }
+
+    method set_time_registers() default {
+        local bool  pm    = tm_hour.val >= 12;
+        local uint8 hours = tm_hour.val;
+
+        if (reg_b.HOURFMT.val == 0) {//12-hour mode
+            if (hours == 0)
+                hours = 12;  // midnight is 12 a.m. not 0
+            if (hours > 12)
+                hours = hours % 12;
+        }
+
+        if (reg_b.DM.val == 0) {//BCD
+            year.val = binary_to_bcd(tm_year.val);
+            month.val = binary_to_bcd(tm_month.val + 1);
+            day_of_mon.val = binary_to_bcd(tm_date.val + 1);
+            day_of_week.val = binary_to_bcd(tm_day.val);
+            this.hours.val = binary_to_bcd(hours);
+            minutes.val = binary_to_bcd(tm_min.val);
+            seconds.val = binary_to_bcd(tm_sec.val);
+        } else {
+            year.val = tm_year.val;
+            month.val = tm_month.val + 1;
+            day_of_mon.val = tm_date.val + 1;
+            day_of_week.val = tm_day.val;
+            this.hours.val = hours;
+            minutes.val = tm_min.val;
+            seconds.val = tm_sec.val;
+        }
+        if (pm && reg_b.HOURFMT.val == 0) {
+            this.hours.val[7] = 1;//set PM bit
+        }
+    }
+
+    method update_interrupt() default {
+        reg_c.IRQF.val = (  (reg_c.PF.val & reg_b.PIE.val)
+                       | (reg_c.AF.val & reg_b.AIE.val)
+                       | (reg_c.UF.val & reg_b.UIE.val));
+        if (reg_c.IRQF.val != irq_raised.val) {
+            if (reg_c.IRQF.val == 0) {
+                log info, 3: "lower interrupt";
+                irq_dev.lower(irq_level.val);
+            } else {
+                log info, 3: "raise interrupt";
+                irq_dev.raise(irq_level.val);
+            }
+
+            irq_raised.val = reg_c.IRQF.val;
+        }
+    }
+}
+
+template rtc_data_reg is register {
+    param index_reg default undefined;
+    param base_addr default 0;
+
+    method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+        local uint64 value;
+        local uint16 addr = index_reg.val;
+
+        if (addr[7] == 1) {
+            log info, 2: "a NMI-disabling bit is set";
+            index_reg.val[7] = 0;
+            addr[7] = 0;
+        }
+        addr += base_addr;
+        try {
+            value = rtc.read(addr, enabled_bytes, aux);
+        } catch {
+            log error: "Indirect read access to offset 0x%x failed.", addr;
+        }
+        return value;
+    }
+
+    method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+        local uint16 addr = index_reg.val;
+
+        if (addr[7] == 1) {
+            log info, 2: "a NMI-disabling bit is set";
+            index_reg.val[7] = 0;
+            addr[7] = 0;
+        }
+        addr += base_addr;
+        try {
+            rtc.write(addr, value, enabled_bytes, aux);
+        } catch {
+            log error: "Indirect write access to offset 0x%x failed.", addr;
+        }
+    }
+}
+
+template rtc_time_reg is (_get, read, write) {
+    param min   default 0;
+    param max   default 0xFF;
+    param type  default RTYPE_T;
+    param m_reg default undefined; // Mirror register
+
+    is write;
+    method write(uint64 value) {
+        #if (type == RTYPE_A) {
+            this.val = value;
+            if (reg_b.DM.val == 0)
+                m_reg.val = bcd_to_binary(value);
+            else
+                m_reg.val = value;
+            check_alarm();
+        } #else {
+            if (reg_b.SET.val == 1) {
+                this.val = value;
+            } else {
+                log spec_viol, 1:
+                    "ignore configuring time register %s when RTC_REGB.SET = 0",
+                    name;
+            }
+        }
+    }
+
+    method get() -> (uint64) {
+        #if (type == RTYPE_A) {
+            if (reg_b.DM.val == 0)
+                this.val = binary_to_bcd(m_reg.val);
+            else
+                this.val = m_reg.val;
+        }
+        return this.val;
+    }
+
+    is read;
+    method read() -> (uint64) {
+        local uint64 value;
+        if (type == RTYPE_T) {
+            if (reg_b.SET.val == 0 && reg_a.DV.val  == 0b010
+                && SIM_time(dev.obj) >= next_update_time.val)
+            sync_with_sim_time();
+        }
+        value = get();
+        return value;
+    }
+}
+
+template intern_time_reg {
+    param p_reg default undefined;
+    param range default undefined;
+    param persistent = true;
+    is unmapped;
+    method add_value(uint8 delta) default {
+        this.val += delta;
+        if (this.val >= range) {
+            #if (defined p_reg)
+                p_reg.add_value(this.val / range);
+            this.val %= range;
+        }
+    }
+}
+
+method init() {
+    next_update_time.val = 1.0;
+    irq_level.val = 8;
+}
+
+method hard_reset() {
+    soft_reset();
+}
+
+method soft_reset() {
+    // we set internal alarm values to internal time to prevent a new alarm
+    rtc.tm_sec_alrm.val = RTC_IGNORED_ALARM;
+    rtc.tm_min_alrm.val = RTC_IGNORED_ALARM;
+    rtc.tm_hour_alrm.val = RTC_IGNORED_ALARM;
+    rtc.tm_date_alrm.val = DISABLED_DATE;
+    // then we reset the control regs to ensure the evens are canceled
+    rtc.reg_a.write_register(0,0xffffffff, NULL);
+    rtc.reg_b.write_register(0,0xffffffff, NULL);
+    rtc.reg_c.write_register(0,0xffffffff, NULL);
+    rtc.reg_d.write_register(0,0xffffffff, NULL);
+}

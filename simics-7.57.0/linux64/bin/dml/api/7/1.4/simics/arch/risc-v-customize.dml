@@ -1,0 +1,32 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/arch/risc-v-customize.h>
+%}
+
+import "simics/processor/types.dml";
+import "simics/processor/generic-spr.dml";
+import "simics/pywrap.dml";
+import "simics/arch/risc-v.dml";
+
+extern typedef int riscv_csr_access_type_t;
+extern riscv_csr_access_type_t Riscv_CSR_Instruction_Access;
+extern riscv_csr_access_type_t Riscv_Attribute_Access;
+extern riscv_csr_access_type_t Riscv_Int_Register_Access;
+extern typedef struct { uint64 (*read_x_register)(conf_object_t *cpu, uint32 number); void (*write_x_register)(conf_object_t *cpu, uint32 number, uint64 value); char const *(*name_x_register)(conf_object_t *cpu, uint32 number); uint64 (*read_csr)(conf_object_t *cpu, uint32 address); void (*write_csr)(conf_object_t *cpu, uint32 address, uint64 value); uint64 (*read_memory)(conf_object_t *cpu, uint64 address, uint32 size); void (*write_memory)(conf_object_t *cpu, uint64 address, uint32 size, uint64 value); void (*load_memory_buf)(conf_object_t *cpu, uint64 address, buffer_t buf); void (*store_memory_buf)(conf_object_t *cpu, uint64 address, bytes_t buf); riscv_cpu_mode_t (*get_current_cpu_mode)(conf_object_t *cpu); void (*raise_exception)(conf_object_t *cpu, uint64 code, uint64 tval); } riscv_instruction_action_interface_t;
+extern typedef struct { bool (*register_csr)(conf_object_t *cpu, conf_object_t *ext_obj, uint32 csr_address, char const *name, char const *description, riscv_csr_access_cb_t access); void (*register_reset)(conf_object_t *cpu, conf_object_t *csr_obj, riscv_reset_cb_t reset_func); } riscv_custom_csr_interface_t;
+extern typedef uint64 (*riscv_csr_access_cb_t)(conf_object_t *obj, conf_object_t *cpu, uint32 csr_address, uint64 value, uint64 write_mask, riscv_csr_access_type_t type);
+extern typedef uint64 (*riscv_reset_cb_t)(conf_object_t *obj, conf_object_t *cpu);

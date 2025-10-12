@@ -1,0 +1,291 @@
+/*
+  NS16550.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device NS16550;
+parameter desc = "model of NS 16550 UART";
+
+import "ns16x50-common.dml";
+import "ns16x50-fifo.dml";
+
+// The following feature imports are optional
+// and can be individually removed:
+import "ns16x50-dma.dml";
+import "ns16x50-reset.dml";
+
+bank regs {
+    is uart_bank;
+
+    parameter iir_offset = undefined;
+
+    register iir_fcr size 1 @ 0x0002    "Interrupt ID/FIFO Control (read/write)";
+
+    register fcr     size 1 @ undefined "FIFO Control Register";
+}
+
+parameter default_bank = $regs;
+
+method uart_init() {
+    $trigger_lvl = 1;
+}
+
+attribute trigger_lvl "Internal: Receive FIFO trigger level.";
+attribute xmit_fifo "The 128 byte deep transmit FIFO.";
+attribute recv_fifo "The 128 byte deep receive FIFO.";
+attribute in_fifo_mode "Internal: If operating in FIFO mode.";
+
+parameter dev_bank = $regs;
+
+method ct_int_enabled() -> (bool value) {
+    value = $in_fifo_mode;
+}
+
+parameter fifo_depth = 16;
+
+method get_iir_top4() -> (value) {
+    if ($in_fifo_mode)
+        value = 0xC;
+    else
+        value = 0x0;
+}
+
+attribute trigger_lvl {
+    parameter allocate_type = "uint32";
+}
+
+attribute in_fifo_mode {
+    parameter allocate_type = "bool";
+}
+
+method set_rcv_trigger(int value) {
+    $trigger_lvl = value;
+    call $check_recv_trigger();
+}
+
+attribute xmit_fifo {
+    is fifo;
+
+    method changed() {
+        inline $xmit_changed();
+    }
+}
+
+attribute recv_fifo {
+    is fifo;
+
+    method changed() {
+        inline $recv_changed();
+    }
+}
+
+method recv_changed()
+{
+    inline $check_recv_trigger();
+    inline $check_recv_dma();
+    if ($receive_throttled) {
+        local bool recv_full;
+        call $recv_fifo.is_full() -> (recv_full);
+        if (!recv_full) {
+            // There is now room for more incoming data.
+            $receive_throttled = false;
+            if ($console.obj)
+                $console.serial_device.receive_ready();
+        }
+    }
+}
+
+method xmit_changed() {
+    inline $check_xmit_dma();
+    inline $check_xmit_empty();
+}
+
+method check_recv_trigger()
+{
+    local int trg;
+    if ($in_fifo_mode) {
+        trg = ($recv_fifo.len >= $trigger_lvl) ? 1 : 0;
+    } else {
+        trg = ($recv_fifo.len > 0) ? 1 : 0;
+    }
+    if ($regs.ii.rd != trg) {
+        log info, 4: "INT: Trigger level passed, %d -> RD_INT.", trg;
+        inline $regs.ii.rd.put(trg);
+    }
+}
+
+method check_xmit_empty() {
+    if ($xmit_fifo.len == 0)
+        inline $regs.ii.te.put(1);
+}
+
+event receive_timeout {
+    parameter timebase = "seconds";
+    method soon()
+    {
+        inline $receive_timeout.remove(NULL);
+        local float swait;
+        inline $xmit_time.in_seconds() -> (swait);
+        inline $receive_timeout.post(swait * 4, NULL);
+    }
+    method event(nodata)
+    {
+        if ($recv_fifo.len > 0) {
+            log info, 4: "INT: Receive timeout reached and triggered.";
+            inline $regs.ii.ct.put(1);
+            inline $check_recv_dma();
+        }
+    }
+}
+
+method should_throttle() -> (bool throttle) {
+    local size_t maxlen;
+    maxlen = ($in_fifo_mode) ? $fifo_depth : 1;
+    throttle = ($recv_fifo.len >= maxlen);
+}
+
+method recv_buffer_length() -> (length) {
+    length = $recv_fifo.len;
+}
+
+method xmit_buffer_length() -> (length) {
+    length = $xmit_fifo.len;
+}
+
+method recv_buffer_write(value) {
+    local bool overrun;
+    call $recv_fifo.push(value) -> (overrun);
+    if (overrun) {
+        log info, 3: "RECV: Full recv fifo pushed, overrun raised!";
+        inline $regs.ii.rs.put(1);
+    } else {
+        log info, 3: "RECV: Data %#x pushed on recv fifo.", value;
+        call $receive_timeout.soon();
+    }
+}
+
+method recv_buffer_read() -> (empty, value)
+{
+    call $recv_fifo.pop() -> (empty, value);
+    inline $regs.ii.ct.put(0);
+    if (!empty) {
+        inline $recv_changed();
+        call $receive_timeout.soon();
+    }
+}
+
+method xmit_buffer_read() -> (empty, value) {
+    inline $xmit_fifo.pop() -> (empty, value);
+}
+
+method xmit_buffer_write(value)
+{
+    local bool wasfull;
+    call $xmit_fifo.push(value) -> (wasfull);
+    if (!wasfull)
+        call $transmit.soon();
+    if ($regs.ii.te == 1) {
+        inline $regs.ii.te.put(0);
+        log info, 4: "XMIT: Transmitter written, TE_INT reset.";
+    }
+}
+
+bank regs {
+    register rtb {
+        method hard_reset()
+        {
+            call $xmit_fifo.clear();
+            call $recv_fifo.clear();
+        }
+        method soft_reset() {
+            call $hard_reset();
+        }
+    }
+
+    register iir_fcr is (noalloc) {
+        parameter configuration = "none";
+        method read_access(memop, msb1, lsb) -> (value) {
+            inline $iir.read_access(memop, msb1, lsb) -> (value);
+        }
+        method write_access(memop, msb1, lsb, value) {
+            inline $fcr.write_access(memop, msb1, lsb, value);
+        }
+    }
+
+    register fcr is (noalloc) {
+        parameter configuration = "none";
+        field rftl[7:6] is (noalloc) "FIFO trigger level" {
+            method write(value)
+            {
+                if ($in_fifo_mode) {
+                    local size_t tl;
+                    tl = 2 << value;
+                    tl = (tl == 2) ? 1 : (tl == 16) ? 14 : tl;
+                    if (tl == $trigger_lvl)
+                        return;
+                    log info, 4: "RECV: New FIFO trigger level: %zu.", tl;
+                    call $set_rcv_trigger(tl);
+                }
+            }
+        }
+        field dsm[3] is (noalloc) "DMA signaling mode" {
+            method write(value) {
+                if ($in_fifo_mode)
+                    call $set_dma_signaling(value == 1);
+            }
+        }
+        field ctf[2] is (noalloc) "Clear Transmit FIFO" {
+            method write(value)
+            {
+                if ($in_fifo_mode && value == 1) {
+                    call $xmit_fifo.clear();
+                    log info, 4: "XMIT: Transmit FIFO cleared.";
+                }
+            }
+        }
+        field crf[1] is (noalloc) "Clear Receive FIFO" {
+            method write(value)
+            {
+                if ($in_fifo_mode && value == 1) {
+                    call $recv_fifo.clear();
+                    log info, 4: "RECV: Receive FIFO cleared.";
+                }
+            }
+        }
+        field ef[0] is (noalloc) "Enable FIFO" {
+            method write(value)
+            {
+                if ((value != 0) != $in_fifo_mode) {
+                    $in_fifo_mode = (value != 0);
+                    if ($in_fifo_mode)
+                        log info, 2: "Switched to FIFO mode.";
+                    else
+                        log info, 2: "Switched to non-FIFO mode.";
+                    call $xmit_fifo.clear();
+                    call $recv_fifo.clear();
+                    inline $regs.ii.reevaluate();
+                }
+            }
+        }
+        method hard_reset() {
+            $in_fifo_mode = false;
+            $trigger_lvl = 1;
+        }
+        method soft_reset() {
+            call $hard_reset();
+        }
+    }
+}
+

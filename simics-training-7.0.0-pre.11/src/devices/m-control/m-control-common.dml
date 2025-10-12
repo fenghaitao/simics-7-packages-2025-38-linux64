@@ -1,0 +1,742 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  m-control : Mandelbrot fractal compute controller device, in DML
+            : Part of Simics training materials
+
+  This file captures the common functionality of both variants
+  of the class: with and without stalling.  Imported from the two
+  top-level devices. 
+
+*/
+
+dml 1.4;
+
+// Note: no device declaration here, since this code is used
+// as a library to implement m-control and m-control-stall. 
+
+// Key parameter: stall on status register reads
+//   Set by the top-level devices to true or false 
+//   Enable use of stall performance optimization 
+param stall_on_status_read default false;
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+import "simics/devs/memory-space.dml";
+import "simics/simulator-api.dml";
+import "m-compute-control-interface.dml";
+
+loggroup control;  // operations that control the computation
+loggroup compute;  // actual compute work
+loggroup performance;  // performance
+
+//-----------------------------------------------------------------------------
+//
+// Hardware support limits
+// - Number of compute units this controller is built to handle
+// - It is a compile-time constant in the model
+// - In use, it can be set up to use fewer 
+//
+//-----------------------------------------------------------------------------
+param max_compute_units = 8;
+
+//----------------------------------------------------------------------
+//
+// Configuration attributes
+//
+//----------------------------------------------------------------------
+
+// bitmask primitive to make it a bit clearer what we do 
+method bitmask(uint64 a, uint64 b) -> (uint64) { 
+    return( ~0)[a:b];
+}
+
+attribute connected_compute_unit_count is (uint64_attr) {
+    param documentation = "Number of compute units connected to the control unit. " +
+                          "Actual connections are set up the compute_units attribute.";
+    param configuration = "required";   // must be provided on model creation
+
+    // Nice to store the cached value in the scope of the attribute 
+    session uint64 cached_mask;
+
+    method set(attr_value_t  a_value) throws {
+        local uint64 value = SIM_attr_integer(a_value);
+        if(value > max_compute_units) {
+            throw;
+        }
+        this.val = value;
+
+        // Cache the bit mask 
+        cached_mask = bitmask(value-1,0);
+    }
+}
+
+// This attribute is used to allow better error checking in setup code
+// Returns the number of compute units that this control unit can support
+attribute model_max_compute_unit_count is read_only_attr {
+    param documentation = "Max number of compute units this model can support.";
+    param type = "i";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return (SIM_make_attr_int64(max_compute_units));
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Attribute for controlling on-access stalling for status register
+//
+//----------------------------------------------------------------------
+#if(stall_on_status_read) {
+    attribute status_reg_stall_time is (double_attr, init) {
+        param documentation = "Time to stall on status register reads (s)";
+        param configuration = "optional";
+        method init() {
+            this.val = 50.0e-6;  // 50 micro seconds, or about 5000 pixels
+        }
+    }
+} 
+
+//----------------------------------------------------------------------
+//
+// Attribute for testing attribute raising
+//
+//----------------------------------------------------------------------
+attribute test_sending_intr is write_only_attr {
+    param documentation = "Write-only test attribute to trigger operation complete interrupt";
+    param internal = true;
+    param type = "i";
+    method set (attr_value_t val) throws {
+        log info, 1, control:  "Hit test attribute, raising MSI-X interrupts etc.";
+        // Do the full interrupt raising operation
+        raise_operation_complete_interrupt();
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Connects to the two memory spaces
+// - registers
+// - local memory 
+// So that we can expose them over PCIe to the rest of the system.
+// Note that the contents of the register memory is not defined in 
+// this device, but in the component code that sets up the subsystem.
+//
+//----------------------------------------------------------------------
+connect register_memory "Memory space for the on-accelerator registers" {
+    param configuration = "required";
+    interface memory_space;
+}
+
+connect local_memory "Memory space for the on-accelerator RAM" {
+    param configuration = "required";
+    interface memory_space;
+}
+
+
+//----------------------------------------------------------------------
+//
+// Connects   
+// - Reference to the compute unit control port
+// - Start operation and clear done wrapped inside the custom interface
+//
+//----------------------------------------------------------------------
+connect compute_unit_control[i<max_compute_units]
+        "Connection to the compute unit control ports" {
+
+    param configuration = "optional"; 
+    param internal = false;       // = list-attributes shows it by default
+    interface m_compute_control;
+
+    // This method handles the "protocol" to a compute unit.
+    // Avoids putting that into the starting-operation method. 
+    method signal_start_operation() {
+        if (!obj) {
+            // Print clear error message - even though this should not happen unless
+            // the user interactively breaks the setup after using either a component
+            // or proper setup code to set things up.
+            // 
+            // Note that this possibility for inconsistency is left in the model
+            // on purpose.  It is a lot easier to code like this, letting the external 
+            // setup take care to make things consistent.  After all, a user of the 
+            // model should use the component to configure things, not create 
+            // objects out of thin air.  There are many other constraints in place. 
+            // 
+            log error : "Model setup is inconsistent! (connect %s has no object)", this.qname; 
+            return;
+        }
+        // Signal the object to start computing
+        this.m_compute_control.start_operation();
+    }
+
+    method signal_clear_done() {
+        if (!obj) {
+            // Print clear error message - just like above, see above 
+            // comment for more details
+            log error : "Model setup is inconsistent! (connect %s has no object)", this.qname; 
+            return;
+        }
+        // Signal the object to clear the done flag
+        this.m_compute_control.clear_done();
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Connects   
+// - Reference to outside world from the control unit
+//
+//----------------------------------------------------------------------
+connect operation_done is (signal_connect) "Target for control unit done notification" {
+    //
+    // Using the template "signal_connect" changes how the outbound
+    // signal is handled. Instead of calling signal_raise/signal_lower,
+    // the code call set_level() which gets converted into signal_raise
+    // and signal_lower as needed. See the DML 1.4 Manual for more information.
+    //
+    param configuration = "optional";  
+    param internal = false;       // = list-attributes shows it by default
+
+    // Signal that the operation completed
+    // But only if something is connected
+    method signal_done() {
+        if(obj) {
+            log info, 2, control: "Raising completion signal";            
+            set_level(1);
+        } else {
+            log info, 2, control: "No object to signal completion to (%s)", this.qname;
+        }
+    }
+
+    method signal_done_clear() {
+        if(obj) {
+            log info, 3, control: "Lowering completion signal";            
+            set_level(0);
+        } else {
+            log info, 3, control: "No connected object for %s", this.qname;
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Template "smart signal" 
+// - Collect logic that checks for double-raise and double-lower
+// - Included as an example for how to break out functionality 
+//   into a template to leave the core logic less cluttered. 
+// - Also, if you had several incoming signals in the device, this
+//   would be easy to apply to all of them without a lot of 
+//   of copy-paste. 
+//
+//----------------------------------------------------------------------
+template level_checked_signal {
+
+    // This method should be overridden to provide the actual 
+    // implementation of what happens on a signal_raise.
+    //
+    // The "default" keyword indicates that it is here to be 
+    // replaced by an actual implementation in an object that
+    // implements the template. 
+    //
+    // Since some kind of custom behavior is needed, the template
+    // issues a compile-time error if the override is missing
+    //
+    method on_signal_raise () default {
+        error "Please override on_signal_raise()";
+    }
+
+    // Same for signal_lower.
+    method on_signal_lower () default {
+        error "Please override on_signal_lower()";
+    }
+
+    implement signal {
+        // saved int = value is checkpointed in an attribute,
+        // no need to write any more code than this to achieve that. 
+        saved int level = 0;
+
+        method signal_raise() {
+            // Level 3 - debug - indicate what is going on for the programmer
+            log info, 3, control: "%s - Signal raised", this.qname;
+            // Report incorrect use of the signal interface
+            if (level==1) {
+                log spec_viol, 1, control :
+                    "%s: signal raise called with signal already raised.", this.qname;                
+                return;
+            }
+            // True raise:
+            on_signal_raise();
+            // Set level to 1
+            level = 1;
+        }
+
+        method signal_lower() {
+            if (level==0) {
+                // Report incorrect use of the signal interface                
+                log spec_viol, 1, control :
+                    "%s: Signal lower called with signal already lowered.", this.qname;   
+                return;             
+            }
+            // True lowering:
+            on_signal_lower();
+            level = 0;
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Ports   
+// - Incoming connections 
+//   - "done" - raised when a compute unit has completed its work.
+//              lowered once the done state is cleared in the compute unit. 
+//
+//---------------------------------------------------------------------
+port done[i<max_compute_units] is level_checked_signal 
+                               "completion signal from compute units" {
+
+    method on_signal_raise() {
+        // Note that the compute unit completed its work
+        log info, 2, control: "Completion signal received from unit %d raised, setting done bit", i;
+        ctrl.done.unit[i].val = 1;
+
+        // All done?
+        if(ctrl.done.val == ctrl.used.val) {
+            log info, 2, control: "Compute operation finished (in all used compute units)";
+            raise_operation_complete_interrupt();
+        }
+    }
+    
+    method on_signal_lower() {
+        log info, 3, control: "Done signal from unit %d lowered ", i;
+        ctrl.done.unit[i].val = 0;
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Start and finish up the computation in the compute units 
+//
+//----------------------------------------------------------------------
+method start_compute(uint64 unitcount) {
+    log info, 2, control : "Start_compute: operation for %d units requested", unitcount;
+
+    // Check value
+    if ((unitcount==0) || 
+        (unitcount > connected_compute_unit_count.val )) {
+        log spec_viol, 1, control :
+        "Invalid value for compute start: requested %d (expected 1 to %d).",
+            unitcount, connected_compute_unit_count.val;
+        return;
+    }
+
+    // Check for an attempt to start the operation while one is pending
+    if(ctrl.status.processing.val==1) {
+        log spec_viol, 1, control :
+        "Compute start requested while an operation is ongoing - ignoring";
+        return;
+    }
+
+    // Clear out any lingering "done" state
+    // This is OK, since the accelerator is not actively processing
+    if(ctrl.status.done.val==1) {
+        do_clear_done();
+    }
+
+    // Start compute in each compute unit
+    local int i;
+    ctrl.used.val = 0;  // clear all "used" flags
+    for (i=0; i < unitcount; i++ ) {
+        log info, 3, control : "Signalling unit %d to start", i;
+
+        // Signal the compute unit to do its work 
+        compute_unit_control[i].signal_start_operation();       
+
+        // Mark it as active
+        ctrl.used.unit[i].val = 1;
+    }
+
+    // Update global control registers
+    ctrl.status.processing.val = 1;
+    ctrl.status.done.val = 0;
+    ctrl.start.val = unitcount;
+}
+
+method raise_operation_complete_interrupt() {
+    // Log 
+    log info, 3, control: "Raising interrupts and notifying notifier for operation done.";
+
+    // Turn of processing state
+    ctrl.status.processing.val = 0;
+
+    // Raise external-facing signal
+    // and set the done flag in the register
+    do_set_done();
+
+    // Raise PCIe interrupt 
+    // - Nothing happens if PCIe is not set up in the PCIe BARs
+    // - This is a message interrupt, thus no "lower" call is needed
+    pcie_config.msix.raise(0);
+
+    // Signal notifier, for scripting to use 
+    SIM_notify(this.obj, complete_notifier());
+}
+
+//----------------------------------------------------------------------
+//
+// Logic for done flag and completion signal
+// - Done flag and external signal should always be in sync
+//----------------------------------------------------------------------
+
+method do_set_done() {
+    log info, 2, control: "Setting done flag";
+    operation_done.signal_done();
+    ctrl.status.done.val = 1;
+}
+
+method do_clear_done() {
+    // Clear outbound done signal
+    log info, 2, control: "Clearing done flag";
+    operation_done.signal_done_clear();
+
+    // Clear done signals from compute units
+    // Use the same logic loop as when starting the operation
+    local int unitcount = ctrl.start.val;
+    // No check for sane values needed this late in the process
+
+    local int i;
+    for (i=0; i < unitcount; i++ ) {
+        log info, 3, control : "Signalling unit %d to clear its done flag", i;
+
+        // Signal the compute unit to clear its done flag 
+        compute_unit_control[i].signal_clear_done();       
+    }
+
+    // Update registers 
+    ctrl.status.done.val = 0; // done field in status register
+    ctrl.start.val = 0;
+    ctrl.used.val = 0;
+    ctrl.done.val = 0;
+
+    // PCIe MSI-X: no need to do anything in particular
+    // Since interrupts are not kept raised, but are just signals
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// Device control register bank 
+// - "Global" control registers 
+//
+//-----------------------------------------------------------------------------
+
+// Template for the bitmask registers - since they all have the same
+// field layout this is an efficient way to code them.
+template compute_unit_bitmask_register {
+    field reserved @ [63:max_compute_units] is (zeros);
+    field unit[i<max_compute_units] @ [i] is (read_only);
+}
+
+bank ctrl "control registers" {
+    param documentation = "Control register bank for the " +
+                          "accelerator subsystem.";
+
+    param register_size = 8;
+
+    register compute_units @ 0x00 is (read_only) "Available compute units";
+    register start  @ 0x08 is (write) "Start operation"; 
+    register status @ 0x10 "Operation status" {
+        field done        @ [63] is (write)      "Operation completed" ;
+        field processing  @ [62] is (read_only)  "Operation in progress" ;
+        field unused      @ [61:0] is (reserved) "unused" ;
+    }
+    register _reserved    @ 0x18 is (reserved) "Reserved";
+
+    // Managing the compute units 
+    // as bit masks in registers 
+    register present @ 0x20 is (compute_unit_bitmask_register) "compute units present bitmask";
+    register used    @ 0x28 is (compute_unit_bitmask_register) "units used in current operation";
+    register done    @ 0x30 is (compute_unit_bitmask_register) "units used & completed operation";
+}
+
+//----------------------------------------------------------------------
+//
+// Register bank implementation  
+// - Adding the functionality to the names and offsets declared above
+//
+//----------------------------------------------------------------------
+bank ctrl {
+    // Go to modern transactions
+    param use_io_memory = false; 
+    
+    // Poll loop optimization 
+    #if(stall_on_status_read) {
+
+        // Override transaction reception to defer reply
+        method transaction_access(transaction_t *t, uint64 offset, void *aux) -> (exception_type_t) {
+            // Retrieve the initiator of the transaction and pass it along to the read_register call
+            // in the aux pointer
+            return default(t, offset, SIM_transaction_initiator(t));
+        }
+    } // end-if
+
+    // Compute - writing register with #compute units to use
+    //           activates the compute units.
+    register start is write {
+        method write(uint64 value) {
+            start_compute(value);
+            this.val = value;
+        }
+    }
+
+    // Status - the "done" bit requires some extra logic
+    register status {
+        field done is write {
+            method write(uint64 v) {
+                if (v==1) {
+                    if(this.val==1) {
+                        // Wrote a 1 bit to clear the done flag
+                        // - Take all side-effect actions needed. 
+                        do_clear_done();
+                    } else {
+                        log spec_viol, 1, control: "Attempt to clear already clear done flag";
+                    }
+                } else {
+                    log spec_viol, 1, control: "Writing zero to done has no effect";
+                }
+            }
+        }
+
+        // Stall initiator on memory accesses, to optimize poll loops
+        #if(stall_on_status_read) {
+            method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+                // The aux pointer is passed on from transaction_access above
+                // stall the caller in case it is a processor 
+                if(aux!=NULL) {
+                    local conf_object_t * aux_obj = cast(aux, conf_object_t *);
+                    if(SIM_object_is_processor(aux_obj)) {
+                        log info, 3, performance: "stalling processor access to status register";
+                        SIM_stall(aux_obj, status_reg_stall_time.val );
+                    }
+                }      
+                return default(enabled_bytes, aux);
+            }
+        } // #if  
+    }
+
+    // compute_units should return # of configured compute units
+    // present should return a bit mask of the same
+    //
+    //  In hardware, this would typically be fused into the chip in
+    //  testing. The dies would be tested, number of good compute units
+    //  determined, and an actual number set in fuses. The number
+    //  could be lower than number of good units, in case there is a
+    //  need to create different products at different price levels.
+    //
+    // No attribute is generated for the register, since the information
+    // is already held in the configuration attribute.  In principle, 
+    // there could be a pseudo attribute, but that is a matter of 
+    // judgement.  Register inspection should be via register 
+    // inspection commands and not via attributes.
+    // 
+    register compute_units is (read, get) {
+        param configuration = "none";  // do not generate an attribute 
+        method get() -> (uint64) {
+            return connected_compute_unit_count.val;
+        }
+        method read() -> (uint64) {
+            return get();
+        }
+    }
+
+    register present is (read, get)  {
+        param configuration = "none";  // do not generate an attribute 
+        method get() -> (uint64) {
+            return connected_compute_unit_count.cached_mask;
+        }
+        method read() -> (uint64) {
+            return get();
+        }
+    }
+
+}
+
+//----------------------------------------------------------------------
+//
+// Device initialization 
+// 
+//----------------------------------------------------------------------
+independent startup memoized method complete_notifier() -> (notifier_type_t) {
+    // Runs at module load time to create the notifier
+    //
+    // All future calls to method will return the same value,
+    //   cached automatically in DML  
+    local notifier_type_t t = SIM_notifier_type("m-compute-complete");
+
+    SIM_register_notifier(SIM_get_class(dev.classname),
+                          t,
+                          "Triggered when the compute unit operation completes");
+
+    return t;
+}
+
+//----------------------------------------------------------------------
+//
+// PCIe interface
+// 
+//----------------------------------------------------------------------
+// Make this a PCIe device, in the new PCIe framework
+import "pcie/common.dml";
+is pcie_endpoint; 
+
+// Device building parameters
+param MSIX_VECTORS = 2 ;        // Number of MSI-X interrupts vectors possible. Total overkill. 
+
+// loggroup for PCIe
+loggroup MSIX_interrupt;
+loggroup PCIe;
+
+//----------------------------------------------------------------------
+//
+// PCIe configuration bank 
+//
+//----------------------------------------------------------------------
+bank pcie_config {
+    param desc = "configuration bank for the mandelbrot accelerator";
+   
+    // Our Vendor, Device ID, and other identification information
+    register vendor_id   { param init_val =   0x8086; }  // Intel
+    register device_id   { param init_val =   0x0D5F; }  // PCIe ID assigned to Simics 
+    register revision_id { param init_val =     0x02; }  // Revision number
+    register class_code  { param init_val = 0x120000; }  // "Processing accelerator"
+    
+    register status {
+        field c { param init_val = 1; }  // mark that we have capabilities
+    }
+    
+    //
+    // BAR #0: control register memory space
+    //          
+    register base_address_0 @ 0x10 is (memory_base_address_32) {
+        param desc = "BAR0 maps the control registers";
+        param size_bits = 12;   // size of mapping -- 12 bits = 4kB for regs 
+        field prefetchable { param init_val = 1; }
+        // Make the internal register memory map of the training device
+        // available as BAR0 - includes this device and also the compute
+        // units. 
+        param map_obj = register_memory.obj;  
+    }
+
+    //
+    // BAR #1 and #2: MSI-X
+    // -- Connection from BARs to MSI-X is in the BIR registers in the 
+    //    MSI-X capability 
+    register base_address_1 @ 0x14 is (memory_base_address_32) {
+        param desc = "BAR1 maps the MSI-X interrupt data table and PBA";
+        param size_bits = 8;   
+    }
+
+    //
+    // BAR #3: Local memory 
+    // 
+    register base_address_3 @ 0x1c is (memory_base_address_32) {
+        param desc = "BAR3 maps the RAM on the card";
+        param size_bits = 26;   // size of mapping -- 26 bits = 64MiB 
+        field prefetchable { param init_val = 1; }
+        // Make the internal memory map of the training device
+        // available as BAR0. 
+        param map_obj = local_memory.obj;  
+    }
+
+    
+    // PCI and PCIe Capabilities - follows the main configuration registers in the pci configuration space
+    register capabilities_ptr { param init_val = msix.base; }
+
+
+    // MSI-X capability
+    // - Software will write into the capability to configure where
+    //   to send interrupts. 
+    group msix is msix_capability {
+        param base = 0x70;
+        param next_ptr = exp.base;  // Point on to PCIe cap
+        param num_vectors = MSIX_VECTORS;
+        // Offsets for the tables inside the bank
+        //   Low three bits designate the BAR used for the table
+        //   It is masked off when determining the address to map at
+        param table_offset_bir = 0x0000 +  0x01;
+        param pba_offset_bir = 0x040 + 0x01;
+        param data_bank = msix_data;
+    }    
+
+    // PCIe capability;
+    group exp is exp_capability {
+        param base = 0x80;
+        param next_ptr = 0x0;  // end of list
+
+        // Make the link register(s) appear
+        param has_links = true; 
+    
+        //  This device does not implement anything needing capabilities_2 regs
+    
+        // Endpoint type, goes into the "PCI Express Capabilities Register"
+        param dp_type = PCIE_DP_Type_EP;  // device port type endpoint
+           
+        // "Device capabilities register". 
+        //   The exp_dev group is created by the exp_capability template, contains the cap
+        //   register. Override cap register fields. 
+        group device {
+            register cap {
+                field el0al { param init_val = 0x01; } // 128 ns 
+                field el1al { param init_val = 0x01; } // 2 us 
+                field rber  { param init_val = 0x1; }  // must be 1 for PCIe, basically
+            }
+        }
+        
+        // The link group is created by the exp_capability template. 
+        // Contains the cap, status, and control registers. 
+        group link {
+            // Sets values in the "Link capabilities register" or "cap"
+            //   Provide hard-coded link speed and width to make software happy
+            param max_link_speed = PCIE_Link_Speed_8;
+            param max_link_width = PCIE_Link_Width_x4;
+
+            // Hard-code results of link training, to make it 
+            // look "interesting/realistic" when inspected from target software. 
+            // In real hardware, this is negotiated between the root complex and 
+            // the endpoint. 
+            register status {
+                field ls  { param init_val = 0x1; }
+                field nlw { param init_val = 0x4; }  // Link width, should be != 0
+            }
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// MSI-X interrupt bank
+// - Driver software needs to configure how to send each interrupt in the table,
+//   configuring message data and message address
+//
+//----------------------------------------------------------------------
+bank msix_data is msix_table   {
+    param desc = "interrupt table and pending bit array for MSI-X";
+    param num_vectors = MSIX_VECTORS;
+}

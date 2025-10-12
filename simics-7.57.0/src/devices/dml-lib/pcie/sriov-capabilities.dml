@@ -1,0 +1,344 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "pcie/capabilities.dml";
+import "pcie/extended-capabilities.dml";
+
+template sriov_variant_capability {
+    /* We introduce these parameters for the SR-IOV variants of PCIe
+    capabilities to be able where needed set use_standard_access_templates and
+    use_standard_write_templates to false so we can modify set different
+    access/write templates for the fields in the capability. However, one caveat
+    is that in places where we end up doing this, we also have to include all
+    the fields and their respective access/write templates. This results in some
+    duplication of fields' access/write templates.
+
+    These parameters do not have to be configured by the user as their default
+    values are inherited by the aforementioned parameters.*/
+    param use_standard_access_sriov_capability_templates default bank.use_standard_access_templates;
+    param use_standard_write_sriov_capability_templates default bank.use_standard_write_templates;
+}
+
+template sriov_msix_capability is (msix_capability, sriov_variant_capability) {}
+template defining_sriov_msix_capability is defining_msix_capability {}
+
+template sriov_ari_capability is (ari_capability, sriov_variant_capability) { }
+template defining_sriov_ari_capability is defining_ari_capability {}
+
+template sriov_exp_capability is (exp_capability, sriov_variant_capability) {
+#if (is_physical) {
+    error "Only virtual functions (banks that instantiate vf_type_0_bank)"
+        + " should use the capability templates that have an 'sriov_' prefix";
+}
+    param dp_type = PCIE_DP_Type_EP;
+    param has_slots = false;
+    param has_root = false;
+
+    /* With the PCI Express Capability Structure, there are some differences in
+    access/write attributes that makes it impossible to simply apply those
+    differentiating access/write attribute templates to existing fields without
+    causing conflicts. Therefore, we set these params to false so that we can
+    add access/write templates applicable for the SR-IOV variant of this
+    capability. */
+    param use_standard_access_templates = false;
+    param use_standard_write_templates = false;
+
+#if (use_standard_access_sriov_capability_templates) {
+    group device {
+        register cap {
+            field mpss  is read_only;
+            field pfs   is (read_only, read_zero);
+            field etfs  is read_only;
+            field el0al is read_only;
+            field el1al is read_only;
+    #if (cap_version == 1) {
+            field abp   is read_only;
+            field aip   is read_only;
+            field pip   is read_only;
+    }
+            field rber  is read_only;
+    #if (pcie_version >= 5.0) {
+            field ecsc  is read_only;
+    }
+    #if (pcie_version >= 6.0) {
+            field rmf is hwinit;
+    }
+            field csplv is read_only;
+            field cspls is read_only;
+            field flrc  is read_only;
+    #if (pcie_version >= 6.0) {
+            field mms is hwinit;
+    }
+        }
+
+        register control {
+            field cere is (read_zero, ignore_write);
+            field nfere is (read_zero, ignore_write);
+            field fere is (read_zero, ignore_write);
+            field urre is (read_zero, ignore_write);
+            field ero is (read_zero, ignore_write);
+            field mps is (read_zero, ignore_write);
+            field etfe is (read_zero, ignore_write);
+            field pfe is (read_zero, ignore_write);
+            field appme is (read_zero, ignore_write);
+            field ens is (read_zero, ignore_write);
+            field mrrs is (read_zero, ignore_write);
+        }
+
+        register status {
+            field auxpd is (read_zero, ignore_write);
+#if (pcie_version >= 4.0) {
+            field eprd is (read_zero, ignore_write);
+}
+        }
+
+#if (cap_version >= 2) {
+        register cap2 {
+            field ctrs     is hwinit;
+            field ctds     is ignore_write;
+    #if (pcie_version >= 2.1) {
+            field arifs    is ignore_write;
+            field aors     is ignore_write;
+            field aocs32   is ignore_write;
+            field aocs64   is ignore_write;
+            field cascs    is ignore_write;
+            field nroprprp is hwinit;
+            field ltrms    is ignore_write;
+            field tphcs    is ignore_write;
+    #if (pcie_version >= 3.1) {
+    #if (pcie_version < 6.0) {
+            field lnscls   is hwinit;
+    }
+            field frss     is hwinit;
+    }
+    #if (pcie_version >= 4.0) {
+            field tcs      is hwinit;
+            field trs      is hwinit;
+            field eprs     is hwinit;
+            field eprir    is hwinit;
+    }
+    #if (pcie_version >= 3.0) {
+            field obffs    is hwinit;
+    }
+            field effs     is ignore_write;
+            field eetlpps  is hwinit;
+            field meetlpp  is hwinit;
+    }
+        }
+        register control2 {
+            field ctv is (read_zero, ignore_write);
+            field ctd is (read_zero, ignore_write);
+            field aore is (read_zero, ignore_write);
+            field idore is (read_zero, ignore_write);
+            field idoce is (read_zero, ignore_write);
+            field ltrme is (read_zero, ignore_write);
+            field eprr is (read_zero, ignore_write);
+            field tre is (read_zero, ignore_write);
+        }
+
+        register status2  is read_only;
+}
+    }
+#if (has_links) {
+    group link {
+        register cap {
+            field mls    is ignore_write;
+            field mlw    is ignore_write;
+            field aspms  is ignore_write;
+            field l0el   is ignore_write;
+            field l1el   is ignore_write;
+            field cpm    is ignore_write;
+            field sder   is ignore_write;
+            field dlllar is ignore_write;
+            field lbn    is ignore_write;
+#if (pcie_version >= 3.0) {
+            field aspmoc is hwinit;
+}
+            field pn     is hwinit;
+        }
+
+        register control {
+            field aspmc is (read_zero, ignore_write);
+#if (pcie_version >= 6.0) {
+            field ppdaib is (read_zero, ignore_write);
+}
+            field rcb is (read_zero, ignore_write);
+            field ccc is (read_zero, ignore_write);
+            field es is (read_zero, ignore_write);
+            field ecpm is (read_zero, ignore_write);
+            field hawd is (read_zero, ignore_write);
+        }
+
+        register status is pcie_no_function_level_reset {
+            field ls is (read_zero, ignore_write);
+            field nlw is (read_zero, ignore_write);
+            field te is (read_zero, ignore_write);
+            field lt is (read_zero, ignore_write);
+            field scc is (read_zero, ignore_write);
+            field dllla is (read_zero, ignore_write);
+            field lbms  is (read_zero, ignore_write);
+            field labs  is (read_zero, ignore_write);
+        }
+
+#if (cap_version >= 2) {
+        register cap2 {
+#if (pcie_version >= 3.0) {
+            field slsv       is hwinit;
+            field cs         is ignore_write;
+}
+#if (pcie_version >= 3.1) {
+            field lskposgssv is hwinit;
+            field lskposrssv is hwinit;
+            field drss       is hwinit;
+}
+#if (pcie_version >= 4.0) {
+            field rpds       is hwinit;
+            field trpds      is hwinit;
+}
+        }
+
+        register control2 {
+            field tls   is (read_zero, ignore_write);
+            field ec    is (read_zero, ignore_write);
+            field hasd  is (read_zero, ignore_write);
+            field sd    is (hwinit);
+            field tm    is (read_zero, ignore_write);
+            field emc   is (read_zero, ignore_write);
+            field csos  is (read_zero, ignore_write);
+#if (pcie_version == 2.0) {
+            field cd    is (read_zero, ignore_write);
+}
+#if (pcie_version >= 3.0) {
+            field cd    is (read_zero, ignore_write);
+}
+        }
+
+        register status2 {
+#if (pcie_version >= 3.0) {
+            field cdl   is (read_zero, ignore_write);
+            field ec    is (read_only);
+            field ep1s  is (read_only);
+            field ep2s  is (read_only);
+            field ep3s  is (read_only);
+}
+#if (pcie_version >= 4.0) {
+            field rpd   is (read_zero, ignore_write);
+            field trpd  is (read_zero, ignore_write);
+            field cr    is (read_only);
+}
+#if (pcie_version >= 6.0) {
+            field fms   is (read_only);
+}
+#if (pcie_version >= 3.1) {
+            field dcp   is (read_zero, ignore_write);
+            field drsmr is (read_zero, ignore_write);
+}
+        }
+    }
+}
+}
+}
+
+#if (use_standard_write_sriov_capability_templates) {
+    group device {
+        register cap {
+            field csplv is pcie_no_function_level_reset;
+            field cspls is pcie_no_function_level_reset;
+        }
+        register control {
+            field mps is pcie_no_function_level_reset;
+        }
+        register status {
+            field ced   is pcie_write_1_clears;
+            field nfed  is pcie_write_1_clears;
+            field fed   is pcie_write_1_clears;
+            field urd   is pcie_write_1_clears;
+        }
+
+        register cap2 {
+            field ctrs     is pcie_sticky;
+#if (pcie_version >= 2.1) {
+            field nroprprp is pcie_sticky;
+#if (pcie_version >= 3.1) {
+#if (pcie_version < 6.0) {
+            field lnscls   is pcie_sticky;
+}
+            field frss     is pcie_sticky;
+}
+    #if (pcie_version >= 4.0) {
+            field tcs      is pcie_sticky;
+            field trs      is pcie_sticky;
+            field eprs     is pcie_sticky;
+            field eprir    is pcie_sticky;
+}
+    #if (pcie_version >= 3.0) {
+            field obffs    is pcie_sticky;
+}
+            field eetlpps  is pcie_sticky;
+            field meetlpp  is pcie_sticky;
+}
+        }
+    }
+
+#if (has_links) {
+    group link {
+        register cap {
+#if (pcie_version >= 3.0) {
+            field aspmoc is pcie_sticky;
+}
+            field pn     is pcie_sticky;
+        }
+        register control {
+            field rl is pcie_write;
+        }
+
+        register status is pcie_no_function_level_reset { }
+
+#if (cap_version >= 2) {
+        register cap2 {
+#if (pcie_version >= 3.0) {
+            field slsv       is pcie_sticky;
+}
+#if (pcie_version >= 3.1) {
+            field lskposgssv is pcie_sticky;
+            field lskposrssv is pcie_sticky;
+            field drss       is pcie_sticky;
+}
+#if (pcie_version >= 4.0) {
+            field rpds       is pcie_sticky;
+            field trpds      is pcie_sticky;
+}
+    }
+        register status2 {
+#if (pcie_version >= 3.0) {
+            field ec    is (pcie_sticky);
+            field ep1s  is (pcie_sticky);
+            field ep2s  is (pcie_sticky);
+            field ep3s  is (pcie_sticky);
+            field ler   is (pcie_sticky, pcie_write_1_clears);
+}
+        }
+}
+    }
+}
+}
+}
+
+template defining_sriov_exp_capability is _defining_exp_capability {
+    group exp is sriov_exp_capability {
+        param base = exp_offset;
+        param next_ptr = exp_next_ptr;
+    }
+}

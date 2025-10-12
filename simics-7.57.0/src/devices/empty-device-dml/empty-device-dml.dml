@@ -1,0 +1,55 @@
+/*
+  © 2010 Intel Corporation
+*/
+
+// empty-device-dml.dml - Skeleton code to base new DML device modules on
+
+dml 1.4;
+
+device empty_device_dml;
+
+param desc = "name of device";
+
+param documentation = "Longer description that will appear in the help";
+
+import "utility.dml";
+
+// USER-TODO: add connect definitions here, if needed
+
+// USER-TODO: add attribute definitions here, if needed
+
+// Basic bank declaration
+bank regs {
+    param register_size = 4;
+    // USER-TODO: Add more register declarations here.  Usually use just one
+    // line per register, containing size (optional), offset, any templates
+    // implemented, and a short description. The default behaviour of registers
+    // is a normal register behaviour where a read returns the last written
+    // value. Use the unimpl template for registers that you haven't yet
+    // implemented.
+    register counter @ 0x00 "A simple counter.";
+    register unimplemented @ 0x04 is (unimpl) "An unimplemented register.";
+}
+
+// USER-TODO: add implement and port declarations here, if needed
+
+// USER-TODO: add event declarations here, if needed
+
+// USER-TODO: add common methods here, if needed
+
+// USER-TODO: add templates here, if needed
+
+// Implementation of registers
+bank regs {
+    register counter {
+        // Methods and fields go here. If there is nothing to add here, the
+        // register block can be removed altogether.
+    }
+}
+
+// USER-TODO: Add init() and post_init() methods here, if needed.
+// init() will be run to set the empty state of the model, before any
+// configuration or checkpointed attributes are set.  post_init() is run after
+// all configuration attributes have been set.  This happens both when the
+// initial configuration is set and when the configuration is loaded from a
+// checkpoint.

@@ -1,0 +1,86 @@
+/*
+  endpoint.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_pcie_device;
+param classname = "sample-pcie-device";
+
+param desc = "sample PCIe device";
+param documentation = "A sample PCIe endpoint with a BAR mapped register bank"
+                    + " that contains a register that when written sends an"
+                    + " MSI-X interrupt after 0.1 seconds. It has 3 PCIe"
+                    + " capabilities that are mandatory for an endpoint. While"
+                    + " it uses MSI-X for interrupts but MSI could be used"
+                    + " also/instead.";
+
+import "pcie/common.dml";
+
+is pcie_endpoint;
+
+param pcie_version = 6.0;
+
+bank pcie_config {
+    register device_id { param init_val = 0x1234; }
+    register vendor_id { param init_val = 0x5678; }
+
+    // Notice that we are not using bar0 here which is on offset 0x10. This is
+    // to provide a more thorough example for how the msix capability is
+    // configured.
+    register bar1 @ 0x18 is (memory_base_address_64) {
+        param map_obj = bar_mapped_bank.obj;
+        param size_bits = 14;
+    }
+
+    register capabilities_ptr { param init_val = 0x40; }
+
+    is defining_pm_capability;
+    param pm_offset = capabilities_ptr.init_val;
+    param pm_next_ptr = pm_offset + 0x08;
+
+    is defining_msix_capability;
+    param msix_offset = pm_next_ptr;
+    param msix_next_ptr = msix_offset + 0x0C;
+    param msix_num_vectors = 32;
+    // We are here putting the MSI-X table and the MSI-X PBA in the memory space
+    // pointed to by BAR @ 0x18, where the bar_mapped_bank also resides. Therefore, we
+    // have to ensure that no overlapping occurs between the registers in the
+    // bar_mapped bank and the MSI-X structures
+    param msix_table_offset_bir = (2 << 0) | (0x1000 << 3);
+    param msix_pba_offset_bir = (2 << 0) | ((0x1000 + (0x10 * msix_num_vectors)) << 3);
+    param msix_data_bank = msix_data;
+
+    is defining_exp_capability;
+    param exp_offset = msix_next_ptr;
+    param exp_next_ptr = 0x0;
+    param exp_dp_type = PCIE_DP_Type_EP;
+}
+
+bank bar_mapped_bank {
+    register hello_world size 2 @ 0x0;
+
+    register hello_world is write {
+        param init_val = 0x1234;
+
+        method write(uint64 value) {
+            default(value);
+            after 0.1s: pcie_config.msix.raise(value);
+        }
+    }
+}
+
+bank msix_data is msix_table {
+    param msix_bank = pcie_config;
+}

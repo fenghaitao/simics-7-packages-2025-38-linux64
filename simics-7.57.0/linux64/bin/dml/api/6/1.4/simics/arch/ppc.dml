@@ -1,0 +1,119 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/arch/ppc.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/processor/generic-spr.dml";
+import "simics/pywrap.dml";
+import "simics/base/memory-transaction.dml";
+import "simics/processor/types.dml";
+import "simics/model-iface/cache.dml";
+
+extern ppc_memory_transaction_t *SIM_ppc_mem_trans_from_generic(generic_transaction_t *mop);
+extern typedef int ppc_mc_exc_t;
+constant Sim_PPC_Generic_MC = 0;
+constant Sim_PPC_MC_TEA = 1;
+constant Sim_PPC_MC_MCP = 2;
+constant Sim_PPC_Bus_Address_Parity = 3;
+constant Sim_PPC_Bus_Data_Parity = 4;
+constant Sim_PPC_Instruction_Cache_Parity = 5;
+constant Sim_PPC_Data_Cache_Parity = 6;
+constant Sim_PPC_L2_Data_Parity = 7;
+constant Sim_PPC_L3_Data_Parity = 8;
+constant Sim_PPC_L3_Address_Parity = 9;
+constant Sim_PPC970_Data_Cache_Parity = 10;
+constant Sim_PPC970_Data_Cache_Tag_Parity = 11;
+constant Sim_PPC970_D_ERAT_Parity = 12;
+constant Sim_PPC970_TLB_Parity = 13;
+constant Sim_PPC970_SLB_Parity = 14;
+constant Sim_PPC970_L2_Load_ECC_Parity = 15;
+constant Sim_PPC970_L2_Page_Table_ECC_Parity = 16;
+constant Sim_PPC970_Uncacheable_Load_Parity = 17;
+constant Sim_PPC970_MC_External = 18;
+extern typedef int ppc_mem_instr_origin_t;
+constant Normal_Load_Store = 0;
+constant Caching_Inhibited = 1;
+constant Instr_Multiple = 2;
+constant Instr_String = 3;
+constant Instr_Altivec_Element = 4;
+constant Instr_dcbt = 5;
+constant Instr_dcbst = 6;
+constant Instr_dcbtst = 7;
+constant Instr_dcbi = 8;
+constant Instr_dcbf = 9;
+constant Instr_dcbfl = 10;
+constant Instr_dcba = 11;
+constant Instr_dcbz = 12;
+constant Instr_icbi = 13;
+constant Instr_dst = 14;
+constant Instr_dstt = 15;
+constant Instr_dstst = 16;
+constant Instr_dststt = 17;
+constant Instr_dcblc_l1 = 18;
+constant Instr_dcblc_l2 = 19;
+constant Instr_dcbtls_l1 = 20;
+constant Instr_dcbtls_l2 = 21;
+constant Instr_dcbtstls_l1 = 22;
+constant Instr_dcbtstls_l2 = 23;
+constant Instr_icblc_l1 = 24;
+constant Instr_icblc_l2 = 25;
+constant Instr_icbtls_l1 = 26;
+constant Instr_icbtls_l2 = 27;
+constant Instr_lwarx = 28;
+constant Instr_stwcx = 29;
+constant Instr_ldarx = 30;
+constant Instr_stdcx = 31;
+constant Instr_lq = 32;
+constant Instr_stq = 33;
+constant Instr_sync = 34;
+constant Instr_eieio = 35;
+constant Instr_ecowx = 36;
+constant Instr_eciwx = 37;
+constant Instr_tlbie = 38;
+constant Instr_tlbsync = 39;
+constant Instr_isync = 40;
+constant Instr_lfdp = 41;
+constant Instr_stfdp = 42;
+constant Instr_spe = 43;
+constant Instr_dcbal = 44;
+constant Instr_dcblc_pc = 45;
+constant Instr_dcbtls_pc = 46;
+constant Instr_dcbtstls_pc = 47;
+constant Instr_icblc_pc = 48;
+constant Instr_icbtls_pc = 49;
+constant Instr_Fpu = 50;
+extern typedef int ppc_decoration_type_t;
+constant Decoration_None = 0;
+constant Decoration_Notify = 1;
+constant Decoration_Load = 2;
+constant Decoration_Store = 3;
+extern typedef int ppc_sleep_state_t;
+constant PPC_Sleep_Awake = 0;
+constant PPC_Sleep_MSR = 1;
+constant PPC_Sleep_Doze = 2;
+constant PPC_Sleep_Nap = 3;
+constant PPC_Sleep_Sleep = 4;
+constant PPC_Sleep_Rvwinkle = 5;
+constant PPC_Sleep_Wait = 6;
+constant PPC_Sleep_Waitrsv = 7;
+extern typedef struct { generic_transaction_t s; processor_mode_t mode; ppc_mem_instr_origin_t instr_origin; logical_address_t ea_origin; uint8 wimg; uint8 alignment; uint8 inhibit_exception; uint8 external_pid; ppc_decoration_t decoration; } ppc_memory_transaction_t;
+extern typedef struct { ppc_decoration_type_t type; uint64 data; } ppc_decoration_t;
+extern typedef struct { void (*clear_atomic_reservation_bit)(conf_object_t *cpu); void (*raise_machine_check_exception)(conf_object_t *cpu, ppc_mc_exc_t exc); uint32 (*get_timebase_enabled)(conf_object_t *cpu); void (*set_timebase_enabled)(conf_object_t *cpu, uint32 enabled); ppc_sleep_state_t (*get_sleep_state)(conf_object_t *cpu); void (*set_sleep_state)(conf_object_t *cpu, ppc_sleep_state_t state); } ppc_interface_t;
+extern typedef struct { void (*register_user_handlers)(conf_object_t *cpu, int64 spr_number, gen_spr_user_getter_func_t getter, lang_void *user_getter_data, gen_spr_user_setter_func_t setter, lang_void *user_setter_data, int privilege_checks); void (*unregister_user_handlers)(conf_object_t *cpu, int64 spr_number); void (*set_target_value)(conf_object_t *cpu, uint64 value); void (*stash_value)(conf_object_t *cpu, int64 spr_number, uint64 value); uint64 (*fetch_value)(conf_object_t *cpu, int64 spr_number); gen_spr_ret_t (*default_getter)(conf_object_t *cpu, int64 spr_number, gen_spr_access_type_t type); gen_spr_ret_t (*default_setter)(conf_object_t *cpu, int64 spr_number, uint64 value, gen_spr_access_type_t type); char const *(*get_name)(conf_object_t *cpu, int64 spr_number); int64 (*get_number)(conf_object_t *cpu, char const *spr_name); } spr_interface_t;
+extern typedef struct { uint64 (*get)(conf_object_t *obj, int pmr_number, bool instruction_read); void (*set)(conf_object_t *obj, int pmr_number, uint64 value, bool instruction_write); } pmr_interface_t;
+extern typedef struct { conf_object_t *obj; cache_control_interface_t const *ifc; } controllable_cache_t;

@@ -1,0 +1,94 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/model-iface/cpu-instrumentation.h>
+%}
+
+import "simics/pywrap.dml";
+import "simics/base/conf-object.dml";
+import "simics/base/memory-transaction.dml";
+import "simics/base/types.dml";
+import "simics/processor/types.dml";
+
+extern typedef int page_crossing_info_t;
+constant Sim_Page_Crossing_None = 0;
+constant Sim_Page_Crossing_First = 1;
+constant Sim_Page_Crossing_Second = 2;
+extern typedef int cpu_emulation_t;
+constant CPU_Emulation_Fall_Through = 0;
+constant CPU_Emulation_Control_Flow = 1;
+constant CPU_Emulation_Default_Semantics = 2;
+constant CPU_Emulation_Stall = 3;
+extern typedef int cpu_exception_scope_t;
+extern cpu_exception_scope_t CPU_Exception_All;
+extern typedef int cpu_control_register_scope_t;
+extern cpu_control_register_scope_t CPU_Control_Register_All;
+extern typedef int cpu_access_scope_t;
+constant CPU_Access_Scope_Explicit = 0;
+constant CPU_Access_Scope_Implicit = 1;
+extern typedef int cpu_stream_enum_t;
+constant CPU_Stream_Instruction_PA = 0;
+constant CPU_Stream_Instruction_VA = 1;
+constant CPU_Stream_Instruction_VA_After = 2;
+constant CPU_Stream_Read_PA = 3;
+constant CPU_Stream_Read_VA = 4;
+constant CPU_Stream_Write_PA = 5;
+constant CPU_Stream_Write_VA = 6;
+constant CPU_Stream_Read_Bytes = 7;
+constant CPU_Stream_Written_Bytes = 8;
+constant CPU_Stream_Address_VA = 9;
+constant CPU_Stream_Object = 10;
+constant CPU_Stream_Opcode = 17;
+constant CPU_Stream_Local = 32;
+constant CPU_Stream_User_Data = 63;
+extern typedef struct { } instruction_handle_t;
+extern typedef struct { } memory_handle_t;
+extern typedef struct { } decoder_handle_t;
+extern typedef struct { } exception_handle_t;
+extern typedef struct { } exception_return_handle_t;
+extern typedef struct { } address_handle_t;
+extern typedef struct { } cached_instruction_handle_t;
+extern typedef struct { } _cpu_instrumentation_entry_t;
+extern typedef struct { size_t size; uint8 const *data; } cpu_bytes_t;
+extern typedef struct { logical_address_t (*logical_address)(conf_object_t *cpu, instruction_handle_t *handle); physical_address_t (*physical_address)(conf_object_t *cpu, instruction_handle_t *handle); cpu_bytes_t (*get_instruction_bytes)(conf_object_t *cpu, instruction_handle_t *handle); bool (*is_existing_instruction)(conf_object_t *cpu, instruction_handle_t *handle); } cpu_instruction_query_interface_t;
+extern typedef struct { logical_address_t (*logical_address)(conf_object_t *cpu, memory_handle_t *handle); physical_address_t (*physical_address)(conf_object_t *cpu, memory_handle_t *handle); void (*set_host_ptr)(conf_object_t *cpu, memory_handle_t *handle, void *p); cpu_bytes_t (*get_bytes)(conf_object_t *cpu, memory_handle_t *handle); void (*set_bytes)(conf_object_t *cpu, memory_handle_t *handle, cpu_bytes_t bytes); bool (*atomic)(conf_object_t *obj, memory_handle_t *handle); ini_type_t (*arch)(conf_object_t *obj, memory_handle_t *handle); page_crossing_info_t (*get_page_crossing_info)(conf_object_t *obj, memory_handle_t *handle); buffer_t (*get_surrounding_bytes)(conf_object_t *cpu, memory_handle_t *handle, uint32 granularity_log2); } cpu_memory_query_interface_t;
+extern typedef struct { int (*exception_number)(conf_object_t *cpu, exception_handle_t *handle); logical_address_t (*fault_pc)(conf_object_t *cpu, exception_handle_t *handle); } cpu_exception_query_interface_t;
+extern typedef struct { void (*register_instruction_before_cb)(conf_object_t *cpu, cached_instruction_handle_t *ci_handle, cpu_instruction_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*register_instruction_after_cb)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, cpu_instruction_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*register_read_before_cb)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, cpu_memory_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*register_read_after_cb)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, cpu_memory_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*register_write_before_cb)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, cpu_memory_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*register_write_after_cb)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, cpu_memory_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*add_counter)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, uint64 *counter, bool use_atomic_increment); } cpu_cached_instruction_interface_t;
+extern typedef struct { void (*register_instruction_before_once_cb)(conf_object_t *cpu, cached_instruction_handle_t *ci_handle, cpu_instruction_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); void (*register_instruction_after_once_cb)(conf_object_t *cpu, cached_instruction_handle_t *ci_handle, cpu_instruction_cb_t cb, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); } cpu_cached_instruction_once_interface_t;
+extern typedef struct { void (*add_counters)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, uint64 *i_counter, uint64 *t_counter, bool use_atomic_increment); char const *(*get_service_routine_name)(conf_object_t *obj, instruction_handle_t *iq_handle); } internal_cached_instruction_interface_t;
+extern typedef struct { void (*register_emulation_cb)(conf_object_t *cpu, cpu_emulation_cb_t cb, decoder_handle_t *handle, lang_void *user_data, cpu_callback_free_user_data_cb_t free_cb); } cpu_instruction_decoder_interface_t;
+extern typedef struct { void (*remove_callback)(conf_object_t *cpu, cpu_cb_handle_t *handle); void (*enable_callback)(conf_object_t *cpu, cpu_cb_handle_t *handle); void (*disable_callback)(conf_object_t *cpu, cpu_cb_handle_t *handle); void (*remove_connection_callbacks)(conf_object_t *cpu, conf_object_t *connection); void (*enable_connection_callbacks)(conf_object_t *cpu, conf_object_t *connection); void (*disable_connection_callbacks)(conf_object_t *cpu, conf_object_t *connection); cpu_cb_handle_t *(*register_instruction_before_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_instruction_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_instruction_after_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_instruction_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_read_before_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_access_scope_t scope, cpu_memory_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_read_after_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_access_scope_t scope, cpu_memory_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_write_before_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_access_scope_t scope, cpu_memory_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_write_after_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_access_scope_t scope, cpu_memory_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_address_before_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_address_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_cached_instruction_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_cached_instruction_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_instruction_decoder_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_instruction_decoder_cb_t cb, cpu_instruction_disassemble_cb_t disass_cb, lang_void *data); cpu_cb_handle_t *(*register_exception_before_cb)(conf_object_t *cpu, conf_object_t *connection, int exception_number, cpu_exception_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_exception_after_cb)(conf_object_t *cpu, conf_object_t *connection, int exception_number, cpu_exception_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_exception_return_before_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_exception_return_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_exception_return_after_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_exception_return_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_mode_change_cb)(conf_object_t *cpu, conf_object_t *connection, cpu_mode_change_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_control_register_read_before_cb)(conf_object_t *cpu, conf_object_t *connection, int register_number, cpu_control_register_read_cb_t cb, lang_void *data); cpu_cb_handle_t *(*register_control_register_write_before_cb)(conf_object_t *cpu, conf_object_t *connection, int register_number, cpu_control_register_write_cb_t cb, lang_void *data); } cpu_instrumentation_subscribe_interface_t;
+extern typedef struct { uint64 tag; uint64 data; } cpu_stream_data_t;
+extern typedef struct { void (*add_stream)(conf_object_t *obj, cached_instruction_handle_t *ci_handle, cpu_stream_bits_t bits, cpu_stream_data_t **data, uint64 user_data); } cpu_cached_stream_interface_t;
+extern typedef struct { cpu_stream_handle_t *(*add_stream)(conf_object_t *cpu, conf_object_t *connection, cpu_stream_bits_t bits, cpu_stream_data_t **data, cpu_access_scope_t scope); void (*remove_stream)(conf_object_t *cpu, cpu_stream_handle_t *handle); } cpu_instrumentation_stream_interface_t;
+extern typedef struct { cpu_cb_handle_t *(*register_pre_decoder_cb)(conf_object_t *cpu, conf_object_t *connection, pre_decoder_cb_t cb, lang_void *data); } pre_decoder_interface_t;
+extern typedef logical_address_t (*cpu_address_cb_t)(conf_object_t *obj, conf_object_t *cpu, logical_address_t address, address_handle_t *handle, lang_void *user_data);
+extern typedef void (*cpu_cached_instruction_cb_t)(conf_object_t *obj, conf_object_t *cpu, cached_instruction_handle_t *ci_handle, instruction_handle_t *iq_handle, lang_void *user_data);
+extern typedef void (*cpu_callback_free_user_data_cb_t)(conf_object_t *obj, conf_object_t *cpu, lang_void *user_data);
+extern typedef _cpu_instrumentation_entry_t cpu_cb_handle_t;
+extern typedef void (*cpu_control_register_read_cb_t)(conf_object_t *obj, conf_object_t *cpu, int register_number, lang_void *user_data);
+extern typedef void (*cpu_control_register_write_cb_t)(conf_object_t *obj, conf_object_t *cpu, int register_number, uint64 value, lang_void *user_data);
+extern typedef cpu_emulation_t (*cpu_emulation_cb_t)(conf_object_t *obj, conf_object_t *cpu, lang_void *user_data);
+extern typedef void (*cpu_exception_cb_t)(conf_object_t *obj, conf_object_t *cpu, exception_handle_t *exception_handle, lang_void *user_data);
+extern typedef void (*cpu_exception_return_cb_t)(conf_object_t *obj, conf_object_t *cpu, exception_return_handle_t *exception_handle, lang_void *user_data);
+extern typedef void (*cpu_instruction_cb_t)(conf_object_t *obj, conf_object_t *cpu, instruction_handle_t *handle, lang_void *user_data);
+extern typedef int (*cpu_instruction_decoder_cb_t)(conf_object_t *obj, conf_object_t *cpu, decoder_handle_t *decoder_handle, instruction_handle_t *iq_handle, lang_void *user_data);
+extern typedef tuple_int_string_t (*cpu_instruction_disassemble_cb_t)(conf_object_t *obj, conf_object_t *cpu, generic_address_t addr, cpu_bytes_t bytes);
+extern typedef void (*cpu_memory_cb_t)(conf_object_t *obj, conf_object_t *cpu, memory_handle_t *handle, lang_void *user_data);
+extern typedef void (*cpu_mode_change_cb_t)(conf_object_t *obj, conf_object_t *cpu, processor_mode_t old_mode, processor_mode_t new_mode, lang_void *user_data);
+extern typedef uint64 cpu_stream_bits_t;
+extern typedef _cpu_instrumentation_entry_t cpu_stream_handle_t;
+extern typedef bool (*pre_decoder_cb_t)(conf_object_t *obj, conf_object_t *cpu, generic_address_t instruction_start_address, physical_address_t position_physical_address, uint8 *opcode_bytes, uint32 valid_bytes, uint32 instruction_position, lang_void *user_data);

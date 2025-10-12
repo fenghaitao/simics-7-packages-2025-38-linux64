@@ -1,0 +1,43 @@
+/*
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  Interface for drawing in the panel display unit, DML mirror 
+
+  See p-display-draw-interface.h for the C definition and full details
+
+*/
+
+dml 1.4;
+
+header %{
+#include "p-display-draw-interface.h"
+%}
+
+// Define the new interface type, mirroring the C declaration
+extern typedef struct {
+   int  (*get_width)(conf_object_t *obj);
+   int  (*get_height)(conf_object_t *obj);   
+   void (*color_rect)(conf_object_t *obj, int x, int y, 
+                      int width, int height, uint32 argb);
+   void (*draw_image_alpha)(conf_object_t *obj, int x, int y, 
+                            int width, int height, bytes_t pixels);
+   uint64 (*load_png_image)(conf_object_t *obj, char * filename);
+   void   (*draw_png_image)(conf_object_t *obj, int x, int y, uint64 image);   
+   uint64 (*get_png_image_width)(conf_object_t *obj, uint64 image);   
+   uint64 (*get_png_image_height)(conf_object_t *obj, uint64 image);      
+} p_display_draw_interface_t;
+
+extern const char *const P_DISPLAY_DRAW_INTERFACE;

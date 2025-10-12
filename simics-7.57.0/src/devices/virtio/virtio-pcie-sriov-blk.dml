@@ -1,0 +1,65 @@
+/*
+  virtio-pcie-blk.dml
+
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device virtio_pcie_sriov_blk;
+
+param classname = "virtio-pcie-sriov-blk";
+
+param desc = "model of virtio PCIE block device";
+
+param documentation = "Virtio PCIE block device based on the Virtio 1.1"
+                    + " specification. Implements the base functionality along"
+                    + " with SR-IOV support."
+                    + " Does not implement:"
+                    + "<ul>"
+                    + "<li>VIRTIO_BLK_F_SIZE_MAX</li>"
+                    + "<li>VIRTIO_BLK_F_SEG_MAX</li>"
+                    + "<li>VIRTIO_BLK_F_GEOMETRY</li>"
+                    + "<li>VIRTIO_BLK_F_RO</li>"
+                    + "<li>VIRTIO_BLK_F_BLK_SIZE</li>"
+                    + "<li>VIRTIO_BLK_F_FLUSH</li>"
+                    + "<li>VIRTIO_BLK_F_TOPOLOGY</li>"
+                    + "<li>VIRTIO_BLK_F_CONFIG_WCE</li>"
+                    + "<li>VIRTIO_BLK_F_DISCARD</li>"
+                    + "<li>VIRTIO_BLK_F_WRITE_Z</li>"
+                    + "</ul>"
+                    + ""
+                    + "This device uses MSI-X for interrupts, and does"
+                    + " currently not support legacy interrupts."
+                    + " CONFIG_PCI_MSI=y must thus be set in the kernel config.";
+
+import "virtio-pcie-common.dml";
+import "virtio-blk-common.dml";
+
+param N_VIRTUAL_FUNCTIONS = 5;
+param BLK_N_IMAGES = 1 + N_VIRTUAL_FUNCTIONS;
+
+is pcie_multifunction_endpoint;
+is defining_virtio_pcie_sriov_device;
+
+param DEVICE_ID = VIRTIO_PCI_BASE_ID + VIRTIO_ID_BLOCK;
+param CLASS_CODE = 0x018000;
+
+template virtio_block_function {
+    is virtio_blk_device;
+    bank virtio_config {
+        group device_specific is virtio_blk_regs;
+    }
+}
+
+subdevice PF is virtio_block_function;
+subdevice VF[i < N_VIRTUAL_FUNCTIONS] is virtio_block_function;

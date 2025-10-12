@@ -1,0 +1,122 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device irq_pin_to_ioapic;
+
+param desc = "simple adapter from signal to ioapic";
+param documentation = "This device redirects incoming signals (maximum 32)"
+                    + " to ioapic vectors.";
+
+import "utility.dml";
+import "simics/devs/interrupt.dml"; 
+import "io-apic.dml";
+import "simics/devs/signal.dml"; 
+import "simics/devs/pci.dml"; 
+
+attribute irq_to_ioapic_pin "Map incoming simple irq to outgoing ioapic pin" {
+    param type = "[i{32}]";
+    session uint8 map[32];
+    method set(attr_value_t value) throws {
+        local uint32 i;
+        for (i = 0; i < 32; i++)
+            map[i] = SIM_attr_integer(SIM_attr_list_item(value, i));
+    }
+    method get() -> (attr_value_t) {
+        local attr_value_t rv = SIM_alloc_attr_list(32);
+        local uint32 i;
+        for (i = 0; i < 32; i++)
+            SIM_attr_list_set_item(&rv, i, SIM_make_attr_uint64(map[i]));
+        return rv;
+    }
+}
+
+attribute irq_is_edge_triggered "Incoming simple irq is edge triggered" {
+    param type = "[b{32}]";
+    session bool is_edge[32];
+    method set(attr_value_t value) throws {
+        local uint32 i;
+        for (i = 0; i < 32; i++)
+            is_edge[i] = SIM_attr_boolean(SIM_attr_list_item(value, i));
+    }
+    method get() -> (attr_value_t) {
+        local attr_value_t rv = SIM_alloc_attr_list(32);
+        local uint32 i;
+        for (i = 0; i < 32; i++)
+            SIM_attr_list_set_item(&rv, i, SIM_make_attr_boolean(is_edge[i]));
+        return rv;
+    }
+}
+
+connect to_ioapic "Connect to iopaic" {
+    param configuration = "required";
+    interface ioapic;
+}
+
+port incoming_signals[index < 32] {
+    implement signal {
+        method signal_raise() {
+            to_ioapic.ioapic.interrupt(irq_to_ioapic_pin.map[index]);
+        }
+        method signal_lower() {
+            if (irq_is_edge_triggered.is_edge[index])
+                to_ioapic.ioapic.interrupt_clear(irq_to_ioapic_pin.map[index]);
+        }
+
+    }
+}
+
+port incoming_simple_irq {
+    implement simple_interrupt {
+        method interrupt(int index) {
+            to_ioapic.ioapic.interrupt(irq_to_ioapic_pin.map[index]);
+        }
+        method interrupt_clear(int index) {
+            if (irq_is_edge_triggered.is_edge[index])
+                to_ioapic.ioapic.interrupt_clear(irq_to_ioapic_pin.map[index]);
+        }
+    }
+}
+
+attribute irq_level[i < 8] is (uint64_attr) {
+    param documentation = "Raise count for PIRQ[A-H]";
+    param internal = true;
+}
+
+//PIRQ 0 ~ 7
+implement pci_interrupt {
+    method raise_interrupt(conf_object_t *obj, int dev, int pin) {
+        assert 0 <= pin && pin < 4;
+
+        log info, 3: "raise PIRQ; device %d, pin %d", 
+            dev, pin;
+
+        irq_level[pin].val += 1;
+        if (irq_level[pin].val == 1) {
+            to_ioapic.ioapic.interrupt(irq_to_ioapic_pin.map[16 + pin]);
+        }
+    }
+
+    method lower_interrupt(conf_object_t *obj, int dev, int pin) {
+        assert 0 <= pin && pin < 4;
+
+        log info, 3: "lower PIRQ; device %d, pin %d",
+            dev, pin;
+
+        irq_level[pin].val -= 1;
+        if (irq_level[pin].val == 0) {
+            to_ioapic.ioapic.interrupt_clear(irq_to_ioapic_pin.map[16 + pin]);
+        }
+    }
+}

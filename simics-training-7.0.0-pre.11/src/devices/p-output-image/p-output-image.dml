@@ -1,0 +1,284 @@
+/*
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  p-output-image : Draw one of a set of images to a p-display unit.
+
+    : Configured with a single coordinate to draw from +
+    : one or more images to display at that coordinate. 
+    : Which image to show is set via a unit64_t interface. 
+    : Mirror of the old system panel MultiImageOutput system 
+*/
+
+
+dml 1.4;
+
+device p_output_image;
+
+param desc = "panel image output";
+
+param documentation = "Display one or more PNG images at a certain coordinate";
+
+import "utility.dml";
+
+import "simics/simulator-api.dml";
+import "simics/model-iface/state.dml"; 
+
+import "p-display-draw-interface.dml";
+import "p-image-properties-interface.dml";
+
+//----------------------------------------------------------------------
+//
+// Connect to the display to draw to. 
+// 
+//----------------------------------------------------------------------
+
+connect draw  {
+    param desc = "Panel display unit to draw on";
+    param configuration = "required";
+    param internal = false;       // = list-attributes shows it by default
+    interface p_display_draw;
+}
+
+//----------------------------------------------------------------------
+//
+// Configuration: X,Y
+// 
+//----------------------------------------------------------------------
+attribute x is (uint64_attr) "X coordinate to draw at" {
+    param configuration = "required";
+}
+
+attribute y is (uint64_attr) "Y coordinate to draw at" {
+    param configuration = "required";
+}
+
+//----------------------------------------------------------------------
+//
+// Reporting: size of loaded images
+//
+// Report the size of the loaded image.  All images must have the same
+// size according to the logic of this design.
+// 
+//----------------------------------------------------------------------
+attribute width is (read_only_attr) "Width of the image" {
+    param type= "i";          
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(images.width);
+    }
+}
+
+attribute height is (read_only_attr) "Height of the image" {
+    param type= "i";          
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(images.height);
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Configuration: list of images
+//
+// Depends on the IDs returned from the display object, using its
+// drawing interface.  If the list of images is changed, we will 
+// leak the memory inside the display unit.  But that is not worth
+// cleaning up. 
+// 
+//----------------------------------------------------------------------
+attribute images "List of images to draw" {
+     // Type is a bit complex - initial state is NIL
+     // and has to be allowed to be returned. 
+     // But it is a pretty pointless value to set. 
+    param type= "n|[s+]";          
+    param configuration = "optional";
+
+    // Local cache of loaded image pointers
+    session uint64       *img_ids;
+    // Local cache of attribute list value
+    session attr_value_t  val;
+    // Local count of images loaded
+    session uint64        img_count;
+    // Height and width of the loaded images
+    session uint64        height;
+    session uint64        width;
+
+    // Need to have an initial value for the attribute
+    is init;
+    method init() {
+        // Note that all variables in DML are set to 0 or NULL 
+        // automatically when the device object is created 
+        val = SIM_make_attr_nil();
+    }
+
+    method set(attr_value_t value) throws {
+        // Check for dumb assignment to NIL
+        if(SIM_attr_is_nil(value)) {
+            // Lose everything
+            if(img_ids!=NULL) {
+                log info, 3: "Deleting cached images";            
+                delete img_ids;
+            }
+            // Clean up attribute
+            log info, 3: "Setting value to NIL";            
+            SIM_attr_free(&val);
+            val = SIM_make_attr_nil();
+            // Variables
+            img_count = 0;
+            height = 0;
+            width = 0;
+            // Done
+            return;
+        }
+
+        // Unpack the list we are now certain 
+        // that we have since the type of the attribute
+        // is either N or a one-element-or-more list of strings
+        local int n;
+        local int i;
+        n = SIM_attr_list_size(value);
+        // Use a local array first, to avoid destroying
+        // old attribute state in case we get a bad value
+        local uint64 * img_ids_2;
+        img_ids_2 = new uint64[n];
+        local uint64 width_2=0;
+        local uint64 height_2=0;
+
+        // For each entry...
+        for(i=0;i<n;i++) {
+            // Get the string
+            local attr_value_t li;
+            local const char * s;
+            local char *f;
+            li = SIM_attr_list_item(value,i);
+            s = SIM_attr_string(li);
+            f = SIM_lookup_file(s);
+            // Check that the file did indeed exist
+            if(f==NULL) {
+                log error: "Cannot find image: \"%s\"", s;
+                // Delete local memory allocation
+                delete img_ids_2;
+                throw;
+            }
+            log info, 2: "Loading image #%d from \"%s\" (\"%s\")", i, s, f;
+            // Loading info message
+            // Load using the display unit
+            local uint64 id;
+            id = draw.p_display_draw.load_png_image(f);
+            local uint64 iw;
+            local uint64 ih;
+            iw = draw.p_display_draw.get_png_image_width(id);            
+            ih = draw.p_display_draw.get_png_image_height(id);
+            // Save the ID in the array
+            img_ids_2[i]=id;
+            // And save the width and height, and check 
+            if(width_2==0) {
+                // Reset case: height and width are both 0
+                width_2 = iw;
+            }
+            if(height_2==0) {
+                height_2 = ih;
+            }
+            if(width_2!=iw) {
+                log error: "Image: \"%s\" has non-matching width %d!=%d", s, iw, width_2;
+                throw;
+            }
+            if(height_2!=ih) {
+                log error: "Image: \"%s\" has non-matching height %d!=%d", s, ih, height_2;
+                throw;
+            }
+            // And log the completed operation 
+            log info, 3: "Loaded: id 0x%x", id;
+        }
+        // We only get here if all files were OK
+        SIM_attr_free(&val);
+        val = SIM_attr_copy(value);
+        // Set the cache pointer
+        if(img_ids!=NULL) {
+            log info, 3: "Replacing old list of images";            
+            delete img_ids;
+        }
+        img_ids = img_ids_2;        
+        width = width_2;
+        height = height_2;
+        img_count = n;
+    }
+
+    method get() -> (attr_value_t) {
+        // The API rules that the caller gets ownership of the value
+        // Therefore, make a copy 
+        return SIM_attr_copy(val);
+    }
+
+}
+
+attribute image_count is (read_only_attr) "Number of images loaded" {
+    param type= "i";          
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(images.img_count);
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Interaction: Set the state
+// - Each set call causes a drawing
+// - No automatic drawing from initial state
+// - Keep it VERY simple
+// - The display unit checkpoints the current graphics state
+//
+// - This is NOT a port as there is only one interface on each image
+//   and it is convenient to have a single reference to the object for
+//   this interface and the size investigation.
+// 
+// - Expose the last set level for debug, in a saved variable == attribute
+//----------------------------------------------------------------------
+saved int last_set_level = 0;
+implement uint64_state {
+    method set(uint64 level)  {
+        // Check input value
+        if(level >= images.img_count) {
+            log error : "Image index %d too large", level;
+            return;
+        }
+        last_set_level = level;
+        // Draw!
+        draw.p_display_draw.draw_png_image(x.val, y.val, images.img_ids[level]);
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Interaction: Retrieve the coordinates and size of this image
+// - implements at top level, so that a button or other control
+//   can have a single object reference calling both this and the 
+//   uint64_t interface for setting the state. 
+//
+//----------------------------------------------------------------------
+implement p_image_properties {
+    method get_x() -> (uint64)  {
+        return x.val;
+    }
+    method get_y() -> (uint64)  {
+        return y.val;
+    }
+    method get_width() -> (uint64)  {
+        return images.width;
+    }
+    method get_height() -> (uint64)  {
+        return images.height;
+    }
+}
+

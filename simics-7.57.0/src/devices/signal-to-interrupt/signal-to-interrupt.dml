@@ -1,0 +1,71 @@
+/*
+  signal-to-interrupt.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device signal_to_interrupt;
+
+parameter desc = "signal to simple_interrupt converter";
+parameter documentation = ("When the signal is raised on an instance of this "
+                           + "class the device connected to irq_dev will be "
+                           + "interrupted on level irq_level. Similarly, when "
+                           + "the signal is lowered the interrupt is "
+                           + "cleared.");
+
+import "simics/devs/interrupt.dml";
+import "simics/devs/signal.dml";
+
+connect irq_dev {
+    parameter desc = ("The device that should be interrupted when the "
+                      + "signal is raised.");
+    parameter documentation = ("When the signal of an instance of the "
+                               + "signal_to_interrupt class is raised the "
+                               + "irq_dev device will receive an interrupt "
+                               + "with level specified by the irq_level "
+                               + "attribute.");
+
+    parameter configuration = "required";
+    interface simple_interrupt {
+        parameter required = true;
+    }
+}
+
+attribute irq_level {
+    parameter desc = ("The level used to interrupt the irq_dev "
+                      + "simple-interrupt device.");
+    parameter documentation = ("When the signal of an instance of the "
+                               + "signal_to_interrupt class is raised the "
+                               + "device specified by the irq_dev attribute "
+                               + "will receive an interrupt at level "
+                               + "irq_level");
+
+    parameter configuration = "required";
+    parameter type = "i";
+    parameter allocate_type = "uint32";
+}
+
+implement signal {
+        method signal_raise() {
+            log info, 4: "signal_raise"; 
+            $irq_dev.simple_interrupt.interrupt($irq_level);
+        }
+
+        method signal_lower()
+        { 
+            log info, 4: "signal_lower";
+            $irq_dev.simple_interrupt.interrupt_clear($irq_level);
+        }
+}
+

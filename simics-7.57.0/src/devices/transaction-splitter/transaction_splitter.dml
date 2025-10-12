@@ -1,0 +1,74 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device transaction_splitter;
+
+param desc = "simple transaction splitter";
+
+param documentation = "A simple transaction splitter that splits transactions" +
+                      " into partial transactions depending on its" +
+                      " split_size attribute. Transactions smaller than the" +
+                      " split size are not changed in any way. The split" +
+                      " boundary is always aligned to the split size." +
+                      " A transfer with an address that is not aligned to the" +
+                      " split size will be split into a first part that" +
+                      " carries only the first few bytes such that the" +
+                      " addresses of all subsequent parts are then aligned" +
+                      " to the split size.";
+
+import "utility.dml";
+import "simics/devs/translator.dml";
+
+connect target is map_target "target device";
+
+attribute split_size is uint64_attr {
+    param documentation = "Size that transactions shall be split into.";
+    param init_val = 4;
+    method set(attr_value_t value) throws {
+        local uint64 v = SIM_attr_integer(value);
+        if (v == 0) {
+            log error: "The split size cannot be 0.";
+            throw;
+        } else {
+            if ( (v & (v - 1)) != 0) {
+                log error: "The split size must be a power of two.";
+                throw;
+            } else {
+                val = v;
+            }
+        }
+        
+    }
+}
+
+implement translator {
+    method translate(physical_address_t addr,
+                     access_t access,
+                     const map_target_t *default_target)
+                     -> (translation_t)
+    {
+        local translation_t txl = {
+            .target = target.map_target,
+            .base = addr & ~(split_size.val - 1),
+            .start = addr & ~(split_size.val - 1),
+            .size = split_size.val,
+            ...
+        };
+        return txl;
+    }
+}
+
+
+

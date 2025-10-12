@@ -1,0 +1,15 @@
+ICH10 SATA Test Description
+=================================
+
+Included Cases
+--------------
+The ICH10 SATA test totally includes 3 cases:
+(1) s-sata-ide.py: tests IDE mode of ICH10 SATA controllers
+(2) s-sata-ahci.py: tests AHCI mode of ICH10 SATA controllers
+(3) s-sata-raid.py: tests RAID mode of ICH10 SATA controllers
+
+
+
+Not Tested Features
+-------------------
+None

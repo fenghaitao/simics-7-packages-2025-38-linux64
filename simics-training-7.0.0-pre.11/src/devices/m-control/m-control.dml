@@ -1,0 +1,37 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  m-control : Mandelbrot fractal compute controller device, in DML
+            : Part of Simics training materials
+
+  This device file is the default implementation that does not
+  use stalling on status read operations.  
+
+*/
+
+dml 1.4;
+
+device m_control;
+
+param desc = "mandelbrot control unit";
+
+param documentation = "Control unit for synchronizing multiple compute units.";
+
+// Optionally, enable use of stall performance optimization 
+param stall_on_status_read = false;
+
+// Import the device implementation 
+import "m-control-common.dml";

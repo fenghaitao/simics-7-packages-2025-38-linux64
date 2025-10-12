@@ -1,0 +1,5 @@
+To test the p-output-image file name handling, 
+all that is needed is a real file.  It does not
+have to be an image at all, as it is never 
+actually subjected to the PNG loader. 
+

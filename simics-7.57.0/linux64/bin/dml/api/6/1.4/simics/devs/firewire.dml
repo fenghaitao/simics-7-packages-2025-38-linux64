@@ -1,0 +1,71 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/devs/firewire.h>
+%}
+
+import "simics/pywrap.dml";
+import "simics/util/dbuffer.dml";
+import "simics/base/types.dml";
+
+extern typedef int firewire_ack_code_t;
+constant Firewire_Ack_Complete = 1;
+constant Firewire_Ack_Pending = 2;
+constant Firewire_Ack_Busy_X = 4;
+constant Firewire_Ack_Busy_A = 5;
+constant Firewire_Ack_Busy_B = 6;
+constant Firewire_Ack_Tardy = 11;
+constant Firewire_Ack_Conflict_Error = 12;
+constant Firewire_Ack_Data_Error = 13;
+constant Firewire_Ack_Type_Error = 14;
+constant Firewire_Ack_Address_Error = 15;
+constant Firewire_Ack_No_Destination = 16;
+constant Firewire_Ack_No_Ack = 17;
+extern typedef int firewire_response_code_t;
+constant Firewire_Response_Complete = 0;
+constant Firewire_Response_Data_Error = 5;
+constant Firewire_Response_Type_Error = 6;
+constant Firewire_Response_Address_Error = 7;
+extern typedef int firewire_transaction_code_t;
+constant Firewire_Write_Quadlet = 0;
+constant Firewire_Write_Block = 1;
+constant Firewire_Write_Response = 2;
+constant Firewire_Read_Quadlet = 4;
+constant Firewire_Read_Block = 5;
+constant Firewire_Read_Quadlet_Response = 6;
+constant Firewire_Read_Block_Response = 7;
+constant Firewire_Cycle_Start = 8;
+constant Firewire_Lock = 9;
+constant Firewire_Streaming = 10;
+constant Firewire_Lock_Response = 11;
+extern typedef int firewire_async_lock_code_t;
+constant Firewire_Lock_Maskswap = 1;
+constant Firewire_Lock_Compareswap = 2;
+constant Firewire_Lock_Fetchadd = 3;
+constant Firewire_Lock_Littleadd = 4;
+constant Firewire_Lock_Boundedadd = 5;
+constant Firewire_Lock_Wrapadd = 6;
+constant Firewire_Lock_Vendor = 7;
+extern typedef int firewire_iso_tag_t;
+constant Firewire_Tag_Unformatted = 0;
+extern typedef int firewire_port_status_t;
+constant Firewire_Port_No_Port = 0;
+constant Firewire_Port_Not_Connected = 1;
+constant Firewire_Port_Parent = 2;
+constant Firewire_Port_Child = 3;
+extern typedef struct { int (*connect_device)(conf_object_t *bus, conf_object_t *dev); int (*disconnect_device)(conf_object_t *bus, conf_object_t *dev); void (*set_device_bus_id)(conf_object_t *bus, conf_object_t *dev, uint16 bus_id); void (*set_id_mask)(conf_object_t *bus, conf_object_t *dev, uint16 id_mask); firewire_ack_code_t (*transfer)(conf_object_t *bus, conf_object_t *source, dbuffer_t *packet, int crc_calculated); int (*register_channel)(conf_object_t *bus, conf_object_t *dev, uint32 channel); int (*unregister_channel)(conf_object_t *bus, conf_object_t *dev, uint32 channel); void (*reset)(conf_object_t *bus); } firewire_bus_interface_t;
+extern typedef struct { size_t len; uint32 *data; } uint32_array_t;
+extern typedef struct { firewire_ack_code_t (*transfer)(conf_object_t *dev, dbuffer_t *packet, int crc_calculated); void (*reset)(conf_object_t *dev, uint16 id, uint8 root_id, uint32_array_t self_ids); uint32 (*get_self_id_template)(conf_object_t *dev); int (*get_rhb)(conf_object_t *dev); uint8 (*get_port_count)(conf_object_t *dev); uint16 (*get_port_mask)(conf_object_t *dev); } firewire_device_interface_t;

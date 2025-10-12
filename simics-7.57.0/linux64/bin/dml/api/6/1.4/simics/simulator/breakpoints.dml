@@ -1,0 +1,30 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/simulator/breakpoints.h>
+%}
+
+import "simics/base/breakpoints.dml";
+
+extern breakpoint_id_t SIM_breakpoint(conf_object_t *obj, breakpoint_kind_t type, access_t access, uint64 address, uint64 length, breakpoint_flag_t flags);
+extern void SIM_breakpoint_remove(breakpoint_id_t id, access_t access, generic_address_t address, generic_address_t length);
+extern void SIM_delete_breakpoint(breakpoint_id_t id);
+extern void SIM_disable_breakpoint(breakpoint_id_t id);
+extern void SIM_enable_breakpoint(breakpoint_id_t id);
+extern typedef int breakpoint_flag_t;
+constant Sim_Breakpoint_Temporary = 1;
+constant Sim_Breakpoint_Simulation = 2;
+constant Sim_Breakpoint_Private = 4;

@@ -1,0 +1,1228 @@
+/*
+  e1000-mac-tx.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+extern uint64 LOAD_LE64(const void *p);
+extern uint16 UNALIGNED_LOAD_BE16(const void *p);
+extern void UNALIGNED_STORE_BE16(void *p, uint16 x);
+extern void UNALIGNED_STORE_BE32(void *p, uint32 x);
+
+header %{
+    // Second per bit of the tri-speed of Gigabit LAN controller
+    static const double tri_speed_spb[4] = {1e-7, 1e-8, 1e-9, 1e-7};
+%}
+
+extern double tri_speed_spb[4];
+
+
+param TX_DELAY_TIMER_UNIT = 1.024e-6;
+param TX_DESC_IPv4        = 0;
+param TX_DESC_IPv6        = 1;
+param TX_DESC_TCP         = 1;
+param TX_DESC_UDP         = 0;
+
+param ETH_802_3_HDR_LEN      = 14;
+param TUP_PSEUDO_HEADER_IPv4 = 12;
+param TUP_PSEUDO_HEADER_IPv6 = 40;
+
+attribute tx_descriptor is (descriptor_attr);
+attribute tx_payload is (data_buffer) {
+    param type = "[di]";
+    param numbers = [length];
+    session int length;
+}
+
+attribute tx_segment is (data_buffer) {
+    param type = "[diiii]";
+    param int_number = 4;
+    param numbers = [length, offset, seg_idx, ipid];
+    session int length;
+    session int offset;
+    session int seg_idx;
+    session int ipid;
+}
+
+attribute tx_frame is (data_buffer) {
+    param type = "[diii]";
+    param int_number = 3;
+    param numbers = [length, turn, tse];
+    session int length;
+    session int turn;
+    session int tse;
+}
+
+/// DEAD
+method dump_txrx_raw(const uint8 *buf, int len, const char *usage)
+{
+    local int i;
+
+    local strbuf_t str;
+    sb_init(&str);
+    sb_addfmt(&str, "%s: ", usage);
+
+    for (i = 0; i < len; i++)
+        sb_addfmt(&str, "%02x", buf[i]);
+    log info, 4: "%s", sb_str(&str);
+    sb_free(&str);
+}
+
+bank csr {
+    // "Current queue for transmitting"
+    saved int64 tx_queue_nbr = NUM_TRANSMIT_QUEUES - 1;
+
+    register tctl @ 0x00400 "Transmit Control";
+    register tipg @ 0x00410 is (unimpl) "Transmit IPG";
+
+    register tx_checksum size 4 "Indicates IXSM and TXSM" {
+        is unmapped;
+        field ixsm @ [0] "Insert IP Checksum";
+        field txsm @ [1] "Insert TCP Checksum";
+        field ifcs @ [3];
+        field vle @ [4];
+        field tse @ [5];
+        field pri @ [31:29];
+        field cfi @ [28];
+        field vid @ [27:16];
+    }
+    register tx_checksum_data size 4 "Aux data for tx_checksum" {
+        is unmapped;
+        field ipstart @ [7:0] "IP header start";
+        field ipsum_offset @ [15:8] "IP chksum offset";
+        field iplen @ [31:16] "IP header length";
+    }
+
+    #if(HAS_TX_INTERRUPT_DELAY) {
+        register tidv @ 0x03820 "Transmit Interrupt Delay Value";
+        register tadv @ 0x0382c "Transmit Absolute Interrupt Delay Value";
+
+        register tidv {
+            field idv @ [15:0] "Interrupt Delay Value";
+            field fdp @ [31] "Flush Partial Description Block";
+        }
+
+        register tadv is (write_mask) { param mask = 0x0000FFFF; }
+    }
+
+
+
+    method transmit() {
+        local bool      sent;
+
+        log info, 4: "transmit occurs at %f seconds", SIM_time(dev.obj);
+
+        do {
+            if (tctl.en.val == 0) {
+                log info, 3:
+                    "aborts transmitting because transceiver is disabled";
+                return;
+            }
+
+            if (tx_frame.length == 0) {
+                try {
+                    load_tx_frame();
+                } catch {
+                    log warning:
+                        "load_tx_frame() failed during transmit attempt; aborting";
+                    return;
+                }
+            }
+
+            if (tx_frame.length == 0)
+                return;
+
+#if (HAS_TIMESYNC) {
+            local tcp_ip_data_desc_t *td = cast(&tx_descriptor.buf[0], void *);
+            check_timesync_before_send(tx_frame.buf, td);
+}
+
+#if (ICH10_ETHERNET_LAN) {
+            local tcp_ip_data_desc_t *td = cast(&tx_descriptor.buf[0], void *);
+            check_linksec_before_send(tx_frame.buf, td);
+}
+
+            // Send the frame
+            sent = send_frame(tx_frame.buf);
+
+#if (ICH10_ETHERNET_LAN) {
+            check_linksec_post_send(tx_frame.buf, sent);
+}
+
+            // If the frame was sent clear it and try to send the next frame
+            // Otherwise the phy is busy sending a previous frame and
+            // the transmit() function will be called by tx_bandwidth_available
+            // when it is possible to send a new frame
+            if (sent){
+                count_total_tx_packet(tx_frame.length);
+                if(tx_frame.tse == 1)
+                    tsctc.count(1);
+                tx_frame.clear();
+            }
+
+        } while (sent);
+    }
+
+#if (e1000_use_legacy_pci_library) {
+    method send_frame(dbuffer_t *frame) -> (bool) default {
+        local bool success;
+        local size_t len = dbuffer_len(frame);
+        success = false;
+
+        if (phy.ieee_802_3_phy_v2.check_tx_bandwidth() != 0) {
+            if (phy.ieee_802_3_phy_v2.send_frame(frame, 1) == 0) {
+                gptc.count(1);
+                log info, 3: "sent a frame (%zd bytes) to phy device", len;
+                dump_txrx_frame(frame, "Sent frame");
+                success = true;
+                local const layout "big-endian" {
+                    uint64 value;
+                } *da = cast(dbuffer_read(frame, 0, 8), void*);
+                local bool bcst  = (da->value & 0xFFFFFF00) == 0xFFFFFF00;
+                local bool multi =
+                    bcst ? false : (da->value & 0x10000000) == 0x10000000;
+                count_transmitted_packet(len, multi, bcst);
+            }
+        }
+        return success;
+    }
+} #else {
+    method send_frame(dbuffer_t *frame) -> (bool) default {
+        local bool success;
+        local size_t len = dbuffer_len(frame);
+        success = false;
+
+        if (eth_phy.ieee_802_3_phy_v2.check_tx_bandwidth() != 0) {
+            if (eth_phy.ieee_802_3_phy_v2.send_frame(frame, 1) == 0) {
+                gptc.count(1);
+                log info, 3: "sent a frame (%zd bytes) to phy device", len;
+                dump_txrx_frame(frame, "Sent frame");
+                success = true;
+                local const layout "big-endian" {
+                    uint64 value;
+                } *da = cast(dbuffer_read(frame, 0, 8), void*);
+                local bool bcst  = (da->value & 0xFFFFFF00) == 0xFFFFFF00;
+                local bool multi =
+                    bcst ? false : (da->value & 0x10000000) == 0x10000000;
+                count_transmitted_packet(len, multi, bcst);
+            }
+        }
+        return success;
+    }
+}
+    /* This event is used for the timing of throttled Tx interrupts.
+       When $INTERRUPT_DELAY_ENABLE is true, it replaces the currently
+       posted event if there is any, extending the timeout.
+       When $INTERRUPT_DELAY_ENABLE is false, it doesn't post new events
+       until the current one has triggered. */
+    event tx_delay is simple_time_event {
+        param documentation
+            = "Countdown clock for transmit delay interrupt";
+
+        method event() {
+            //set the transmit descriptor written back interrupt
+            log info, 4: "set a transmit descriptor written back interrupt";
+            raise_interrupt(INTR_TXDW);
+        }
+
+        method start_count(uint16 time) {
+            local bool is_posted;
+            local double period = time * TX_DELAY_TIMER_UNIT;
+
+            is_posted = posted();
+            if (is_posted)
+              if (INTERRUPT_DELAY_ENABLE) {
+                remove();
+              } else {
+                return;
+              }
+
+            if (time > 0) {
+                log info, 4:
+                    "post a transmit delay timer at %f with period %f seconds",
+                    SIM_time(dev.obj), period;
+                post(period);
+            } else {
+                event();
+            }
+        }
+    }
+
+    /* Get the next frame to send.
+       If TCP Segmentation is in progress, it fetches the next frame
+       from the $tx_segment buffer. If not, it searches the Tx queues for
+       buffer descriptors and gets the frame from there.
+    */
+    method load_tx_frame() throws
+    {
+        log info, 4: "TX load frame called.";
+        local bool tse = false;
+        if (tx_segment.length == 0) {
+            local int i;
+            local bool empty;
+            for (i = 0; i < NUM_TRANSMIT_QUEUES; i++) {
+                empty = tx_queue[tx_queue_nbr].check_descriptor();
+                if (!empty)
+                    break;
+                if (tx_payload.length != 0)
+                    return;//wait to compact whole frame
+                tx_queue_nbr--;
+                if(tx_queue_nbr < 0)
+                  tx_queue_nbr = NUM_TRANSMIT_QUEUES - 1;
+            }
+            if (empty)
+                return;
+
+            local bool cont = true;
+            local uint64 daddr;
+            local uint8 dbuf[16];
+            while (cont && !empty) {
+                daddr = tx_queue[tx_queue_nbr].load_descriptor(dbuf);
+                local legacy_tx_desc_t *ltd = cast(dbuf, void*);
+                if (ltd->desc.dext == 0) {
+                    load_legacy_buffer(ltd, daddr);
+                    cont = ltd->desc.eop == 0;
+                } else {
+                    local generic_ext_desc_t *desc = cast(dbuf, void*);
+                    if (desc->desc1.dtyp == context.desc_type) {
+                        context.read_descriptor(
+                            cast(dbuf, void*), daddr);
+                    } else {
+                        context.load_data(cast(dbuf, void*), daddr);
+                        cont = desc->desc1.eop == 0;
+                        tse = tx_checksum.tse.val == 1;
+                    }
+                }
+
+                if (cont)
+                    empty = tx_queue[tx_queue_nbr].check_descriptor();
+            }
+
+            if (!cont) {//End-of-Frame
+                if (!tse) {
+                    if (tx_payload.length > 0) {
+                        dbuffer_copy_append(tx_frame.buf,
+                                            tx_payload.buf,
+                                            0, tx_payload.length);
+                        tx_frame.turn = 1; //ready to transmit it
+                        tx_frame.length = tx_payload.length;
+                        tx_frame.tse = 0;
+                        tx_descriptor.update(dbuf, daddr);
+                    }
+                } else {
+                    tx_segment.clear();
+                    dbuffer_copy_append(tx_segment.buf,
+                                        tx_payload.buf,
+                                        0, tx_payload.length);
+
+                    local int header_length;
+
+                    header_length = context.header_length();
+
+                    tx_segment.offset = header_length;
+                    tx_segment.length = tx_payload.length - header_length;
+
+                    tx_descriptor.update(dbuf, daddr);
+                }
+                tx_payload.clear();
+            }
+        } else {
+            tse = true;
+        }
+
+        if (tse && tx_segment.length != 0)
+            transfer_segment();
+
+        if (tx_frame.length > 0)
+            complete_frame();
+    }
+
+    /* Trigger a Tx interrupt.
+       If $INTERRUPT_DELAY_ENABLE is true, we check the ide bit in the
+       descriptor to see if the interrupt should be delayed.
+       If $INTERRUPT_DELAY_ENABLE is false, we use the interval/counter
+       values from the EITR registers.
+
+       FIXME: This code seems wrong according to the i82576EB data sheet.
+              For starters, only the queue 0 values are used.
+    */
+    method trigger_tx_interrupt(void *descriptor) default {
+        local legacy_tx_desc_t *desc = descriptor;
+
+        #if (INTERRUPT_DELAY_ENABLE) {
+            /* NOTE: The ide bit is the same even on other descriptor
+               types, so we can safely use the legacy descriptor type.
+             */
+            if (desc->desc.ide == 1 && tidv.idv.val != 0)
+                tx_delay.start_count(tidv.idv.val);
+            else
+                tx_delay.start_count(0);
+        } #else {
+            raise_interrupt(INTR_TXDW);
+        }
+    }
+
+    method load_legacy_buffer(legacy_tx_desc_t *ltd, uint64 td_addr) throws {
+        log info, 3: "%s: %s=%d,%s=%d,%s=%d,%s=%d,%s=%d,%s=%x,%s=%d,%s=%d",
+            "legacy tx descriptor",
+            "css", ltd->desc.css,
+            "rs", ltd->desc.rs,
+            "ic", ltd->desc.ic,
+            "ifcs", ltd->desc.ifcs,
+            "cso", ltd->desc.cso,
+            "buf_addr", ltd->buf_addr,
+            "length", ltd->desc.length,
+            "eop", ltd->desc.eop;
+
+        if (ltd->buf_addr == 0 || ltd->desc.length == 0) {
+            log info, 3: "no data in this transmit descriptor, omit it";
+            return;
+        }
+
+        if (tx_payload.length == 0) {
+            tx_checksum.set(0);
+        }
+        memory_read(dbuffer_append(tx_payload.buf, ltd->desc.length),
+                          ltd->buf_addr, ltd->desc.length);
+        tx_payload.length += ltd->desc.length;
+
+        // Report the status and generate an interrupt if required
+        ltd->desc.dd = 1;
+        memory_write(td_addr, cast(ltd, void *), 16);
+        if (ltd->desc.rs == 1) {
+            log info, 4: "TX load legacy buffer -> writing back descriptor w/ DD = 1 to addr: 0x%x", td_addr;
+            trigger_tx_interrupt(ltd);
+        }
+        if (ltd->desc.eop == 1) {
+            if (ltd->desc.ic == 1) {
+                tx_checksum.ixsm.val  = 1;
+                tx_checksum_data.ipstart.val = ltd->desc.css;
+                tx_checksum_data.ipsum_offset.val = ltd->desc.cso;
+                tx_checksum_data.iplen.val = 0;
+            }
+
+            if (ltd->desc.vle == 1 && ctrl.vme.val == 1) {
+                tx_checksum.vle.val = 1;
+                tx_checksum.pri.val = ltd->desc.pri;
+                tx_checksum.cfi.val = ltd->desc.cfi;
+                tx_checksum.vid.val = ltd->desc.vlan;
+                log info, 3: "tx vle legacy adding vle %d", tx_checksum.vid.val;
+            }
+
+            tx_checksum.ifcs.val = ltd->desc.ifcs;
+        }
+    }
+
+    method transfer_segment() {
+        log info, 3: "load a packet of TCP segmentation";
+        local int header_length;
+        local int segment_length;
+        header_length = context.header_length();
+        segment_length = context.segment_length();
+
+        local bool first_frame = tx_segment.offset == header_length;
+        local bool last_frame = tx_segment.length < segment_length;
+
+        // Copy header
+        tx_frame.clear();
+        dbuffer_copy_append(tx_frame.buf, tx_segment.buf, 0, header_length);
+
+        // Copy payload
+        local int len = last_frame ? tx_segment.length : segment_length;
+        dbuffer_copy_append(
+            tx_frame.buf, tx_segment.buf, tx_segment.offset, len);
+        tx_frame.length = header_length + len;
+        tx_segment.offset += len;
+        tx_segment.length -= len;
+
+        local uint8 *frame = dbuffer_update_all(tx_frame.buf);
+
+        context.update_ethernet_header(frame, len);
+
+        context.update_ip_header(frame, len, first_frame);
+
+        context.update_tcp_udp_header(frame, len,
+                                              first_frame, last_frame);
+
+        if (tx_segment.length == 0)
+            tx_segment.clear();
+
+        tx_frame.turn = 1; /* frame is ready */
+        tx_frame.tse = 1;
+    }
+
+    method complete_frame() {
+        local dbuffer_t *buf = tx_frame.buf;
+        if (tx_checksum.txsm.val == 1) {
+            context.update_tcp_udp_checksum(buf);
+            if (tx_checksum.ifcs.val == 0)
+                log spec_viol, 1:
+                    "IFCS must be set when replacing TCP/UDP checksum";
+            tx_checksum.ifcs.val = 1;
+        }
+
+        local ipv4_header_t *iph = cast(
+            dbuffer_read(buf, tx_checksum_data.ipstart.val, sizeoftype(ipv4_header_t)), void*);
+        if (tx_checksum.ixsm.val == 1 && iph->header.version == 4) {
+            local uint64 cs_value;
+            local int header_start = tx_checksum_data.ipstart.val;
+            local int chksum_offset = tx_checksum_data.ipsum_offset.val;
+            local int len = (tx_checksum_data.iplen.val == 0) ?
+                (dbuffer_len(buf) - tx_checksum_data.ipstart.val) :
+                tx_checksum_data.iplen.val;
+            local uint16 checksum =
+                UNALIGNED_LOAD_BE16(dbuffer_read(buf, chksum_offset, 2));
+            cs_value = calc_checksum_value(
+                dbuffer_read(buf, header_start, len), len);
+            checksum = checksum_to_16bit(cs_value, checksum);
+
+            log info, 3: "updated IP checksum to 0x%x at offset %d",
+                checksum, chksum_offset;
+            UNALIGNED_STORE_BE16(
+                dbuffer_update(buf, chksum_offset, 2), checksum);
+            if (tx_checksum.ifcs.val == 0)
+                log spec_viol, 1:
+                    "IFCS must be set when replacing IP checksum";
+            tx_checksum.ifcs.val = 1;
+        }
+
+        if (tx_checksum.vle.val == 1) {
+            local ieee_802_1q_tag_t tag;
+            tag.TagVal   = ETH_TYPE_VLAN;
+            tag.vlan.pri = tx_checksum.pri.val;
+            tag.vlan.cfi = tx_checksum.cfi.val;
+            tag.vlan.vid = tx_checksum.vid.val;
+            memcpy(dbuffer_insert(buf, 12, 4), &tag, 4);
+            tx_checksum.ifcs.val = 1;
+            log info, 3: "tx vle adding VLAN %d", tx_checksum.vid.val;
+        }
+
+        if (tx_checksum.ifcs.val == 1) {
+            local uint32 fcs;
+            fcs = calc_crc32(dbuffer_read_all(buf), dbuffer_len(buf));
+            log info, 3: "adding Ethernet checksum fcs to 0x%x",
+                fcs;
+            UNALIGNED_STORE_BE32(dbuffer_append(buf, 4), fcs);
+        }
+
+        local size_t len = dbuffer_len(buf);
+        if (len < 64 && tctl.psp.val == 1) { // Pad short packets
+            dbuffer_append_value(buf, 0x88, 64-len);
+            if (!(tx_checksum.ifcs.val == 1))
+                log spec_viol, 1:
+                    "IFCS must be set when padding short packets";
+            tx_checksum.ifcs.val = 1;
+        }
+    }
+
+    method tx_bandwidth_available() default {
+        transmit();
+    }
+}
+
+method tx_init()
+{
+    tx_payload.initialize();
+    tx_segment.initialize();
+    tx_frame.initialize();
+}
+
+method dump_txrx_frame(dbuffer_t *buf, const char *usage)
+{
+    /* No need to create that huge string if the loglevel isn't right */
+    if (SIM_log_level(dev.obj) < 4)
+        return;
+
+    local int len = dbuffer_len(buf);
+    local int i;
+
+    local strbuf_t str;
+    sb_init(&str);
+    sb_addfmt(&str, "%s: ", usage);
+
+    for (i = 0; i < len; i++)
+        sb_addfmt(&str, "%02x", dbuffer_read(buf, i, 1)[0]);
+    log info, 4: "%s", sb_str(&str);
+    sb_free(&str);
+}
+
+template descriptor_attr is (attribute, object) {
+    param documentation = "Current transmit descriptor";
+    param type = "[id]";
+    session uint64 daddr;
+    session uint8 buf[16];
+
+    method set(attr_value_t val) throws {
+        local attr_value_t buf_val;
+
+        if (SIM_attr_is_list(val) && SIM_attr_list_size(val) > 1) {
+            daddr = SIM_attr_integer(SIM_attr_list_item(val, 0));
+            buf_val = SIM_attr_list_item(val, 1);
+            if (SIM_attr_is_data(buf_val) && SIM_attr_data_size(buf_val) >= 16)
+                memcpy(&buf[0], SIM_attr_data(buf_val), 16);
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_list(2, SIM_make_attr_int64(daddr),
+                                 SIM_make_attr_data(16, &buf[0]));
+    }
+
+    method update(void *src, uint64 daddr) {
+        memcpy(&buf, src, 16);
+        this.daddr = daddr;
+    }
+}
+
+template data_buffer is attribute {
+    session dbuffer_t *buf;
+    param int_number default 1;
+    param numbers default undefined;
+    method set(attr_value_t val) throws {
+        clear();
+        local attr_value_t data = SIM_attr_list_item(val, 0);
+        local int size = SIM_attr_data_size(data);
+        local int i = 1;
+
+        if (size > 0)
+            dbuffer_append_data(buf, SIM_attr_data(data), size);
+        #foreach nbr in (numbers) {
+            nbr = SIM_attr_integer(SIM_attr_list_item(val, i));
+            i++;
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t val;
+        local int i = 1;
+        val = SIM_alloc_attr_list(int_number + 1);
+        SIM_attr_list_set_item(
+            &val, 0,
+            SIM_make_attr_data(dbuffer_len(buf), dbuffer_read_all(buf)));
+        #foreach nbr in (numbers) {
+            SIM_attr_list_set_item(&val, i, SIM_make_attr_uint64(nbr));
+            i++;
+        }
+        return val;
+    }
+
+    method initialize() {
+        buf = new_dbuffer();
+        #foreach nbr in (numbers)
+            nbr = 0;
+    }
+
+    method clear() {
+        dbuffer_clear(buf);
+        #foreach nbr in (numbers)
+            nbr = 0;
+    }
+}
+
+param L4TYPE_UDP = 0;
+param L4TYPE_TCP = 1;
+param L4TYPE_SCTP = 2;
+
+template advanced_context_attr is (attribute, object) {
+    param documentation = "Advanced context";
+    param type = "[ii]";
+    param desc_type = 0b0010;
+    param internal = true;
+    session uint64 regs[2];
+
+    method set(attr_value_t val) throws {
+        local int i;
+        for(i = 0;i < SIM_attr_list_size(val);i++) {
+            regs[i] = SIM_attr_integer(SIM_attr_list_item(val, i));
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_list(2,
+                                 SIM_make_attr_int64(regs[0]),
+                                 SIM_make_attr_int64(regs[1]));
+    }
+
+    method read_descriptor(uint64 *addr, uint64 td_addr) default {
+        regs[0] = LOAD_LE64(&addr[0]);
+        regs[1] = LOAD_LE64(&addr[1]);
+    }
+
+    method header_length() -> (int) default {
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+
+        return desc->desc0.maclen + desc->desc0.iplen + desc->desc1.l4len;
+    }
+
+    method segment_length() -> (int) default {
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+
+        return desc->desc1.mss;
+    }
+
+    method update_ethernet_header(uint8 *frame, int len) default {
+        local ethernet_header_t *eth = cast(frame, void*);
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+        local int header_length = desc->desc0.maclen + desc->desc0.iplen +
+            desc->desc1.l4len;
+
+        if(desc->desc1.snap == 1)
+            eth->type = len + header_length -14;
+    }
+
+    method update_ip_header(uint8 *frame, int len, bool first_frame) default {
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+
+        if (desc->desc1.ipv4 == 1) {
+            local ipv4_header_t *ipv4 = cast(&frame[desc->desc0.maclen], void*);
+            ipv4->len = len + desc->desc0.iplen + desc->desc1.l4len;
+            if (!first_frame) {
+                tx_segment.ipid += 1;
+                ipv4->id = tx_segment.ipid;
+            } else
+                tx_segment.ipid = ipv4->id;
+        } else {
+            local ipv6_header_t *ipv6 = cast(&frame[desc->desc0.maclen], void*);
+            ipv6->len = len + desc->desc0.iplen + desc->desc1.l4len - 40;
+        }
+
+    }
+
+    method update_tcp_udp_header(uint8 *frame, int len,
+                                 bool first_frame, bool last_frame) default {
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+        local int offset = desc->desc0.iplen + desc->desc0.maclen;
+
+        switch(desc->desc1.l4t) {
+        case L4TYPE_UDP:
+            {
+                local udp_header_t *udp = cast(&frame[offset], void*);
+                udp->length = len + 8;
+            }
+            break;
+        case L4TYPE_TCP:
+            {
+                local tcp_header_t *tcp = cast(&frame[offset], void*);
+
+                if (!first_frame)
+                    tcp->seq_number = tx_segment.seg_idx;
+                else
+                    tx_segment.seg_idx = tcp->seq_number;
+                tx_segment.seg_idx += len;
+
+                if (!last_frame) {
+                    tcp->control.fin = 0;
+                    tcp->control.psh = 0;
+                }
+            }
+            break;
+        }
+    }
+
+    method update_tcp_udp_checksum(dbuffer_t *buf) default {
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+        local const uint8 *d = dbuffer_read_all(buf);
+        local const uint8 *tcp_data;
+
+        local uint64 checksum;
+        local uint16 csum;
+        local int32 tcp_length;
+        local uint8 checksum_offset;
+        local int dbuflen = dbuffer_len(buf);
+        local int tcp_udp_offset = desc->desc0.maclen + desc->desc0.iplen;
+
+        /* The device driver is responsible for calculating the checksum
+           of the pseudo header, so all we need to do is to calculate
+           the TCP/UDP header as-is, including the precalculated
+           checksum field. */
+        tcp_data = d + tcp_udp_offset;
+        tcp_length = dbuflen - tcp_udp_offset;
+
+        switch(desc->desc1.l4t) {
+        case L4TYPE_UDP:
+            checksum_offset = 6;
+            break;
+        case L4TYPE_TCP:
+            checksum_offset = 16;
+            break;
+        default:
+            log spec_viol, 1: "requested checksum offloading for non-TCP/UDP packets";
+            return;
+        }
+
+        /* Bail out if the offset is out of bounds */
+        if(tcp_udp_offset + checksum_offset > dbuflen - 2) {
+            log spec_viol, 1: "%s(%d/%d) invalid, %s(%d).",
+                "tx context maclen/iplen ",
+                desc->desc0.maclen,
+                desc->desc0.iplen,
+                "packet length",
+                dbuflen;
+            return;
+        }
+
+        checksum = calc_checksum_value(tcp_data, tcp_length);
+
+        /* The TCP packet length is 0 in the pseudo header when doing
+           TCP segmentation */
+        if(csr.tx_checksum.tse.val != 0)
+            checksum += tcp_length;
+
+        csum = checksum_to_16bit(checksum, 0);
+        UNALIGNED_STORE_BE16(dbuffer_update(buf, tcp_data - d + checksum_offset, 2), csum);
+    }
+
+    method load_data(void *desc_addr, uint64 td_addr) throws default {
+        local advanced_data_desc_t *tdd = desc_addr;
+        local advanced_ctx_desc_t *desc = cast(&regs, void *);
+
+        log info, 3:
+            "advanced data desc: %s=%d,%s=%d,%s=%d,%s=%d,%s=%d, %s=%d",
+            "eop",  tdd->desc.eop,
+            "tse",  tdd->desc.tse,
+            "txsm", tdd->desc.txsm,
+            "ixsm", tdd->desc.ixsm,
+            "ifcs", tdd->desc.ifcs,
+            "dlen", tdd->desc.dtalen;
+
+        local bool is_first = tx_payload.length == 0;
+
+        if (tdd->buf_addr != 0 || tdd->desc.dtalen != 0) {
+            memory_read(dbuffer_append(tx_payload.buf, tdd->desc.dtalen),
+                              tdd->buf_addr, tdd->desc.dtalen);
+            tx_payload.length += tdd->desc.dtalen;
+        }
+
+        if (is_first) {
+            csr.tx_checksum.ixsm.val = tdd->desc.ixsm;
+            csr.tx_checksum.txsm.val = tdd->desc.txsm;
+
+            if(tdd->desc.ixsm) {
+                csr.tx_checksum_data.ipstart.val = desc->desc0.maclen;
+                csr.tx_checksum_data.iplen.val = desc->desc0.iplen;
+                csr.tx_checksum_data.ipsum_offset.val = desc->desc0.maclen + 10;
+            }
+        }
+
+        if ((tdd->desc.vle == 1 && csr.ctrl.vme.val == 1)
+            && ((   (is_first == true   && tdd->desc.tse == 1)
+                 || (tdd->desc.eop == 1 && tdd->desc.tse == 0)))) {
+                csr.tx_checksum.vle.val  = 1;
+                csr.tx_checksum.pri.val = desc->desc0.pri;
+                csr.tx_checksum.cfi.val = desc->desc0.cfi;
+                csr.tx_checksum.vid.val = desc->desc0.vlan;
+            log info, 3: "tx vle load adding vle %d", csr.tx_checksum.vid.val;
+        }
+
+        if(  tdd->desc.eop == 1 ){
+            csr.tx_checksum.ifcs.val = tdd->desc.ifcs;
+        }
+
+        tdd->desc.dd = 1;
+        memory_write(td_addr, cast(tdd, void *), 16);
+        if (tdd->desc.rs == 1) { // Report the status
+            csr.trigger_tx_interrupt(tdd);
+        }
+
+        csr.tx_checksum.tse.val = tdd->desc.tse;
+    }
+}
+
+template tcpip_context_attr is (attribute, object) {
+    param documentation = "TCP/IP context";
+    param type = "[ii]";
+    param desc_type = 0b0000;
+    param internal = true;
+    session uint64 regs[2];
+
+    method set(attr_value_t val) throws {
+        local int i;
+        for(i = 0;i < SIM_attr_list_size(val);i++) {
+            regs[i] = SIM_attr_integer(SIM_attr_list_item(val, i));
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_list(2,
+                                 SIM_make_attr_int64(regs[0]),
+                                 SIM_make_attr_int64(regs[1]));
+    }
+
+    method read_descriptor(uint64 *addr, uint64 td_addr) throws default {
+        regs[0] = LOAD_LE64(&addr[0]);
+        regs[1] = LOAD_LE64(&addr[1]);
+
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+
+        log info, 4: "read TCP/IP context w0: %x w1: %x", regs[0], regs[1];
+
+        // Check the limitations of the context parameters
+        if (desc->desc1.tse == 1 && desc->desc1.mss < 0x10) {
+            desc->desc1.mss = 0x10;
+            log spec_viol, 2:
+                "the MSS must be set a value larger than 0x10";
+        }
+
+        desc->desc1.dd = 1;
+        memory_write(td_addr, desc, 16);//write-back
+
+        if (desc->desc1.rs == 1) {
+            csr.trigger_tx_interrupt(desc);
+        }
+    }
+
+    method header_length() -> (int) default {
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+
+        return desc->desc1.hdrlen;
+    }
+
+    method segment_length() -> (int) default {
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+
+        return desc->desc1.mss;
+    }
+
+    method update_ethernet_header(uint8 *frame, int len) default {
+        local ethernet_header_t *eth = cast(frame, void*);
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+        local int header_length = desc->desc1.hdrlen;
+
+        if(desc->desc1.snap == 1)
+            eth->type = len + header_length -14;
+    }
+
+    method update_ip_header(uint8 *frame, int len, bool first_frame) default {
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+
+        if (desc->desc1.ip == 1) {
+            local ipv4_header_t *ipv4 = cast(&frame[14], void*);
+            ipv4->len = len + desc->desc1.hdrlen - desc->desc0.ipcss;
+            if (!first_frame) {
+                tx_segment.ipid += 1;
+                ipv4->id = tx_segment.ipid;
+            } else
+                tx_segment.ipid = ipv4->id;
+        } else {
+            local ipv6_header_t *ipv6 = cast(&frame[14], void*);
+            ipv6->len = len + desc->desc1.hdrlen - desc->desc0.ipcss - 40;
+        }
+    }
+
+    method update_tcp_udp_header(uint8 *frame, int len,
+                                 bool first_frame, bool last_frame) default {
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+        local int offset = desc->desc0.tucss;
+
+        if (desc->desc1.tcp == 1) {
+            local tcp_header_t *tcp = cast(&frame[offset], void*);
+            if (!first_frame)
+                tcp->seq_number = tx_segment.seg_idx;
+            else
+                tx_segment.seg_idx = tcp->seq_number;
+            tx_segment.seg_idx += len;
+
+            if (!last_frame) {
+                tcp->control.fin = 0;
+                tcp->control.psh = 0;
+            }
+        } else {
+            local udp_header_t *udp = cast(&frame[offset], void*);
+            udp->length = len + desc->desc1.hdrlen - desc->desc0.tucss;
+        }
+    }
+
+    method update_tcp_udp_checksum(dbuffer_t *buf) default {
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+
+        if (desc->desc0.tucso == 0)
+            return;
+
+        local int dbuflen = dbuffer_len(buf);
+        local int len = ((desc->desc0.tucse == 0
+                          ? dbuflen
+                          : (desc->desc0.tucse + 1)) - desc->desc0.tucss);
+        local const uint8 *data = dbuffer_read_all(buf);
+
+        if((desc->desc0.tucso >= dbuflen - 1) ||
+           (desc->desc0.tucss >= dbuflen)) {
+            log spec_viol, 1: "%s(%d/%d) invalid, %s(%d).",
+                "TCP/UDP checksum offset/start",
+                desc->desc0.tucso,
+                desc->desc0.tucss,
+                "packet length",
+                dbuflen;
+            return;
+        }
+
+        local uint16 csum   = 0;
+        local uint8  ip_ver =
+            cast(&data[sizeoftype ethernet_header_t], ipv4_header_t*) ->
+                header.version;
+        if (   (csr.tx_checksum.tse.val == 0 && ip_ver == 4)
+            || (csr.tx_checksum.tse.val == 1 && desc->desc1.ip == 1)) {
+
+            local ipv4_header_t *v4h =
+                cast(&data[sizeoftype ethernet_header_t],void*);
+
+            csum = calc_tup_checksum_v4( &data[desc->desc0.tucss],
+                                        v4h->protocol,
+                                        v4h->src,
+                                        v4h->dst,
+                                        len);
+        } else if ((csr.tx_checksum.tse.val == 0 && ip_ver == 6)
+                   || (csr.tx_checksum.tse.val == 1 && desc->desc1.ip == 0)) {
+            local ipv6_header_t *v6h =
+                cast(&data[sizeoftype ethernet_header_t],void*);
+            local uint8 *tup = cast(&data[  sizeoftype ethernet_header_t
+                                          + sizeoftype ipv6_header_t],
+                                    uint8*);
+
+            csum = calc_tup_checksum_v6(tup,
+                                       v6h->next,
+                                       cast(&v6h->src[0], uint8 *),
+                                       cast(&v6h->dst[0], uint8 *),
+                                       v6h->next,
+                                       v6h->len);
+        } else {
+            local ethernet_header_t * eth_h = cast(data,void*);
+            log spec_viol, 1:
+                "%s: eth_header_type: 0x%x, ip:%d, tse: %d, desc->desc1.ip %d",
+                "The packet has unknown type",
+                 eth_h->type,
+                 ip_ver,
+                 csr.tx_checksum.tse.val,
+                 desc->desc1.ip;
+            return;
+        }
+        log info, 3: "updated TCP/UDP checksum to 0x%x at offset %d",
+            csum, desc->desc0.tucso;
+        UNALIGNED_STORE_BE16(dbuffer_update(buf, desc->desc0.tucso, 2), csum);
+    }
+
+    method load_data(void *desc_addr, uint64 td_addr) throws default {
+        local tcp_ip_data_desc_t *tdd = desc_addr;
+        local tcp_ip_ctx_desc_t *desc = cast(&regs, void *);
+
+        log info, 3:
+            "TCP/IP data desc: %s=%d,%s=%d,%s=%d,%s=%d,%s=%d,%s=%d, %s=%d",
+            "eop",  tdd->desc.eop,
+            "tse",  tdd->desc.tse,
+            "txsm", tdd->desc.txsm,
+            "ixsm", tdd->desc.ixsm,
+            "ifcs", tdd->desc.ifcs,
+            "rs", tdd->desc.rs,
+            "dlen", tdd->desc.dtalen;
+
+        local bool is_first = tx_payload.length == 0;
+
+        if (tdd->buf_addr != 0 || tdd->desc.dtalen != 0) {
+            memory_read(dbuffer_append(tx_payload.buf, tdd->desc.dtalen),
+                tdd->buf_addr, tdd->desc.dtalen);
+            tx_payload.length += tdd->desc.dtalen;
+        }
+
+        if (is_first) {
+            csr.tx_checksum.ixsm.val = tdd->desc.ixsm;
+            csr.tx_checksum.txsm.val = tdd->desc.txsm;
+
+            if(tdd->desc.ixsm) {
+                csr.tx_checksum_data.ipstart.val = desc->desc0.ipcss;
+                csr.tx_checksum_data.iplen.val =
+                    ((desc->desc0.ipcse == 0 ? 0 : (desc->desc0.ipcse + 1)
+                      - desc->desc0.ipcss));
+                csr.tx_checksum_data.ipsum_offset.val = desc->desc0.ipcso;
+            }
+        }
+
+        if ((tdd->desc.vle == 1 && csr.ctrl.vme.val == 1)
+            && ((   (is_first == true   && tdd->desc.tse == 1)
+                 || (tdd->desc.eop == 1 && tdd->desc.tse == 0)))) {
+                csr.tx_checksum.vle.val  = 1;
+                csr.tx_checksum.pri.val = tdd->desc.pri;
+                csr.tx_checksum.cfi.val = tdd->desc.cfi;
+                csr.tx_checksum.vid.val = tdd->desc.vlan;
+        }
+
+        if(  tdd->desc.eop == 1 ){
+            csr.tx_checksum.ifcs.val = tdd->desc.ifcs;
+        }
+
+        tdd->desc.dd = 1;
+        memory_write(td_addr, cast(tdd, void *), 16);
+        if (tdd->desc.rs == 1) { // Report the status
+            csr.trigger_tx_interrupt(tdd);
+        }
+
+        csr.tx_checksum.tse.val = tdd->desc.tse;
+    }
+}
+
+/* These templates cascade into one single template to be used by the NIC,
+   namely 'tx_desc_queue'. */
+template tx_desc_queue_std {
+    param BA default undefined;
+    register tdbal  @ BA + 0x00 "Transmit Descriptor Base Low";
+    register tdbah  @ BA + 0x04 "Transmit Descriptor Base High";
+    register tdlen  @ BA + 0x08 "Transmit Descriptor Length";
+    register tdh    @ BA + 0x10 "Transmit Descriptor Header";
+    register tdt    @ BA + 0x18 "Transmit Descriptor Tail";
+    register txdctl @ BA + 0x28 "Transmit Descriptor Control";
+
+    register tdbal is (write_mask) { param mask = 0xFFFFFFF0; }
+    register tdbah is (write_mask) { param mask = 0xFFFFFFFF; }
+    register tdlen is (write_mask) { param mask = 0x000FFF80; }
+    register tdh   is (write_mask) { param mask = 0x0000FFFF; }
+    register tdt   is (write_mask) { param mask = 0x0000FFFF; }
+
+    register tdt {
+        method write(uint64 value) {
+            default(value);
+            if (this.val != tdh.val)
+                transmit();
+        }
+    }
+
+    method check_descriptor() -> (bool) default {
+        local bool enabled;
+
+        enabled = check_queue_enabled();
+        return !enabled || tdh.val == tdt.val;
+    }
+
+    method load_descriptor(uint8 *data) -> (uint64) throws default {
+        local uint64 addr;
+        addr = ((tdbah.val << 32) | tdbal.val) + tdh.val * 16;
+        memory_read(&data[0], addr, 16);
+        increase_header();
+        return addr;
+    }
+
+    method increase_header() default {
+        local uint32 old_tdh = tdh.val;
+
+        if (tdh.val == tdt.val) {
+            log info, 4: "cannot increase the header for %s %d",
+                "arriving the tail of transmit queue", tx_queue_nbr;
+            return;
+        }
+
+        tdh.val = (((tdh.val + 1) * 16) % tdlen.val) / 16;
+
+        log info, 4: "increase header from %d to %d", old_tdh, tdh.val;
+
+        #if (HAS_TX_THRESHOLD_INTERRUPTS) {
+            local int pending =
+                (tdt.val >= tdh.val) ? (tdt.val - tdh.val) : (tdlen.val / 16 + tdt.val - tdh.val);
+
+            // raise TX Descriptor low interrupt?
+            if (pending == 8 * txdctl.lwthresh.val && txdctl.lwthresh.val != 0)
+                ics.write(INTR_TXD_LOW);
+
+            // raise queue empty interrupt?
+            if (pending == 0)
+                ics.write(INTR_TXQE);
+        }
+    }
+}
+
+template tx_desc_queue_tarc {
+    #if(HAS_TARC) {
+        register tarc   @ BA + 0x40 "Transmit Arbitration Counter";
+        register tarc_counter is (unmapped) "Transmit Arbitration Counter value";
+
+        register txdctl {
+            field pthresh @ [5:0]   is (unimpl) "Prefetch Threshold";
+            field hthresh @ [13:8]  is (unimpl) "Host Threshold";
+            field wthresh @ [21:16] is (unimpl) "Write Back Threshold";
+            field gran @ [24]       is (unimpl) "Granularity";
+            field lwthresh @ [31:25] "Transmit descriptor Low Threshold";
+        }
+
+        register tarc {
+            field count @ [6:0] is (read, write) "Transmit Arbitration Count" {
+                param init_val = ICH10_ETHERNET_LAN #? (i == 0 ? 3 : 1) #: 3;
+                method write(uint64 value) {
+                    if (value == 0) {
+                        log spec_viol, 1: "writing 0 to %s is not allowed", name;
+                        return;
+                    }
+                    this.val = value;
+                    if (tarc_counter.val == 0)
+                        tarc_counter.val = this.val;//first load
+                }
+                method read() -> (uint64) {
+                    return tarc_counter.val;
+                }
+            }
+            field comp @ [7] "Compensation Mode";
+            field ratio @ [9:8] "Compensation Ratio";
+            field en @ [10] is (write) "Descriptor Enable" {
+                param init_val = i == 0 ? 1 : 0;
+                method write(uint64 value) {
+                    if (i == 0 && value == 0)
+                        log spec_viol, 1: "enable bit of transmit queue 0 should always be set";
+                }
+            }
+        }
+
+        method check_queue_enabled() -> (bool) default {
+            return tarc.en.val;
+        }
+    } #else {
+        register txdctl {
+            field pthresh @ [4:0]   is (unimpl) "Prefetch Threshold";
+            field hthresh @ [12:8]  is (unimpl) "Host Threshold";
+            field wthresh @ [20:16] is (unimpl) "Write Back Threshold";
+            field enable @ [25] "Tx queue enable" {
+                param init_val = i == 0 ? 1 : 0;
+            }
+            field swflsh @ [26]     is (unimpl) "Tx software flush";
+        }
+
+        method check_queue_enabled() -> (bool) default {
+            return txdctl.enable.val;
+        }
+    }
+}
+
+template tx_desc_queue {
+    is tx_desc_queue_std;
+    is tx_desc_queue_tarc;
+}
+
+template tx_desc_queue_alias {
+    param BA default undefined;
+    param reggroup default undefined;
+
+    register tdbal  @ BA + 0x00 is (register_alias) {
+        param target = reggroup[i].tdbal;
+    }
+    register tdbah  @ BA + 0x04 is (register_alias) {
+        param target = reggroup[i].tdbah;
+    }
+    register tdlen  @ BA + 0x08 is (register_alias) {
+        param target = reggroup[i].tdlen;
+    }
+    register tdh    @ BA + 0x10 is (register_alias) {
+        param target = reggroup[i].tdh;
+    }
+    register tdt    @ BA + 0x18 is (register_alias) {
+        param target = reggroup[i].tdt;
+    }
+    register txdctl @ BA + 0x28 is (register_alias) {
+        param target = reggroup[i].txdctl;
+    }
+}
+

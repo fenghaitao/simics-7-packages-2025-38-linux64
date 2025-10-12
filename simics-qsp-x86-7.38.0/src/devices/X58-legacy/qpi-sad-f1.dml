@@ -1,0 +1,158 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device x58_qpi_sad_f1_legacy;
+parameter classname = "x58-qpi-sad-f1-legacy";
+
+parameter desc = "model of QPI System Address Decoder Regs";
+parameter documentation = "QuickPath Interconnect System Address Decoder"
+    + " Registers in the Intel® Core™ i7 processor - legacy variant,"
+    + " using old PCIe libraries";
+
+parameter limitations = "<ul>"
+    + "<li>The device is mostly dummy.</li>"
+    + "</ul>";
+
+import "pci/common.dml";
+is pcie_device;
+
+bank pci_config {
+    register device_id { parameter hard_reset_value = 0x2c01; }
+    register vendor_id { parameter hard_reset_value = 0x8086; }
+
+    register base_address_1 @ 0x10 is (no_base_address_32);
+    register base_address_2 @ 0x14 is (no_base_address_32);
+    register base_address_3 @ 0x18 is (no_base_address_32);
+    register base_address_4 @ 0x1c is (no_base_address_32);
+    register base_address_5 @ 0x20 is (no_base_address_32);
+    register base_address_6 @ 0x24 is (no_base_address_32);
+
+    register command is (read_only) { parameter hard_reset_value = 0x6; }
+    register status is (read_only) { parameter hard_reset_value = 0x90; }    
+    register class_code { parameter hard_reset_value = 0x600; }
+    register revision_id { parameter hard_reset_value = 0; }
+    register header_type is (read_only) { parameter hard_reset_value = 0x80; }
+    register subsystem_vendor_id { parameter hard_reset_value = 0x8086; }
+    register subsystem_id { parameter hard_reset_value = 0x8086; }
+
+    register sad_pciexbar size 8 @ 0x50 "PCIEXBAR";
+
+    register sad_pam0123 size 4 @ 0x40 is (unimplemented);
+    register sad_pam456 size 4 @ 0x44 is (unimplemented);
+    register sad_hen size 4 @ 0x48 is (unimplemented);
+    register sad_smram size 4 @ 0x4c is (unimplemented);
+
+    register sad_dram_rule[8] size 4 @ 0x80 + $i * 4 is (unimplemented);
+    register sad_interleave_list[8] size 4 @ 0xc0 + $i * 4 is (unimplemented);
+}
+
+attribute socket_id {
+    parameter documentation = "socket number";
+    parameter configuration = "required";
+    parameter allocate_type = "int32";
+}
+
+connect socket_pci_config {
+    interface memory_space;
+}
+
+bank mcfg {
+    parameter function = 0;
+    method access(generic_transaction_t *mop, physical_address_t offset,
+                  physical_address_t size) {
+        local exception_type_t ex;
+        local uint64 val;
+        
+        if (SIM_mem_op_is_read(mop)) {
+            call $pci_value_from_memory(
+                Sim_Addr_Space_Conf,
+                offset, SIM_get_mem_op_size(mop)) -> (val, ex);
+            if (ex == Sim_PE_IO_Not_Taken)
+                val = -1;
+            SIM_set_mem_op_value_le(mop, val);
+            log "info", 4: "MCFG read @ %x -> %x", offset, val;
+        } else {
+            val = SIM_get_mem_op_value_le(mop);
+            log "info", 4: "MCFG write @ %x <- %x", offset, val;
+            call $pci_value_to_memory(
+                Sim_Addr_Space_Conf,
+                val, offset, SIM_get_mem_op_size(mop)) -> (ex);
+        }
+    }
+}
+
+
+bank pci_config {
+    register sad_pciexbar {
+        field enable[0];
+        field s[3:1];
+        field addr[39:20];
+
+        method after_write(mop) {
+            if ($s != 0 && $s < 6) {
+                log "spec_violation", 1: "Unsupported PCIEXBAR size %d", $size;
+            }
+            call $remap();
+        }
+    }
+    
+    method remap() {
+        local map_info_t info;
+        local int max_bus;
+        local int size = $sad_pciexbar.s;
+        
+        memset(&info, 0, sizeoftype(map_info_t));
+        if (size == 6)
+            max_bus = 63;
+        else if (size == 7)
+            max_bus = 127;
+        else {
+            // size == 0
+            max_bus = 255;
+        }
+
+        // remap config space map at (max_bus - $socket_id)
+        $pci_bus.pci_bus.remove_map($socket_pci_config.obj,
+                                    Sim_Addr_Space_Conf, 0);
+        info.base = cast(max_bus - $socket_id, physical_address_t) << 20;
+        info.length = 0x100000;
+        $pci_bus.pci_bus.add_map($socket_pci_config.obj,
+                                 Sim_Addr_Space_Conf, NULL, info);
+
+        // unmap MCFG
+        $pci_bus.pci_bus.remove_map($dev.obj, Sim_Addr_Space_Memory, 0);
+        
+        if (!$sad_pciexbar.enable)
+            return;
+        
+        // map MCFG
+        info.length = cast(0x100000, uint64) * (max_bus + 1);
+        info.base = cast($sad_pciexbar.addr, physical_address_t) << 20;
+        info.base &= ~(info.length - 1);
+        info.priority = $socket_id;
+
+        local int succ;
+        succ = $pci_bus.pci_bus.add_map(
+            $dev.obj, Sim_Addr_Space_Memory, NULL, info);
+        log "info", 2, PCI_config: "Mapped MCFG @ %llx", info.base;
+
+    }
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state($dev.obj)) {
+        call $pci_config.remap();
+    }
+}

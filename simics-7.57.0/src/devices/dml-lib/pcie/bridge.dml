@@ -1,0 +1,1564 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "simics/devs/translator.dml";
+
+/**
+   ## pcie_bridge
+
+   To be used by devices bridging PCIe to/from e.g. host memory. Inherits
+   `pcie_upstream_translator`. Defines a port object `downstream_port` and a
+   connect `host_memory` to which upstream **Mem** transactions are forwarded,
+   by default. Defines a port `message`, to which **Msg** transactions are
+   forwarded, by default. The `message` port inherits the `message_port`
+   template. Other transaction types are terminated, by default.
+*/
+template pcie_bridge {
+    is pcie_upstream_translator;
+    group txl_target {
+        param mem default host_memory.map_target;
+        param msg default message.map_target;
+    }
+
+    port message is message_port "handles PCIe Messages";
+
+    connect downstream_port is downstream_port;
+
+    connect host_memory is map_target "Connection to Host Memory" {
+        param mt = map_target;  // legacy alias
+    }
+}
+
+/**
+   ## pcie_port
+
+   Inherits `pcie_device` and `pcie_upstream_translator`. Defines a connect
+   `upstream_target` and a port object `downstream_port`. Defines a port
+   `upstream_message_router` which routes upstream messages either to itself or
+   forwards them further upstream or reroutes them downstream. Defines a port
+   `upstream_message` which handles upstream transactions of type **Msg**
+   directed at this PCIe port.
+*/
+template pcie_port {
+    param pcie_port_direction : const char*;
+
+    is pcie_hreset;
+    is pcie_hot_reset;
+    is pcie_device;
+    is pcie_upstream_translator;
+
+    group downstream_translators is pcie_downstream_translators;
+
+    group txl_target {
+        param def default upstream_target.map_target;
+        param msg default upstream_message_router.map_target;
+    }
+
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) default {
+            local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+            if ((type == PCIE_Type_Mem) || (type == PCIE_Type_IO)) {
+                local conf_object_t *initiator_obj = SIM_transaction_initiator(t);
+                local const char * initiator = (initiator_obj != NULL)
+                    ? SIM_object_name(initiator_obj) : "unknown";
+                if (pcie_config.command.m.val != 1) {
+                    log info, 1 then 2: "A PCIe port can not forward a Memory"
+                    + " or an I/O Request when the Bus Master Enable bit is not"
+                    + " set. Type: %s, address: 0x%02x, initiator: %s.",
+                    pcie_type_name(type), addr, initiator;
+                    local translation_t txl;
+                    return callback(txl, t, cbdata);
+                }
+            }
+            return default(addr, access, t, callback, cbdata);
+        }
+    }
+
+    bank pcie_config is type_1_bank;
+    connect upstream_target is upstream_target;
+    connect downstream_port is downstream_port;
+
+    port upstream_message_router is message_translator {
+        param default_target default upstream_target.map_target;
+        param local_target default upstream_message.map_target;
+    }
+    port upstream_message is message_port "consumes Upstream PCIe Messages";
+    implement pcie_device {
+        method hot_reset() default {
+            default();
+            downstream_port.pcie_port_control.hot_reset();
+        }
+    }
+}
+
+/**
+   ## pcie_downstream_port
+
+   To be used by Downstream Switch Ports. Inherits `pcie_port` and
+   `pcie_hotplug_port`.
+*/
+template pcie_downstream_port is (pcie_port, pcie_hotplug_port) {
+    param pcie_port_direction = "downstream";
+
+    port upstream_message {
+        group drs is handling_drs_messages {
+            param associated_function = cast(pcie_config, physical_config_bank);
+        }
+     }
+}
+
+/**
+   ## pcie_root_port
+
+   To be used by Root Ports. Inherits `pcie_downstream_port.`
+*/
+template pcie_root_port is (pcie_downstream_port) {
+
+    group self_map_target is (init, destroy) {
+        session map_target_t *mt;
+        method init() default {
+            mt = SIM_new_map_target(obj, NULL, NULL);
+        }
+        method destroy() default {
+            SIM_free_map_target(mt);
+        }
+    }
+
+    port upstream_message_router { param is_root_port = true; }
+}
+
+/**
+   ## pcie_upstream_port
+
+   To be used by Upstream Switch Ports. Inherits `pcie_port`.
+*/
+template pcie_upstream_port is (pcie_port, pcie_phy) {
+    param pcie_port_direction = "upstream";
+}
+
+/**
+   ## message_port
+
+   Implements `transaction` interface where it receives and dispatches
+   transactions of type **Msg** to instances (on the same level) of the
+   `handling_messages` template. Unhandled messages will be terminated
+    with error or silently dropped depending on type of **Msg**.
+*/
+template message_port is init_mt {
+    implement transaction {
+        method issue(transaction_t *t,
+                     uint64 addr) -> (exception_type_t) default {
+            local pcie_message_type_t type =
+                ATOM_get_transaction_pcie_msg_type(t);
+            local pcie_error_ret_t *perr =
+                ATOM_get_transaction_pcie_error_ret(t);
+
+            log info, 3: "%s Received message of type %s",
+                this.qname, pcie_message_type_name(type);
+
+            foreach p in (each handling_messages in (transaction.parent)) {
+                local pcie_error_t err = p.message(t, addr, type);
+                if (err != PCIE_Error_Not_Set) {
+                    if (perr)
+                        perr->val = err;
+                    return err == PCIE_Error_No_Error ?
+                        Sim_PE_No_Exception : Sim_PE_IO_Not_Taken;
+                }
+            }
+            switch (type) {
+            case PCIE_HP_Power_Indicator_On:
+            case PCIE_HP_Power_Indicator_Blink:
+            case PCIE_HP_Power_Indicator_Off:
+            case PCIE_HP_Attention_Button_Pressed:
+            case PCIE_HP_Attention_Indicator_On:
+            case PCIE_HP_Attention_Indicator_Blink:
+            case PCIE_HP_Attention_Indicator_Off:
+            case PCIE_Vendor_Defined_Type_1:
+                /* VDM1 and Hot-Plug messages are silently ignored */
+                log info, 2: "Unimplemented '%s' message ignored",
+                    pcie_message_type_name(type);
+                if (perr)
+                    perr->val = PCIE_Error_No_Error;
+                return Sim_PE_No_Exception;
+            default:
+                if (perr)
+                    perr->val = PCIE_Error_Master_Abort;
+                log info, 2: "%s message, %s, %s, not taken", this.qname,
+                    pcie_message_type_name(type),
+                    pcie_route_type_name(ATOM_get_transaction_pcie_msg_route(t));
+                return Sim_PE_IO_Not_Taken;
+            }
+        }
+    }
+}
+/**
+   ## message_translator
+
+   Implements `transaction_translator` interface where it receives translator
+   requests of type **Msg** from downstream. Forwards messages depending
+   on `pcie_msg_route` atom. Messages to be routed upstream are forwarded to
+   parameter `default_target`, messages to be routed downstream are forwarded to
+   `downstream_port` and messages targeting this PCIe port are forwarded to
+   parameter `local_target` for local handling of the message.
+   parameter `is_root_port` is used to determine if messages with routing type
+   of `PCIE_Msg_Route_Upstream` should be forwarded to `local_target` instead of
+   `default_target` for Error Messages.
+*/
+template message_translator is (init_mt) {
+    param default_target default NULL;
+    param local_target;
+    param is_root_port default false;
+
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) default {
+            local pcie_message_type_t type =
+                ATOM_get_transaction_pcie_msg_type(t);
+            local pcie_msg_route_t route =
+                ATOM_get_transaction_pcie_msg_route(t);
+            local pcie_error_ret_t *perr =
+                ATOM_get_transaction_pcie_error_ret(t);
+            local const uint8* segment =
+                ATOM_transaction_pcie_destination_segment(t);
+
+            local translation_t txl;
+            switch (route) {
+            case PCIE_Msg_Route_ID:
+                local (bool captured_valid, uint8 cap_segment) = pcie_config.get_captured_segment_id();
+                if (captured_valid && (segment != NULL) && (*segment != cap_segment)) {
+                    log info, 3:
+                        "Segment mismatch, dst segment:%d, captured segment: %d ->"
+                      + " forwarding upstream", *segment, cap_segment;
+                    txl.target = default_target;
+                } else {
+                    local uint16 target_id = addr[63:48];
+                    if (target_id == pcie_config.get_device_id()) {
+                        txl.target = local_target;
+                    } else if (target_id[15:8] >= pcie_config.secondary_bus_number.val &&
+                             target_id[15:8] <= pcie_config.subordinate_bus_number.val) {
+                        txl.target = downstream_port.map_target;
+                    } else {
+                        txl.target = default_target;
+                    }
+                }
+                break;
+            case PCIE_Msg_Route_Address:
+                log unimpl: "%s, Message address routing is unimplemented",
+                    this.qname;
+                txl.target = default_target ? default_target : local_target;
+                break;
+            case PCIE_Msg_Route_Not_Set:
+            case PCIE_Msg_Route_Upstream:
+#if (is_root_port) {
+                /* From PCIe spec: Error Messages are sent to the Root Complex
+                for reporting the detection of errors according to the severity
+                of the error. Error messages that originate from PCI Express or
+                Legacy Endpoints are sent to corresponding Root Ports. */
+                if((type == PCIE_ERR_COR) || (type == PCIE_ERR_NONFATAL)
+                    || (type == PCIE_ERR_FATAL)) {
+                    txl.target = local_target;
+                    break;
+                }
+} #else {
+                if ((type == PCIE_ERR_NONFATAL) || (type == PCIE_ERR_FATAL)) {
+                    if (pcie_config.command.se.val == 0) {
+                        // SERR# is disabled, don't forward ERR_NONFATAL and
+                        // ERR_FATAL messages from the secondary to the primary
+                        // interface of this bridge
+                        log info, 2: "SERR# disabled, not forwarding error"
+                            + " message";
+                        break;
+                    }
+                }
+}
+                txl.target = default_target ? default_target : local_target;
+                break;
+            case PCIE_Msg_Route_Broadcast:
+                log spec_viol: "Receiving upstream broadcast message";
+                if (perr)
+                    perr->val = PCIE_Error_Master_Abort;
+                break;
+            case PCIE_Msg_Route_Terminate:
+            case PCIE_Msg_Route_Gather:
+                txl.target = local_target;
+                break;
+            default:
+                log error: "%s, Unexpected pcie routing type: %d", this.qname, route;
+                break;
+            }
+            log info, 3: "Forwarding messages: %s, %s, address=0x%x, to: %s",
+                pcie_message_type_name(ATOM_get_transaction_pcie_msg_type(t)),
+                pcie_route_type_name(ATOM_get_transaction_pcie_msg_route(t)),
+                addr,
+                txl.target != NULL ?
+                    SIM_object_name(SIM_map_target_object(txl.target)) :  "Nil";
+            return callback(txl, t, cbdata);
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+                           const map_target_t *default_target) -> (bool) {
+            local bool ret = true;
+            if (local_target != NULL) {
+                ret = SIM_map_target_flush(local_target, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(local_target));
+                    return false;
+                }
+            }
+            if (default_target != NULL) {
+                ret = SIM_map_target_flush(default_target, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(default_target));
+                    return false;
+                }
+            }
+            ret = SIM_map_target_flush(downstream_port.map_target, base, size,
+                                       access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(
+                    downstream_port.map_target));
+            }
+            return ret;
+        }
+    }
+}
+
+/**
+   ## handling_messages
+
+   Should be implemented by (DML) objects that wants to handle PCIe messages
+   dispatched by the `message_port` template. When a message is received on a
+   `message_port` instance, it will iterate over instances of this template (in
+   an undefined order) and call the `message` method. Note that downstream
+   messages have stub-methods in the `pcie_config.message` group and are not
+   handled by instancing this template.
+
+   ### Methods
+*/
+template handling_messages {
+    /**
+       #### message(transaction_t *t, uint64 addr, pcie_message_type_t type) -> (pcie_error_t)
+
+       Called by the `message_port` template when a PCIe message is received.
+       Must return `PCIE_Error_Not_Set` if the message is _not_
+       handled. Returning anything else means that the message was handled by
+       this method call. Note that message handlers that implement handling of
+       VDM messages must still return `PCIE_Error_Not_Set` for messages it has
+       no handler for. The handler should thus not assume that the message is
+       handled by this method. Other atoms such as `pcie_msg_vdm_vendor_id`
+       and/or `pcie_msg_vdm_subtype` (or other custom atoms) should be
+       inspected.
+     */
+    shared method message(transaction_t *t, uint64 addr,
+                          pcie_message_type_t type) -> (pcie_error_t);
+}
+
+/**
+   ## handling_drs_messages
+
+   Handles Device Readiness Status messages. Sets the values in the "DRS Message
+   Received", "Flit Mode Status" and "Downstream Presence Detected" fields
+   accordingly. Does not handle any other type of PCIe VDM Message.
+*/
+template handling_drs_messages is handling_messages {
+    param associated_function: physical_config_bank;
+
+    method message(transaction_t *t, uint64 addr,
+                   pcie_message_type_t type) -> (pcie_error_t) {
+        if (type != PCIE_Vendor_Defined_Type_1) {
+            return PCIE_Error_Not_Set;
+        }
+        if (ATOM_get_transaction_pcie_msg_vdm_vendor_id(t)
+            != PCIe_Vendor_ID_PCI_SIG) {
+            return PCIE_Error_Not_Set;
+        }
+        if (ATOM_get_transaction_pcie_msg_vdm_subtype(t)
+            != PCIE_VDM_Device_Readiness_Status) {
+            return PCIE_Error_Not_Set;
+        }
+
+        local exp_link link;
+        try {
+            link = associated_function._find_exp_link();
+        } catch {
+            log warning: "Could not find link registers. Can't handle DRS"
+                + " message";
+            return PCIE_Error_Completer_Abort;
+        }
+        if (link.drs_supported())
+            return link.drs_msg_received();
+        else
+            return PCIE_Error_No_Error;
+    }
+}
+
+/**
+   ## handling_ats_messages
+
+   Stub methods for an RC receiving ATS messages. Inherits
+   `handling_messages`
+*/
+template handling_ats_messages is handling_messages {
+    method message(transaction_t *t, uint64 addr,
+                   pcie_message_type_t type) -> (pcie_error_t) {
+        if (type == PCIE_ATS_Invalidate_Completion) {
+            return ats_invalidate_completion(t, addr) ?
+                PCIE_Error_No_Error : PCIE_Error_Completer_Abort;
+        }
+        return PCIE_Error_Not_Set;
+    }
+    /**
+       #### ats_invalidate_completion(transaction_t *t, uint64 addr) -> (bool)
+
+       Called when a ATS Invalidation Completion message is received. Device model
+       has to override the default implementation to process the message.
+       Returns `true` if processing of the message was successful.
+       Default implementation always returns `false`.
+     */
+    method ats_invalidate_completion(transaction_t *t, uint64 addr) -> (bool) default {
+            log unimpl: "ATS Invalidate Completion Message";
+            return false;
+    }
+}
+
+/**
+   ## handling_prs_messages
+
+   Template for an RC receiving and sending PRS messages. Method
+   `page_request_received` must be overridden to implement the
+   logic to handle a page request message. Inherits `handling_messages`.
+*/
+template handling_prs_messages is handling_messages {
+    method message(transaction_t *t, uint64 addr,
+                   pcie_message_type_t type) -> (pcie_error_t) {
+        if (type == PCIE_PRS_Request) {
+            return page_request_received(t, addr) ?
+                PCIE_Error_No_Error : PCIE_Error_Completer_Abort;
+        }
+        return PCIE_Error_Not_Set;
+    }
+
+    /**
+       #### method page_group_response(map_target_t *mt, uint16 target_id, uint16 prs_group_idx, pcie_prs_response_code_t response_code, pcie_pasid_info_t *pasid) -> (pcie_error_t)
+
+       Sends a Page Response message to **target_id** via **mt**.
+       Argument **pasid** can be set to NULL to leave out the PASID
+       from the transaction.
+    */
+    method page_group_response(map_target_t *mt,
+                               uint16 target_id,
+                               uint16 prs_group_idx,
+                               pcie_prs_response_code_t response_code,
+                               pcie_pasid_info_t *pasid) -> (pcie_error_t) {
+        local pcie_error_ret_t er;
+
+        local pcie_prs_page_group_response_t msg = {
+            .field = {
+                .prgi = prs_group_idx,
+                .response_code = response_code,
+                ...
+            },
+            ...
+        };
+
+        local atom_t atoms[10] = {
+            ATOM_pcie_type(PCIE_Type_Msg),
+            ATOM_pcie_msg_route(PCIE_Msg_Route_ID),
+            ATOM_pcie_msg_type(PCIE_PRS_Response),
+            ATOM_pcie_prs_page_group_response(msg.u16),
+            ATOM_flags(Sim_Transaction_Write),
+            ATOM_pcie_device_id(target_id),
+            ATOM_initiator(obj),
+            ATOM_pcie_error_ret(&er),
+            pasid != NULL ? ATOM_pcie_pasid(pasid->u32) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t;
+        t.atoms = atoms;
+        local exception_type_t exc = SIM_issue_transaction(mt, &t, target_id << 48);
+        if (exc != Sim_PE_No_Exception) {
+            if (er.val == PCIE_Error_Not_Set)
+                return PCIE_Error_Master_Abort;
+            return er.val;
+        }
+        return PCIE_Error_No_Error;
+    }
+
+    /**
+       #### page_request_received(transaction_t *t, uint64 addr) -> (bool)
+
+       Stub method, called when a Page Request message is received.  Should
+       return `true` if the message was handled correctly or `false` if the
+       message could not be handled. The default implementation logs an
+       **unimpl** message and returns `false`.
+    */
+    method page_request_received(transaction_t *t,
+                                 uint64 addr) -> (bool) default {
+        if (ATOM_get_transaction_pcie_prs_stop_marker(t)) {
+            log unimpl: "%s Received Stop Marker Message, PASID:0x%x",
+                this.qname, ATOM_get_transaction_pcie_pasid(t);
+        } else if (ATOM_transaction_pcie_prs_page_request(t) != NULL) {
+            local pcie_prs_page_request_t msg = {
+                .u64 = ATOM_get_transaction_pcie_prs_page_request(t),
+                ...
+            };
+            log unimpl: "Page Request Message: Page Address 0x%x, PRGI:%d %s%s%s"
+                + " PASID:0x%x", msg.field.page_addr << 12, msg.field.prgi,
+                msg.field.l ? "L" : "", msg.field.w ? "W" : "", msg.field.r ? "R" : "",
+                ATOM_get_transaction_pcie_pasid(t);
+        }
+        return false;
+    }
+}
+
+/**
+   ## pcie_upstream_translator
+
+   Default PCIe upstream translator, implementing `transaction_translator`.
+   Redirects transactions based on the `pcie_type` atom.  Transactions are
+   forwarded according to parameters `msg`, `mem`, `io` and `cfg` in the group
+   `txl_target`. By default, all parameters point to the parameter `def` which
+   defaults to `NULL`, i.e. transactions are terminated.
+*/
+template pcie_translator is pcie_upstream_translator { } // Legacy alias
+template pcie_upstream_translator {
+    group txl_target {
+        param def default NULL;
+        param msg default def;
+        param mem default def;
+        param io  default def;
+        param cfg default def;
+    }
+
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) default {
+            local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+            local translation_t txl;
+            if (type == PCIE_Type_Mem)
+                txl.target = txl_target.mem;
+            else if (type == PCIE_Type_Msg)
+                txl.target = txl_target.msg;
+            else if (type == PCIE_Type_IO)
+                txl.target = txl_target.io;
+            else if (type == PCIE_Type_Cfg)
+                txl.target = txl_target.cfg;
+            return callback(txl, t, cbdata);
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+                           const map_target_t *default_target) -> (bool) default {
+            local bool ret = true;
+            if (txl_target.mem != NULL) {
+                ret = SIM_map_target_flush(txl_target.mem, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(txl_target.mem));
+                    return false;
+                }
+            }
+            if (txl_target.msg != NULL) {
+                ret = SIM_map_target_flush(txl_target.msg, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(txl_target.msg));
+                    return false;
+                }
+            }
+            if (txl_target.io != NULL) {
+                ret = SIM_map_target_flush(txl_target.io, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(txl_target.io));
+                    return false;
+                }
+            }
+            if (txl_target.cfg != NULL) {
+                ret = SIM_map_target_flush(txl_target.cfg, base, size, access);
+                if (!ret) {
+                    log info, 1 then 2: "Failed flushing map_target %s",
+                    SIM_object_name(SIM_map_target_object(txl_target.cfg));
+                }
+            }
+            return ret;
+        }
+    }
+}
+
+template init_mt is init {
+    session map_target_t *map_target;
+    param mt = map_target;  // legacy alias
+    method init() default {
+        map_target = SIM_new_map_target(this.obj, NULL, NULL);
+    }
+}
+
+
+/**
+  ## ats_upstream_translator
+
+  Stub template for handling ATS transactions. Inherits
+  `pcie_upstream_translator`. Defines the ports `ats_untranslated`,
+  `ats_translated` and `ats_request` to which **Memory** transactions are
+  forwarded according to the `pcie_at` atom. All other transactions are handled
+  according to the default behavior of `pcie_upstream_translator`. The port
+  `ats_request` implements `transaction` with the method `issue` which by
+  default logs an **unimpl** message and returns `PCIE_Error_Completer_Abort`.
+  The two other ports implement `transaction_translator` and forward all
+  transactions to `host_memory.map_target`, by default.
+*/
+template ats_upstream_translator is pcie_upstream_translator {
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) default {
+            local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+            if (type != PCIE_Type_Mem)
+                return default(addr, access, t, callback, cbdata);
+
+            local translation_t txl;
+            local pcie_at_t at = ATOM_get_transaction_pcie_at(t);
+            if (at == PCIE_AT_Untranslated)
+                txl.target = ats_untranslated.map_target;
+            else if (at == PCIE_AT_Translated)
+                txl.target = ats_translated.map_target;
+            else if (at == PCIE_AT_Translation_Request) {
+                if (SIM_transaction_is_read(t))
+                    txl.target = ats_request.map_target;
+                else
+                    log error: "Expects AT request to be a read transaction";
+            } else
+                log error: "Invalid AT atom %d", at;
+            return callback(txl, t, cbdata);
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+                           const map_target_t *default_target) -> (bool) {
+            default(base, size, access, default_target);
+            local bool ret;
+            ret = SIM_map_target_flush(ats_untranslated.map_target, base, size,
+                                       access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(
+                    ats_untranslated.map_target));
+                return false;
+            }
+            ret = SIM_map_target_flush(ats_translated.map_target, base, size,
+                                       access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(
+                    ats_translated.map_target));
+                return false;
+            }
+            ret = SIM_map_target_flush(ats_request.map_target, base, size,
+                                       access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(
+                    ats_request.map_target));
+            }
+            return ret;
+        }
+    }
+
+    port ats_untranslated is translating_to_host_memory
+        "handles ATS Untranslated requests";
+    port ats_translated is translating_to_host_memory
+        "handles ATS Translated requests";
+    port ats_request is init_mt "handles ATS Translation requests" {
+        implement transaction {
+            method issue(transaction_t *t,
+                         uint64 addr) -> (exception_type_t) default {
+                log unimpl: "ATS Translation Request for 0x%llx, PASID:%d",
+                    addr, ATOM_get_transaction_pcie_pasid(t);
+                local pcie_error_ret_t *pex =
+                    ATOM_get_transaction_pcie_error_ret(t);
+                if (pex)
+                    pex->val = PCIE_Error_Completer_Abort;
+
+                local pcie_byte_count_ret_t *bc =
+                    ATOM_get_transaction_pcie_byte_count_ret(t);
+                if (bc)
+                    bc->val = 0;
+                return Sim_PE_IO_Not_Taken;
+            }
+        }
+    }
+
+    /**
+       #### ats_invalidate(map_target_t *mt, uint16 target_id, const pcie_pasid_info_t *pasid, uint64 untranslated_addr, uint64 size, bool global, uint8 itag) -> (pcie_error_t)`
+
+
+       Sends an ATS invalidation message via **mt** to an endpoint to
+       invalidate a translated address. The method automatically masks the lower
+       bits of the provided `untranslated_addr` according to PCIe specification
+       based on the `size` argument. Argument `pasid` can be set to NULL
+       in order to leave out the `pcie_pasid` atom from the transaction.
+    */
+    method ats_invalidate(map_target_t *mt,
+                          uint16 target_id,
+                          const pcie_pasid_info_t *pasid,
+                          uint64 untranslated_addr,
+                          uint64 size,
+                          bool global,
+                          uint8 itag) -> (pcie_error_t) {
+        log info, 3: "Invalidate range 0x%08X-0x%08X for (%02x:%02x:%02x)",
+            untranslated_addr, untranslated_addr + size - 1,
+            target_id[15:8],
+            target_id[7:3],
+            target_id[2:0];
+        if (size == 0 || size[11:0] != 0) {
+            log error: "Size: 0x%x, must be a multiple of 4096-byte pages", size;
+            size = (size[63:12] + 1) << 12;
+        }
+
+        local pcie_ats_invalidate_request_payload_t payload;
+        payload.field.s = size > 4096;
+        payload.field.global = global;
+        payload.field.untranslated_addr = untranslated_addr >> 12;
+
+        if (payload.field.s) {
+            // Mark size of translation as defined in the PCIe specification
+            local int zero_bit = log2_64(size) - 1;
+            payload.field.untranslated_addr[zero_bit - 12] = 0;
+            payload.field.untranslated_addr[zero_bit - 12 - 1:0] = cast(-1, uint64);
+        }
+
+        local pcie_error_ret_t er;
+        local atom_t atoms[12] = {
+            ATOM_pcie_type(PCIE_Type_Msg),
+            ATOM_pcie_msg_route(PCIE_Msg_Route_ID),
+            ATOM_pcie_msg_type(PCIE_ATS_Invalidate),
+            ATOM_pcie_ats_invalidate_request_itag(itag),
+            ATOM_pcie_device_id(target_id),
+            ATOM_data(cast(&payload, uint8*)),
+            ATOM_size(sizeof(payload)),
+            ATOM_flags(Sim_Transaction_Write),
+            ATOM_initiator(obj),
+            ATOM_pcie_error_ret(&er),
+            pasid != NULL ? ATOM_pcie_pasid(pasid->u32) : ATOM_list_end(0),
+            ATOM_list_end(0),
+        };
+        local transaction_t t = { .atoms = atoms, ... };
+        local exception_type_t exc =
+            SIM_issue_transaction(mt, &t, target_id << 48);
+        if (exc != Sim_PE_No_Exception) {
+            if (er.val == PCIE_Error_Not_Set)
+                return PCIE_Error_Master_Abort;
+            return er.val;
+        }
+        return PCIE_Error_No_Error;
+    }
+}
+
+template translating_to_host_memory is init_mt {
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) default {
+            local translation_t txl;
+            txl.target = host_memory.map_target;
+            return callback(txl, t, cbdata);
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+                           const map_target_t *default_target) -> (bool) default {
+            local bool ret = true;
+            ret = SIM_map_target_flush(host_memory.map_target, base, size,
+                                       access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(host_memory.map_target));
+            }
+            return ret;
+        }
+    }
+}
+
+/**
+   ## type_1_bank
+
+   Inherits **physical_config_bank** and adds Type 1 specific registers.
+   Automatically handles mapping of the downstream_target, according to the
+   secondary/subordinate and base/limit registers. Handles broadcasting of
+   downstream messages to downstream_target.
+*/
+template type_1_bank is (physical_config_bank) {
+    param map_prio default 0;
+    param is_type_1_header default true;
+    register header_type {
+        field type {
+            param init_val default 1;
+        }
+    }
+    register class_code {
+        field base_class_code {
+            param init_val default 6;
+        }
+        field sub_class_code {
+            param init_val default 4;
+        }
+    }
+
+    register primary_bus_number     size 1 @ 0x18 is pcie_desc {
+        param pcie_desc = "Primary Bus Number";
+    }
+    register secondary_bus_number   size 1 @ 0x19 is pcie_desc {
+        param pcie_desc = "Secondary Bus Number";
+    }
+    register subordinate_bus_number size 1 @ 0x1a is pcie_desc {
+        param pcie_desc = "Subordinate Bus Number";
+    }
+    register secondary_status       size 2 @ 0x1e is pcie_desc {
+        param pcie_desc = "Secondary Status";
+    }
+    register bridge_control         size 2 @ 0x3e is pcie_desc {
+        param pcie_desc = "Bridge Control";
+    }
+
+    group io {
+        register base        size 1 @ 0x1c is pcie_desc {
+            param pcie_desc = "I/O Base";
+        }
+        register limit       size 1 @ 0x1d is pcie_desc {
+            param pcie_desc = "I/O Limit";
+        }
+        register base_upper  size 2 @ 0x30 is pcie_desc {
+            param pcie_desc = "I/O Base Upper";
+        }
+        register limit_upper size 2 @ 0x32 is pcie_desc {
+            param pcie_desc = "I/O Limit Upper";
+        }
+    }
+
+    group memory {
+        register base  size 2 @ 0x20 is pcie_desc {
+            param pcie_desc = "Memory Base";
+        }
+        register limit size 2 @ 0x22 is pcie_desc {
+            param pcie_desc = "Memory Limit";
+        }
+    }
+
+    group prefetchable {
+        register base        size 2 @ 0x24 is pcie_desc {
+            param pcie_desc = "Prefetchable Memory Base";
+        }
+        register limit       size 2 @ 0x26 is pcie_desc {
+            param pcie_desc = "Prefetchable Memory Limit";
+        }
+        register base_upper  size 4 @ 0x28 is pcie_desc {
+            param pcie_desc = "Prefetchable Memory Base Upper";
+        }
+        register limit_upper size 4 @ 0x2c is pcie_desc {
+            param pcie_desc = "Prefetchable Memory Limit Upper";
+        }
+    }
+
+    register command {
+        field m {
+            method pcie_write(uint64 value) default {
+                if (this.val != value) {
+                    this.val = value;
+                    SIM_translation_changed(dev.obj);
+                }
+            }
+        }
+    }
+
+    register secondary_bus_number {
+        method pcie_write(uint64 value) default {
+            this.val = value;
+            downstream_port.pcie_port_control.set_secondary_bus_number(value);
+            cfg.update_map();
+            msg.update_map();
+        }
+    }
+    register subordinate_bus_number {
+        method pcie_write(uint64 value) default {
+            this.val = value;
+            cfg.update_map();
+            msg.update_map();
+        }
+    }
+
+    register secondary_status {
+        field pe   @ [8:8]   is pcie_desc {
+            param pcie_desc = "Master Data Parity Error";
+        }
+        field sta  @ [11:11] is pcie_desc {
+            param pcie_desc = "Signaled Target Abort";
+        }
+        field rta  @ [12:12] is pcie_desc {
+            param pcie_desc = "Received Target Abort";
+        }
+        field rma  @ [13:13] is pcie_desc {
+            param pcie_desc = "Received Master Abort";
+        }
+        field ssa  @ [14:14] is pcie_desc {
+            param pcie_desc = "Received System Abort";
+        }
+        field dpe  @ [15:15] is pcie_desc {
+            param pcie_desc = "Detected Parity Error";
+        }
+    }
+
+    register bridge_control {
+        field pere   @ [0:0] is pcie_desc {
+            param pcie_desc = "Parity Error Response Enable";
+        }
+        field serr   @ [1:1] is pcie_desc {
+            param pcie_desc = "SERR# Enable";
+        }
+        field isae   @ [2:2] is pcie_desc {
+            param pcie_desc = "ISA Enable";
+        }
+        field vgae   @ [3:3] is pcie_desc {
+            param pcie_desc = "VGA Enable";
+        }
+        field vga16d @ [4:4] is pcie_desc {
+            param pcie_desc = "VGA 16-bit Decode";
+        }
+        field mam    @ [5:5] is pcie_desc {
+            param pcie_desc = "Invalid in PCIe, hardwired to zero";
+        }
+        field sbr    @ [6:6] is pcie_desc {
+            param pcie_desc = "Secondary Bus Reset";
+            method pcie_write(uint64 value) default {
+                if (this.val != value) {
+                    this.val = value;
+                    if (value > 0)
+                        downstream_port.pcie_port_control.hot_reset();
+                }
+            }
+        }
+        field fbte   @ [7:7] is pcie_desc {
+            param pcie_desc = "Invalid in PCIe, hardwired to zero";
+        }
+    }
+
+    group cfg is type_1_base_address {
+        param type = PCIE_Type_Cfg;
+        method get_base() -> (uint64) default {
+            return secondary_bus_number.val << 24;
+        }
+        method get_limit() -> (uint64) default {
+            return ((subordinate_bus_number.val + 1) << 24) - 1;
+        }
+    }
+
+    group msg is type_1_base_address {
+        param type = PCIE_Type_Msg;
+        method get_base() -> (uint64) default {
+            return secondary_bus_number.val << 56;
+        }
+        method get_limit() -> (uint64) default {
+            return ((subordinate_bus_number.val + 1) << 56) - 1;
+        }
+    }
+
+    group io is type_1_base_address {
+        register base {
+            field addr @ [7:4] is pcie_desc {
+                param pcie_desc = "I/O Base Address bits [15:12]";
+            }
+            field cap  @ [3:0] is pcie_desc {
+                param pcie_desc = "I/O Addressing Capability";
+            }
+        }
+        register limit {
+            field addr @ [7:4] is pcie_desc {
+                param pcie_desc = "I/O Limit Address bits [15:12]";
+            }
+            field cap  @ [3:0] is pcie_desc {
+                param pcie_desc = "I/O Addressing Capability";
+            }
+        }
+        register base_upper {
+            field addr @ [15:0] is pcie_desc {
+                param pcie_desc = "I/O Base Address bits [31:16]";
+            }
+        }
+        register limit_upper {
+            field addr @ [15:0] is pcie_desc {
+                param pcie_desc = "I/O Limit Address bits [31:16]";
+            }
+        }
+
+        param type = PCIE_Type_IO;
+        method get_base() -> (uint64) default {
+            if (base.cap.val == 0)
+                return base.addr.val << 12;
+            return (base_upper.val << 16) | (base.addr.val << 12);
+        }
+
+        method get_limit() -> (uint64) default {
+            if (limit.cap.val == 0)
+                return (limit.addr.val << 12) | 0xfff;
+            return (limit_upper.val << 16) | (limit.addr.val << 12) | 0xfff;
+        }
+    }
+
+    group memory is type_1_base_address {
+        register base {
+            field addr @ [15:4] is pcie_desc {
+                param pcie_desc = "Memory Base Address bits [31:20]";
+            }
+            field rsvd @ [3:0]  is pcie_desc {
+                param pcie_desc = "Reserved bits";
+            }
+        }
+        register limit {
+            field addr @ [15:4] is pcie_desc {
+                param pcie_desc = "Memory Limit Address bits [31:20]";
+            }
+            field rsvd @ [3:0]  is pcie_desc {
+                param pcie_desc = "Reserved bits";
+            }
+        }
+
+        param type = PCIE_Type_Mem;
+        method get_base() -> (uint64) default {
+            return (base.addr.val << 20);
+        }
+
+        method get_limit() -> (uint64) default {
+            return (limit.addr.val << 20) | 0xfffff;
+        }
+    }
+
+    group prefetchable is type_1_base_address {
+        register base {
+            field addr @ [15:4] is pcie_desc {
+                param pcie_desc = "Prefetchable Base Address bits [31:20]";
+            }
+            field cap  @ [3:0] is pcie_desc {
+                param pcie_desc = "Prefetchable Addressing Capability";
+                /* Reasonable assumption, 0 = 32-bit, 1 = 64-bit */
+                param init_val default 1;
+            }
+        }
+        register limit {
+            field addr @ [15:4] is pcie_desc {
+                param pcie_desc = "Prefetchable Limit Address bits [31:20]";
+            }
+            field cap  @ [3:0] is pcie_desc {
+                param pcie_desc = "Prefetchable Addressing Capability";
+                /* Reasonable assumption, 0 = 32-bit, 1 = 64-bit */
+                param init_val default 1;
+            }
+        }
+        register base_upper {
+            field addr @ [31:0] is pcie_desc {
+                param pcie_desc = "Prefetchable Base Address bits [63:32]";
+            }
+        }
+        register limit_upper {
+            field addr @ [31:0] is pcie_desc {
+                param pcie_desc = "Prefetchable Limit Address bits [63:32]";
+            }
+        }
+
+
+        param type = PCIE_Type_Mem;
+        method get_base() -> (uint64) default {
+            if (base.cap.val == 0)
+                return (base.addr.val << 20);
+            return (base_upper.val << 32) | (base.addr.val << 20);
+        }
+
+        method get_limit() -> (uint64) default {
+            if (limit.cap.val == 0)
+                return (limit.addr.val << 20) | 0xfffff;
+            return (limit_upper.val << 32) | (limit.addr.val << 20) | 0xfffff;
+        }
+    }
+
+#if (use_standard_write_templates) {
+    register command {
+        field m is pcie_write;
+    }
+    register secondary_bus_number is pcie_write;
+    register subordinate_bus_number is pcie_write;
+    register bridge_control {
+        field sbr is pcie_write;
+    }
+    register secondary_status {
+        field pe  is pcie_write_1_clears;
+        field sta is pcie_write_1_clears;
+        field rta is pcie_write_1_clears;
+        field rma is pcie_write_1_clears;
+        field ssa is pcie_write_1_clears;
+        field dpe is pcie_write_1_clears;
+    }
+
+    group memory {
+        register base {
+            field addr is pcie_write;
+        }
+        register limit {
+            field addr is pcie_write;
+        }
+    }
+    group io {
+        register base {
+            field addr is pcie_write;
+        }
+        register limit {
+            field addr is pcie_write;
+        }
+        register limit_upper {
+            field addr is pcie_write;
+        }
+        register limit_upper {
+            field addr is pcie_write;
+        }
+    }
+    group prefetchable {
+        register base {
+            field addr is pcie_write;
+        }
+        register limit {
+            field addr is pcie_write;
+        }
+        register base_upper {
+            field addr is pcie_write;
+        }
+        register limit_upper {
+            field addr is pcie_write;
+        }
+    }
+}
+#if (use_standard_access_templates) {
+    register bridge_control {
+        field mam is ignore_write;
+        field fbte is ignore_write;
+    }
+    group memory {
+        register base {
+            field rsvd is ignore_write;
+        }
+        register limit {
+            field rsvd is ignore_write;
+        }
+    }
+    group io {
+        register base {
+            field cap is ignore_write;
+        }
+        register limit {
+            field cap is ignore_write;
+        }
+    }
+    group prefetchable {
+        register base {
+            field cap is ignore_write;
+        }
+        register limit {
+            field cap is ignore_write;
+        }
+    }
+}
+}
+
+/**
+   ## type_1_base_address
+
+   Implements the common functionality of Type 1 base address groups such as
+   `io`, `memory` and `prefetchable`. Handles mapping of the relevant
+   downstream ranges into the upstream target address spaces. Inherits
+   `abstract_base_address`.
+
+*/
+template type_1_base_address is (abstract_base_address, pcie_after_reset) {
+    param map_obj default
+        type == PCIE_Type_Mem ? downstream_translators.mem.obj :
+        type == PCIE_Type_IO ? downstream_translators.io.obj :
+        type == PCIE_Type_Cfg ? downstream_translators.cfg.obj :
+        type == PCIE_Type_Msg ? downstream_translators.msg.obj : NULL;
+    param map_prio default parent.map_prio;
+
+    method enabled() -> (bool) default {
+        local bool valid = get_limit() > get_base();
+        if (type == PCIE_Type_IO) {
+            return valid && command.io.val;
+        } else if (type == PCIE_Type_Mem) {
+            return valid && command.mem.val;
+        } else if (type == PCIE_Type_Cfg || type == PCIE_Type_Msg) {
+            // PCIe spec isn't clear, but secondary bus number resets to 0 and
+            // a device could never have bus 0 on its secondary side, since bus
+            // 0 is reserved for the root complex. It seems safe enough for a
+            // 'default' implementation to assume that that 0 means the port is
+            // not configured.
+            return secondary_bus_number.val != 0 && valid;
+        }
+        log error: "invalid PCIe type %d for '%s'", type, qname;
+        return false;
+    }
+
+    method get_map_info() -> (map_info_t) {
+        local map_info_t nfo;
+        nfo.base = get_base();
+        nfo.start = nfo.base;
+        nfo.length = get_limit() - nfo.base + 1;
+        nfo.priority = map_prio;
+        return nfo;
+    }
+
+    in each (register) {
+        field addr {
+            method pcie_write(uint64 value) {
+                this.val = value;
+                update_map();
+            }
+        }
+    }
+
+    method pcie_after_reset() default {
+        update_map();
+    }
+}
+
+template mtg {
+    session conf_object_t *obj;
+    session map_target_t *map_target;
+    param mt = map_target;  // legacy alias
+    method set(conf_object_t *o) {
+        obj = o;
+        map_target = SIM_new_map_target(o, NULL, NULL);
+    }
+}
+
+/**
+   ## downstream_port
+
+   Can be applied to a connect to automatically create a `pcie-downstream-port`
+   object with map targets for `cfg`, `msg`, `mem` and `io`. The interface
+   `pcie_port_control` and `transaction` are connected to the `downstream` port
+   of the automatically created object.
+*/
+template downstream_port is (connect, init_as_subobj) {
+    param classname default "pcie-downstream-port";
+    interface pcie_port_control {
+        // this -is- required, but we find it either on the device or on
+        // port.downstream
+        param required = false;
+    }
+
+    session map_target_t *map_target;
+    param mt = map_target;  // legacy alias
+    group cfg is mtg;
+    group msg is mtg;
+    group mem is mtg;
+    group io  is mtg;
+    group ecam is mtg;
+    group phy is mtg;
+
+    method init() default {
+        default();
+        /* grab map-targets for the type-specific shortcuts */
+        cfg.set(SIM_object_descendant(this.obj, "port.cfg"));
+        msg.set(SIM_object_descendant(this.obj, "port.msg"));
+        mem.set(SIM_object_descendant(this.obj, "port.mem"));
+        io.set(SIM_object_descendant(this.obj,  "port.io"));
+        map_target = SIM_new_map_target(
+            SIM_object_descendant(this.obj, "port.downstream"), NULL, NULL);
+
+        /* ECAM port might be useful, if present */
+        if (SIM_object_descendant(this.obj, "port.ecam")) {
+            ecam.set(SIM_object_descendant(this.obj, "port.ecam"));
+        } else {
+            log info, 2: "pcie-downstream-port is missing ecam port,"
+                + " upgrade Simics Base package";
+        }
+
+        if (SIM_object_descendant(this.obj, "port.phy")) {
+            phy.set(SIM_object_descendant(this.obj, "port.phy"));
+        } else {
+            log info, 2: "pcie-downstream-port is missing phy port,"
+                + " upgrade Simics Base package";
+        }
+
+        if (!pcie_port_control.val) {
+            // legacy pcie-downstream-port which doesn't have
+            // `pcie_port_control` on the device, but on `port.downstream`
+            set(SIM_object_descendant(this.obj, "port.downstream"));
+            assert(pcie_port_control.val);
+        }
+    }
+}
+
+/**
+   ## pcie_hotplug_port
+
+   This template should only be applied to a Downstream Port of PCI Express
+   Switch or a Root Port of PCI Express Root Complex.
+
+   When instantiating this template, an implementation of the
+   `pcie_hotplug_events` interface will be added to the device. When a method of
+   this interface is invoked, it will check if the device has a PCI Express
+   Capability Structure that has support for the incoming Hot-Plug event. If it
+   does, it will trigger a Hot-Plug event.
+
+   This template also adds handling of the Hot-Plug PCIe message types defined
+   in this library.
+*/
+
+template pcie_hotplug_port {
+#if(pcie_port_direction != "downstream") {
+    error "the pcie_hotplug_port template should only be instantiated on"
+        + " objects that inherit the pcie_downstream_port or pcie-root-port"
+        + " template.";
+}
+
+    implement pcie_hotplug_events {
+        method presence_change(pcie_hotplug_pd_t state) default {
+            foreach s in (each exp_slot in (pcie_config)) {
+                if (s.hotplug_capable(SLOT_PRESENCE_DETECT)) {
+                    s.presence_change_event(state);
+                    pcie_handle_link(state);
+                } else {
+                    log info, 2: "Hot-Plug Presence Change event dropped at %s"
+                               + " since it is not supported by the device",
+                               this.qname;
+                }
+                break;
+            }
+        }
+        method power_fault() default {
+            foreach s in (each exp_slot in (pcie_config)) {
+                if (s.hotplug_capable(SLOT_POWER_FAULT)) {
+                    s.power_fault_event();
+                } else {
+                    log info, 2: "Hot-Plug Power Fault event dropped at %s"
+                               + " since it is not supported by the device",
+                               this.qname;
+                }
+                return;
+            }
+        }
+        method attention_button_pressed() default {
+            foreach s in (each exp_slot in (pcie_config)) {
+                if (s.hotplug_capable(SLOT_ATTENTION_BUTTON)) {
+                    s.attention_button_event();
+                } else {
+                    log info, 2: "Hot-Plug Attention Button event dropped at %s"
+                               + " since it is not supported by the device",
+                               this.qname;
+                }
+                return;
+            }
+        }
+        method mrl_sensor(pcie_hotplug_mrl_t state) default {
+            foreach s in (each exp_slot in (pcie_config)) {
+                if (s.hotplug_capable(SLOT_MRL_SENSOR)) {
+                    s.mrl_sensor_event(state);
+                } else {
+                    log info, 2: "Hot-Plug MRL Sensor event dropped at %s since"
+                               + " it is not supported by the device",
+                               this.qname;
+                }
+                return;
+            }
+        }
+        method data_link_layer(bool is_active) default {
+            foreach s in (each exp_slot in (pcie_config)) {
+                if (s.hotplug_capable(LINK_DLL)) {
+                    s.data_link_layer_event(is_active);
+                } else {
+                    log info, 2: "Hot-Plug Data Link Layer event dropped at %s"
+                               + " since it is not supported by the device",
+                               this.qname;
+                }
+                return;
+            }
+        }
+    }
+
+    method pcie_handle_link(pcie_hotplug_pd_t state) default {
+        foreach l in (each exp_link in (pcie_config)) {
+            if (state == PCIE_HP_PD_Adapter_Not_Present) {
+                l.set_link_attributes(PCIE_Link_Speed_Undefined,
+                                      PCIE_Link_Width_Undefined);
+                pcie_hotplug_events.data_link_layer(false);
+                l.set_flit_mode_status(false);
+                if (l.drs_supported()) {
+                    l.set_downstream_component_presence(
+                        PCIE_DCP_Link_Down_Component_Not_Present);
+                }
+            } else if (state == PCIE_HP_PD_Adapter_Present) {
+                if (l.do_link_training(0))
+                    pcie_hotplug_events.data_link_layer(true);
+                else
+                    log info, 2: "Link training failed";
+            }
+            break;
+        }
+    }
+}
+
+/**
+   ## pcie_link_training
+
+   Can be applied to objects that inherit the pcie_downstream_port or the
+   pcie_root_port template. Applying this template will implement the
+   pcie_link_training interface. Implementing this interface will allow the
+   object to initiate link training by the trigger method being invoked.
+
+   The template will also set the link_training_target in the link group of the
+   PCI Express Capability Structure in the device.
+
+   Parameters:
+   - `pcie_link_training_target`: A map_target_t pointer that is not `NULL`
+      during `post_init`, default `downstream_port.phy.map_target`
+*/
+template pcie_link_training {
+#if(pcie_port_direction != "downstream") {
+    error "the pcie_link_training template should only be instantiated on"
+        + " objects that inherit the pcie_downstream_port or pcie-root-port"
+        + " template.";
+}
+    param pcie_link_training_target default downstream_port.phy.map_target;
+
+    implement pcie_link_training {
+        method trigger(uint16 device_id) -> (bool) default {
+            foreach link in (each exp_link in (this.parent)) {
+                local bool res;
+                local map_target_t *mt;
+
+                res = link.do_link_training(device_id);
+                if (!res)
+                    log info, 2: "Link training failed";
+                return res;
+            }
+            return false;
+        }
+    }
+
+    method init_link_target() default {
+        foreach l in (each exp_link in (pcie_config)) {
+            l.set_link_training_target(pcie_link_training_target);
+        }
+    }
+
+    group _init_helper is post_init {
+        method post_init() {
+            parent.init_link_target();
+        }
+    }
+}
+
+/**
+   ## pcie_downstream_translators
+   Adds a `port` that instantiates the [x](#pcie_downstream_translator) template
+   for each PCIe space. These ports are used to translate transactions to the
+   corresponding port in the `pcie-downstream-port` helper object. The ports are
+   `cfg`, `mem`, `msg` and `io`.
+*/
+template pcie_downstream_translators {
+    port cfg is pcie_downstream_translator { param type = PCIE_Type_Cfg; }
+    port mem is pcie_downstream_translator { param type = PCIE_Type_Mem; }
+    port msg is pcie_downstream_translator { param type = PCIE_Type_Msg; }
+    port io  is pcie_downstream_translator { param type = PCIE_Type_IO; }
+}
+
+/**
+   ## pcie_downstream_translator
+   Default PCIe downstream translator, implementing `transaction_translator`.
+   Redirects to the applicable port (port `cfg`, `mem`, `msg` or `io`), which
+   translates to the corresponding memory space, in the `pcie-downstream-port`
+   helper object. An override to the implementation of the
+   transaction_translator interface method which creates a chained transaction
+   to add atoms to the transaction chain, SHOULD consider whether or not
+   deferred transactions should be supported in the platform this device will be
+   a part of. See more details at
+   [here](pcie-in-dml.html#adding-atoms-to-downstream-transaction).
+*/
+template pcie_downstream_translator {
+    param type: pcie_type_t;
+    param target default
+        type == PCIE_Type_Mem ? downstream_port.mem.map_target :
+        type == PCIE_Type_IO  ? downstream_port.io.map_target  :
+        type == PCIE_Type_Cfg ? downstream_port.cfg.map_target :
+        type == PCIE_Type_Msg ? downstream_port.msg.map_target : NULL;
+
+    implement transaction_translator {
+        /*
+        If an override to this method creates a chained transaction to add atoms
+        to the transaction chain, the override SHOULD consider whether or not
+        deferred transactions should be supported in the platform this device
+        will be a part of. See more details at [here](TODO: link to more doc).
+        */
+        method translate(uint64 addr, access_t access,transaction_t *t,
+                         exception_type_t (*callback)(translation_t txl,
+                                                      transaction_t *tx,
+                                                      cbdata_call_t cbd),
+                         cbdata_register_t cbdata) -> (exception_type_t) default {
+            local translation_t txl;
+            txl.target = target;
+            return callback(txl, t, cbdata);
+        }
+    }
+
+    implement translation_flush {
+        method flush_range(uint64 base, uint64 size, access_t access,
+            const map_target_t *default_target) -> (bool) {
+            local bool ret = true;
+            ret = SIM_map_target_flush(target, base, size, access);
+            if (!ret) {
+                log info, 1 then 2: "Failed flushing map_target %s",
+                SIM_object_name(SIM_map_target_object(target));
+            }
+            return ret;
+        }
+    }
+}

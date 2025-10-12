@@ -1,0 +1,53 @@
+// sample-device-with-external-lib.dml - Sample code for a device using an external library
+
+/*
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+
+dml 1.4;
+
+device sample_device_with_external_lib;
+
+param desc = "sample device with external lib";
+
+param documentation = "A sample device that uses an external library "
+                    + "that shall become part of the module/package "
+                    + "of the device";
+
+import "utility.dml";
+
+extern uint64 external_helper_function(uint64 val);
+
+header %{
+#include "external_lib.h"
+%}
+
+
+// Basic bank declaration
+bank regs {
+    param register_size = 8;
+    register trigger @ 0x00 "Triggers a call into external library.";
+}
+
+
+// Implementation of registers
+bank regs {
+    register trigger is (read,write) {
+        method write(uint64 val) {
+            local uint64 tmp = external_helper_function(val);
+            default(tmp);
+        }
+    }
+}
+
+

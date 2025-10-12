@@ -1,0 +1,53 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+template pcie_function_helpers {
+    shared independent startup memoized method _dp_type() -> (uint8) throws;
+    independent startup memoized method _dp_type() -> (uint8) throws {
+        local exp_capability exp_cap;
+        try {
+            exp_cap = _find_exp_cap();
+        } catch { throw; }
+        return exp_cap.dp_type;
+    }
+
+    shared independent startup memoized method _find_exp_cap()
+        -> (exp_capability) throws;
+    independent startup memoized method _find_exp_cap() -> (exp_capability)
+        throws {
+        foreach cap in (each exp_capability in (bank)) {
+            return cap;
+        }
+        throw;
+    }
+
+    shared independent startup memoized method _find_exp_dev() -> (exp_dev)
+        throws;
+    independent startup memoized method _find_exp_dev() -> (exp_dev) throws {
+        foreach ed in (each exp_dev in (bank)) {
+            return ed;
+        }
+        throw;
+    }
+
+    shared independent startup memoized method _find_exp_link() -> (exp_link)
+        throws;
+    independent startup memoized method _find_exp_link() -> (exp_link) throws {
+        foreach link in (each exp_link in (bank)) {
+            return link;
+        }
+        throw;
+    }
+}

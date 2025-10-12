@@ -1,0 +1,446 @@
+/*
+  ich-mac-intr.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "simics/devs/interrupt.dml";
+
+param INTR_ASSERTED = 1 << 31; // Any interrupt is active
+param EINT_OTHER_BIT = 31;   // Legacy interrupt is active
+
+/* This will allow ICS to trigger even reserved interrupts. However, this
+   seems to be how the real HW works. */
+param INTR_MASK = 0x7ffffff;
+
+attribute interrupt_raised is bool_attr {
+    param documentation = "Interrupt Output State";
+}
+
+attribute legacy_interrupt_raised is bool_attr {
+    param documentation = "Legacy Interrupt Output State";
+}
+
+attribute ext_interrupt_raised is bool_attr {
+    param documentation = "Extended Interrupt Output State";
+}
+
+bank csr {
+    /* --------------------------------------------------------------
+       INTERRUPT REGISTERS
+       -------------------------------------------------------------- */
+    register icr @ 0x000c0 "Interrupt Cause Read";
+    register itr @ 0x000c4 "Interrupt Throttling Rate";
+    register ics @ 0x000c8 "Interrupt Cause Set";
+    register ims @ 0x000d0 "Interrupt Mask Set/Read";
+    register imc @ 0x000d8 "Interrupt Mask Clear";
+    register iam @ 0x000e0 "Interrupt Acknowledge Auto Mask";
+
+    #if(HAS_EXTENDED_INTERRUPTS) {
+        register eitr[i < EITR_CNT] size 4 @ 0x01680 + i*4 "Interrupt Throttle";
+        register ivar[i < IVAR_CNT] size 1 @ 0x01700 + i "Vector allocation";
+        register eicr @ 0x01580 "Extended Interrupt Cause";
+        register eics @ 0x01520 "Extended Interrupt Cause Set";
+        register eims @ 0x01524 "Extended Interrupt Mask Set/Read";
+
+        register gpie @ 0x01514 "General Purpose Interrupt Enable" {
+            field pba_support    @ [31]   "PBA support";
+            field eiame          @ [30]   "Extended Interrupt Auto Mask Enable";
+            field ll_interval    @ [11:7] "LLI credit increment rate";
+            field multiple_msix  @ [4]    "Multi- or single MSI-X vectors";
+            field nsicr          @ [0]    "Non selective interrupt clear on read";
+        }
+    }
+
+    register icr is (read, write) {
+        method write(uint64 value) {
+            log info, 4: "%s written val = 0x%08x", qname, value;
+            #if(HAS_INTERRUPT_AUTOMASKING) {
+                if (ctrl_ext.iame.val == 1) {
+                    // Copy auto mask reg to mask clear reg to clear the mask
+                    imc.write(iam.val);
+                }
+            }
+
+            if(this.val != 0){
+                value &= INTR_MASK;
+                this.val &= ~value;
+                if(this.val == 0){
+                    update_interrupt();
+                }
+            }
+        }
+
+        /* Reading from the ICR register has different effects
+           1) Interrupt Mask register equals 0x0000 (mask all):
+                ICR content is cleared.
+           2) Interrupt was asserted and auto mask is active:
+                ICR content is cleared and IAM is written to IMC.
+           3) Interrupt was not asserted:
+                Read has no side effect.
+        */
+        method read() -> (uint64) {
+            local uint64 value;
+            value = this.val & INTR_MASK;
+
+            if (interrupt_raised.val)
+                value |= INTR_ASSERTED;
+
+            if (ims.val == 0) {
+                log info, 4: "clearing %s on read (IMS is zero)", qname;
+                this.val = 0;
+            } else if (interrupt_raised.val) {
+                /* Documentation is not very clear if ICR is always cleared on
+                   read when an interrupt is raised or if auto-masking also has
+                   to be enabled. Windows expects the former for ICH10. */
+                log info, 4: "clearing %s on READ (irq raised)", qname;
+                this.val = 0;
+
+                #if (HAS_INTERRUPT_AUTOMASKING) {
+                    if (ctrl_ext.iame.val == 1) {
+                        // Copy auto mask reg to mask clear reg
+                        imc.write(iam.val);
+                    }
+                }
+            } else {
+                log info, 4: "not clearing %s on READ", qname;
+            }
+
+            update_interrupt();
+            return value;
+        }
+    }
+
+    method raise_legacy_interrupt(uint32 intr) default {
+        icr.val |= (intr & INTR_MASK);
+        update_legacy_interrupt();
+    }
+
+#if(HAS_EXTENDED_INTERRUPTS) {
+    method raise_extended_interrupt(uint32 intr) default {
+        local bool is_rx_irq;
+        local bool is_tx_irq;
+        local int ivar_idx;
+        local int irq_bit;
+
+        /* Find out if the cause should be reflected in the extended
+           registers */
+        if((intr & INTR_TXDW) != 0)
+            is_tx_irq = true;
+        if((intr & INTR_RXDMT0) != 0)
+            is_rx_irq = true;
+
+        if(is_rx_irq) {
+            /* Find out which IVAR register to use */
+            if(rx_queue_nbr.val < 7)
+                ivar_idx = rx_queue_nbr.val * 4 + 1;
+            else
+                ivar_idx = (rx_queue_nbr.val - 8) * 4 + 3;
+
+            irq_bit = 1 << ivar[ivar_idx].alloc.val;
+
+            if(ivar[ivar_idx].valid.val != 0) {
+                eicr.val |= irq_bit;
+            } else {
+                if(gpie.multiple_msix.val == 1) {
+                    log spec_viol, 1: "rx interrupt on queue %d without a valid IVAR entry in IVAR[%d]", rx_queue_nbr.val, ivar_idx;
+                }
+            }
+        }
+
+        if(is_tx_irq) {
+            /* Find out which IVAR register to use */
+            if(tx_queue_nbr < 7)
+                ivar_idx = tx_queue_nbr * 4 + 1;
+            else
+                ivar_idx = (tx_queue_nbr - 8) * 4 + 3;
+
+            irq_bit = 1 << ivar[ivar_idx].alloc.val;
+
+            if(ivar[ivar_idx].valid.val != 0) {
+                eicr.val |= irq_bit;
+            } else {
+                if(gpie.multiple_msix.val == 1) {
+                    log spec_viol, 1: "tx interrupt on queue %d without a valid IVAR entry in IVAR[%d]", tx_queue_nbr, ivar_idx;
+                }
+            }
+        }
+
+        update_extended_interrupt();
+    }
+} #else {
+    /// DEAD
+    method raise_extended_interrupt(uint32 intr) default {}
+}
+
+    method raise_interrupt(uint32 intr) default {
+        raise_legacy_interrupt(intr);
+        #if(HAS_EXTENDED_INTERRUPTS) {
+            raise_extended_interrupt(intr);
+        }
+        update_interrupt();
+    }
+
+#if (e1000_use_legacy_pci_library) {
+    method signal_irq(bool active) {
+        if(active) {
+            if(pci_config.msi_control.msie.val != 0){
+                local exception_type_t ex;
+                local uint64 msi_address;
+
+                // note there is need to check if 64-bit MSI is supported
+
+                msi_address = pci_config.msi_upper_address.val;
+                msi_address <<= 32;
+                msi_address |= pci_config.msi_address.val;
+
+                log info, 4: "%s sending MSI to %lx", qname, msi_address;
+
+                ex = pci_value_to_memory(
+                    Sim_Addr_Space_Memory,
+                    pci_config.msi_data.val,
+                    msi_address,
+                    pci_config.msi_data.size);
+            }else{
+                log info, 4: "%s raising legacy interrupt", qname;
+                pci_config.pci_raise_interrupt();
+            }
+        } else {
+            if(pci_config.msi_control.msie.val == 0){
+                log info, 4: "lower legacy PCI interrupt";
+                pci_config.pci_lower_interrupt();
+            }
+        }
+        interrupt_raised.val = active;
+    }
+} #else {
+    method signal_irq(bool active) {
+        if(active) {
+            if (pcie_config.msi.is_enabled()){
+                pcie_config.msi.raise(0);
+            } else {
+                log info, 4: "%s raising legacy interrupt", qname;
+                pcie_config.raise_legacy_interrupt();
+            }
+        } else {
+            if (pcie_config.msi.is_enabled()){
+                pcie_config.msi.lower(0);
+            } else {
+                log info, 4: "lower legacy PCI interrupt";
+                pcie_config.lower_legacy_interrupt();
+            }
+        }
+        interrupt_raised.val = active;
+    }
+}
+
+    method update_interrupt() default {
+        local bool new_interrupt_level;
+
+        update_legacy_interrupt();
+        new_interrupt_level = legacy_interrupt_raised.val;
+
+        #if(HAS_EXTENDED_INTERRUPTS) {
+            eicr.val[EINT_OTHER_BIT] = legacy_interrupt_raised.val ? 1: 0;
+            update_extended_interrupt();
+            new_interrupt_level = ext_interrupt_raised.val;
+        }
+
+        if (!new_interrupt_level) {
+            /* Lower IRQ if interrupt cause has disappeared */
+            if (interrupt_raised.val) {
+                log info, 4: "lowering interrupt request level";
+                signal_irq(false);
+            }
+            interrupt_raised.val = false;
+            return;
+        } else {
+            /* Raise IRQ if a new interrupt cause is found */
+            if(!interrupt_raised.val) {
+                log info, 4: "raising interrupt request level";
+                signal_irq(true);
+            }
+            interrupt_raised.val = true;
+        }
+    }
+
+#if(HAS_EXTENDED_INTERRUPTS) {
+    method update_extended_interrupt() default {
+        if ((eims.val & eicr.val) == 0) {
+            if(ext_interrupt_raised.val)
+                log info, 4: "lowering extended interrupt request level";
+            ext_interrupt_raised.val = false;
+        } else {
+            if(!ext_interrupt_raised.val)
+                log info, 4: "raising extended interrupt request level";
+            ext_interrupt_raised.val = true;
+        }
+    }
+} #else {
+    /// DEAD
+    method update_extended_interrupt() default {}
+}
+
+    method update_legacy_interrupt() default {
+        if((icr.val & ims.val) == 0){
+            if(legacy_interrupt_raised.val)
+                log info, 4: "lowering legacy interrupt request level";
+            legacy_interrupt_raised.val = false;
+            return;
+        }
+
+        if(legacy_interrupt_raised.val){
+            // doing nothing because interrupt is already raised.
+            return;
+        }
+
+        local bool is_posted;
+        is_posted = intr_interval.posted();
+        if (is_posted) {
+            log info, 4: "legacy interrupt not activated, since it is throttled";
+            return;
+        }
+
+        // start new interrupt throttling timer when raising interrupt
+        if (itr.interval.val != 0)
+            intr_interval.update_interval(itr.interval.val);
+
+        log info, 4: "raising legacy interrupt request level";
+        legacy_interrupt_raised.val = true;
+    }
+
+    register itr {
+        field interval @ [15:0] is (write) "Minimum inter-interrupt interval" {
+            method write(uint64 value) {
+                log info, 4: "write 0x%x to csr.itr", value;
+                if (value != this.val) {
+                    this.val = value;
+                    intr_interval.update_interval(value);
+                }
+            }
+        }
+    }
+    register ics is (read, write) {
+        // Software uses this register to set an interrupt condition.
+        // Any bit written with a 1b sets the corresponding interrupt.
+        // This results in the corresponding bit being set in the
+        // Interrupt Cause Read register. A PCIe interrupt is also
+        // generated if one of the bits in this register is set and
+        // the corresponding interrupt is enabled via the
+        // Interrupt Mask Set/Read register
+        // Bits written with 0b are unchanged.
+        method write(uint64 value) {
+            log info, 4: "write 0x%x to csr.ics", value;
+            icr.val |= (value & INTR_MASK);
+            if (this.val[20] == 1) {
+                log unimpl, 1:
+                    "management engine reset interrupt is unimplemented";
+            }
+            update_interrupt();
+        }
+        /* Undocumented; ICS returns ICR on read, without clearing it.
+           Linux driver ixgbe reads it unconditionally. search for
+           IXGBE_READ_REG(hw, IXGBE_EICS) */
+        method read() -> (uint64) {
+            return icr.val;
+        }
+    }
+    register ims is (write) {
+        // A particular interrupt can be enabled by writing a 1b
+        // to the corresponding mask bit in this register.
+        // Any bits written with a 0b, are unchanged.
+        // Thus, if software desires to disable a particular interrupt
+        // condition that had been previously enabled, it must write
+        // to the Interrupt Mask Clear register, rather than writing
+        // a 0b to bits in this register.
+        method write(uint64 value) {
+            this.val |= (value & INTR_MASK);
+            update_interrupt();
+        }
+    }
+
+    register imc is (write, write_only) {
+        // Software blocks interrupts by clearing the corresponding mask bit.
+        // This is accomplished by writing a 1b to the corresponding bit in
+        // this register. Bits written with 0b are unchanged
+        // (for example, their mask status does not change).
+        method write(uint64 value) {
+            ims.val &= ~(value & INTR_MASK);
+            update_interrupt();
+        }
+    }
+    register iam {
+        // When the CTRL_EXT.IAME bit is set and the ICR.INT_ASSERT=1b,
+        // an ICR read ** or write ** has the side effect of writing
+        // contents of this register to the IMC register.
+    }
+
+    #if(HAS_EXTENDED_INTERRUPTS) {
+        register eitr[i < EITR_CNT] {
+            field interval @ [14:2] "Min inter-interrupt interval";
+            field llien @ [15] "LLI moderation enable";
+            field llcnt @ [20:16] "LL interrupts counter";
+            field counter @ [30:21] "Interval down counter";
+            field cntwdis @ [31] is (read_zero) "Counter write disable";
+            method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+                default(value, enabled_bytes, aux);
+                if (i == 0)
+                    intr_interval.update_interval(interval.val);
+            }
+        }
+        register ivar[i < IVAR_CNT] {
+            field alloc @ [4:0];
+            field valid @ [7];
+            method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+                default(value, enabled_bytes, aux);
+                if(this.valid.val == 1) {
+                    local int queue;
+
+                    if(i % 4 < 2) {
+                        queue = i / 4;
+                    } else {
+                        queue = i / 4 + 8;
+                    }
+
+                    log info, 4:
+                        "IVAR: %s queue #%d is allocated to bit %d in EICR",
+                        (i%2 == 0)?"Rx":"Tx", queue, i;
+                }
+            }
+        }
+        register eicr;
+        register eims {
+            /* Other cause (legacy interrupts) is active by default */
+            param init_val = 0x80000000;
+        }
+    }
+
+    event intr_interval is simple_time_event {
+        param documentation = "Delay between successive interrupts.";
+
+        method event() {
+            log info, 4: "interrupts are allowed again after throttling";
+            update_interrupt();
+        }
+
+        method update_interval(uint16 interval) default {
+            local bool is_posted;
+            is_posted = posted();
+            if (is_posted)
+                remove();
+            if (interval != 0)
+                post(interval * ITR_UNIT);
+        }
+    }
+}

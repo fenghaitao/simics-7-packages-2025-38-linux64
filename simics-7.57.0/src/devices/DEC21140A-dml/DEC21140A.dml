@@ -1,0 +1,503 @@
+/*
+  DEC21140A.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device DEC21140A_dml;
+param classname = "DEC21140A-dml";
+
+param desc = "model of DEC21140A Ethernet controller";
+param documentation = "DEC21140A Ethernet controller.";
+
+
+/////////////
+// Imports //
+/////////////
+
+// Standard imports
+import "utility.dml";
+
+// Device related import
+import "pci/common.dml";                     // Generic PCI device
+import "simics/devs/ethernet.dml";           // Ethernet common definitions
+import "simics/devs/ieee_802_3.dml";         // Communications with PHY
+import "simics/devs/mii.dml";                // MII management bus
+import "simics/devs/microwire.dml";          // Serial EEPROM
+
+// Ethernet engine for DEC21140A
+import "DEC21140A-eth.dml";
+
+/////////////////////////////////
+// PCI configuration registers //
+/////////////////////////////////
+
+// Extend the existing pci_config register bank
+is pci_device;
+bank pci_config {
+
+    // List of base address registers used by the device
+    param base_address_registers = ["base_address_0", "base_address_1"];
+
+    // This device can perform PCI DMA accesses
+    param busmaster = true;
+
+    register vendor_id { param init_val = 0x1011; }
+    register device_id { param init_val = 0x0009; }
+    register status {
+        field fbb { param init_val = 1; }
+        field ds { param init_val = 1; }
+    }
+
+    register revision_id { param init_val = 0x21; }
+    register class_code { param init_val = 0x020000; }
+
+    register base_address_0 @ 0x10 is io_base_address {
+        param size_bits = 7;
+        param map_func = 0;
+    }
+    register base_address_1 @ 0x14 is memory_base_address_32 {
+        param size_bits = 7;
+        param map_func = 0;
+    }
+    // Other base address registers are not used
+    register base_address_2 @ 0x18 is no_base_address_32;
+    register base_address_3 @ 0x1C is no_base_address_32;
+    register base_address_4 @ 0x20 is no_base_address_32;
+    register base_address_5 @ 0x24 is no_base_address_32;
+
+    register subsystem_vendor_id {
+        param init_val = 0x0E11;
+    }
+    register subsystem_id {
+        param init_val = 0xB0BB;
+    }
+
+    // Set correct size, but we don't model it, so do not set it as enabled
+    register expansion_rom_base {
+        param size_bits = 18;
+    }
+
+    register interrupt_pin {
+        param init_val = 0x1;
+    }
+    register min_gnt {
+        param init_val = 0x14;
+    }
+    register max_lat {
+        param init_val = 0x28;
+    }
+
+    register cfdd size 4 @ 0x40 "Device and driver area" {
+        field dsu     @ [15:8]              "Driver special user";
+        field snooze  @ [30:30] is (unimpl) "Snooze mode";
+        field sleep   @ [31:31] is (unimpl) "Sleep mode";
+    }
+}
+
+method post_init() {
+    pci_config.update_all_mappings();
+}
+
+
+
+/////////
+// PHY //
+/////////
+
+connect phy {
+    param documentation = "Phy object";
+    param configuration = "required";
+    interface ieee_802_3_phy_v2 {
+        param required = true;
+    }
+}
+
+implement ieee_802_3_mac {
+
+    // Receive a frame from PHY
+    method receive_frame(int phy, dbuffer_t *buf, int crc_ok) -> (int) {
+        local frags_t f;
+        frags_init_add(&f, dbuffer_read_all(buf), dbuffer_len(buf));
+        ieee_802_3_mac_v3.receive_frame(phy, &f, crc_ok);
+        return 0;
+    }
+
+    method tx_bandwidth_available(int phy) {
+        ieee_802_3_mac_v3.tx_bandwidth_available(phy);
+    }
+
+    method link_status_changed(int phy, ieee_802_3_link_status_t status) {
+        ieee_802_3_mac_v3.link_status_changed(phy, status);
+    }
+}
+
+implement ieee_802_3_mac_v3 {
+    method receive_frame(int phy, const frags_t *frame, int crc_ok) {
+        local int state;
+        log info, 4: "IEEE 802.3: frame received";
+
+        state = get_rx_state();
+        if (state == RX_WAITING) {
+            if (crc_ok == 0) {
+                log info, 2:
+                    "dropping received frame with wrong CRC";
+            } else {
+                receive(frame, crc_ok);
+            }
+        } else {
+            log info, 2:
+                "dropping received frame since receive process is not running";
+        }
+    }
+    method tx_bandwidth_available(int phy) {
+        transmit_more();
+    }
+    method link_status_changed(int phy, ieee_802_3_link_status_t status) {
+        log info, 4: "IEEE 802.3: link status changed";
+    }
+}
+
+// MII management bus to allow software communication with the PHY
+connect mii_bus {
+    param documentation = "MII Management Bus";
+    param configuration = "required";
+    interface mii_management {
+        param required = true;
+    }
+}
+
+
+
+
+////////////
+// EEPROM //
+////////////
+
+connect serial_eeprom {
+    param documentation = "Serial EEPROM";
+    param configuration = "required";
+    interface microwire {
+        param required = true;
+    }
+}
+
+
+
+
+
+///////////////////////
+// CSR register bank //
+///////////////////////
+
+
+//
+// templates for different register fields
+//
+
+// write allowed only if TX process is stopped
+template rw_tx_stopped {
+    is write;
+    method write(uint64 value) {
+        if (csr.csr5.ts.val != TX_STOPPED && value != this.val)
+            log spec_viol, 3:
+                "writing 0x%x to the %s.%s.%s field with running Tx process",
+                value, bank.name, reg.name, this.name;
+        this.val = value;
+    }
+}
+
+// write allowed only if RX process is stopped
+template rw_rx_stopped {
+    is write;
+    method write(uint64 value) {
+        if (csr.csr5.ts.val != RX_STOPPED && value != this.val)
+            log spec_viol, 3:
+                "writing 0x%x to the %s.%s.%s field with running Rx process",
+                value, bank.name, reg.name, this.name;
+        this.val = value;
+    }
+}
+
+// write allowed only if RX and TX processes are stopped
+template rw_rx_tx_stopped {
+    is write;
+    method write(uint64 value) {
+        if ((csr.csr5.ts.val != RX_STOPPED || csr.csr5.ts.val != TX_STOPPED)
+            && value != this.val)
+            log spec_viol, 3:
+                "writing 0x%x to the %s.%s.%s field with running Tx or Rx process",
+                value, bank.name, reg.name, this.name;
+        this.val = value;
+    }
+}
+
+//
+// Register bank
+//
+
+bank csr {
+    param documentation = "Control and Status Register Mapping";
+    is function_mapped_bank;
+    param function = 0;
+    param byte_order = "little-endian";
+    param register_size = 4;
+    param partial = true;
+
+    register csr0  @ 0x00 "Bus mode" {
+        field swr   @ [0:0]  "Software Reset" {
+            is write;
+            method write(uint64 value) {
+                if (value == 1)
+                    log info, 2: "software reset";
+            }
+        }
+        field bar   @ [1:1]  "Bus Arbitration";
+        field dsl   @ [6:2]  "Descriptor Skip Length";
+        field ble   @ [7:7]  "Big/Little Endian";
+        field pbl  @ [13:8]  "Programmable Burst Length";
+        field cal  @ [15:14] "Cache Alignment";
+        field mbz  @ [16:16] is (zeros)         "Must Be Zero";
+        field tap  @ [19:17] is (unimpl) "Transmit Automatic Polling";
+        field dbo  @ [20:20] "Descriptor Byte Ordering Mode";
+        field rml  @ [21:21] "Read Multiple";
+        field rs1  @ [31:22] is (ones)          "Reserved";
+    }
+
+    register csr1  @ 0x08 "Transmit Poll Demand" {
+        param init_val = 0xFFFFFFFF;
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            local int state;
+            state = get_tx_state();
+
+            // Start TX engine if it not active already
+            if (state != TX_WAITING)
+                transmit();
+        }
+    }
+
+    register csr2  @ 0x10 "Receive Poll Demand" {
+        param init_val = 0xFFFFFFFF;
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            // Put RX engine in waiting state
+            lower_interrupt(INT_RU);
+            set_rx_state(RX_WAITING);
+        }
+    }
+
+    register csr3  @ 0x18 "Receive List Base Address" {
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            log info, 4: "got new receive list base address 0x%x", this.val;
+            csr.current_rx_address.val = this.val;
+        }
+    }
+
+    // Internal register to hold the current RX address
+    register current_rx_address is unmapped;
+
+    register csr4  @ 0x20 "Transmit List Base Address" {
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            log info, 4: "got new transmit list base address 0x%x", this.val;
+            csr.current_tx_address.val = this.val;
+        }
+    }
+
+    // Internal register to hold the current TX address
+    register current_tx_address is unmapped;
+
+    register csr5  @ 0x28 "Status" {
+        field itr  @ [13:0]  "Interrupt Status" {
+            is write;
+            method write(uint64 value) {
+                // write 1 clears
+                this.val = this.val & ~value;
+            }
+            is read;
+            method read() -> (uint64) {
+                // hide bits that are not enabled
+                return this.val & csr.csr7.itr_mask.val;
+            }
+        }
+        field ais  @ [15:15] "Abnormal Interrupt Summary" {
+            is write;
+            method write(uint64 value) {
+            }
+            is read;
+            method read() -> (uint64) {
+                return this.val & csr.csr7.ais_mask.val;
+            }
+        }
+        field nis  @ [16:16] "Normal Interrupt Summary" {
+            is write;
+            method write(uint64 value) {
+            }
+            is read;
+            method read() -> (uint64) {
+                return this.val & csr.csr7.nis_mask.val;
+            }
+        }
+        field rs   @ [19:17] is read_only     "Receive Process State";
+        field ts   @ [22:20] is read_only     "Transmission Process State";
+        field eb   @ [25:23] is read_only     "Error Bits";
+        field rs1  @ [31:26] is ones          "Reserved";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            update_interrupts();
+        }
+    }
+
+    register csr6  @ 0x30 "Operation Mode" {
+        field hp    @ [0:0]  "Hash/Perfect Receive Filter Mode";
+        field sr    @ [1:1]  "Start/Stop Receive" {
+            is write;
+            method write(uint64 value) {
+                if (value == 1 && this.val == 0) {
+                    log info, 3: "receive process started";
+                    set_rx_state(RX_WAITING);
+                } else if (value == 0 && this.val == 1) {
+                    log info, 3: "receive process stopped";
+                    set_rx_state(RX_STOPPED);
+                }
+                this.val = value;
+            }
+        }
+        field ho    @ [2:2]                      "Hash-only Filtering Mode";
+        field pb    @ [3:3]  is rw_rx_stopped    "Pass Bad Frames";
+        field ivf   @ [4:4]                      "Inverse Filtering";
+        field sb    @ [5:5]  is rw_rx_tx_stopped "Start/Stop Backoff Counter";
+        field pr    @ [6:6]                      "Promiscuous Mode" {
+            param init_val = 1;
+        }
+        field pm    @ [7:7]                      "Pass All Multicast";
+        field mbz   @ [8:8]  is zeros            "Must Be Zero";
+        field fd    @ [9:9]  is rw_rx_tx_stopped "Full-duplex Mode";
+        field om   @ [11:10] is rw_rx_tx_stopped "Operating Mode";
+        field fc   @ [12:12] is rw_rx_tx_stopped "Force Collision Mode";
+        field st   @ [13:13] "Start/Stop Transmit" {
+            is write;
+            method write(uint64 value) {
+                if (this.val == 0 && value == 1) {
+                    log info, 3: "transmit process started";
+                    transmit();
+                } else if (this.val == 1 && value == 0) {
+                    local int state;
+                    state = get_tx_state();
+
+                    log info, 3: "transmit process stopped";
+                    if (state == TX_WAITING && pending_frame != NULL) {
+                        dbuffer_free(pending_frame);
+                        pending_frame = NULL;
+                    }
+                    set_tx_state(TX_STOPPED);
+                }
+                this.val = value;
+            }
+        }
+        field tr   @ [15:14] is rw_tx_stopped    "Threshold Control Bits";
+        field mb2  @ [16:16] is zeros            "Must Be Zero";
+        field ca   @ [17:17] is rw_rx_tx_stopped "Capture Effect Enable";
+        field ps   @ [18:18]                     "Port Select";
+        field hbd  @ [19:19]                     "Heartbeat Disable";
+        field imm  @ [20:20]                     "Immediate Mode";
+        field sf   @ [21:21] is rw_rx_tx_stopped "Store and Forward";
+        field ttm  @ [22:22] is rw_rx_tx_stopped "Transmit Threshold Mode";
+        field pcs  @ [23:23]                     "PCS Function";
+        field scr  @ [24:24]                     "Scrambler Mode";
+        field mbo  @ [25:25] is ones             "Must Be One";
+        field mb3  @ [28:26]                     "Must Be Zero";
+        field mb4  @ [29:29] is ones             "Must Be One";
+        field ra   @ [30:30]                     "Receive All";
+        field sc   @ [31:31]                    "Special Capture Effect Enable";
+    }
+
+    register csr7  @ 0x38 "Interrupt enable" {
+        field itr_mask  @ [13:0]  "Interrupt Status Mask";
+        field ais_mask  @ [15:15] "Abnormal Interrupt Summary Mask";
+        field nis_mask  @ [16:16] "Normal Interrupt Summary Mask";
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            update_interrupts();
+        }
+    }
+
+    register csr8  @ 0x40 "Missed frames and overflow counter" {
+        field mfc  @ [15:0]  "Missed Frame Counter";
+        field mfo  @ [16:16] "Missed Frame Overflow";
+        field oc   @ [30:17] "Overflow Counter";
+        field oco  @ [31:31] "Overflow Counter Overflow";
+    }
+
+    // Only SROM communication is implemented
+    register csr9  @ 0x48 "Boot ROM, serial ROM and MII management" {
+        field data   @ [7:0]  "Boot ROM data or Serial ROM control" {
+            param init_val = 0xFF;
+            is read;
+            method read() -> (uint64) {
+                if (sr.val == 1)
+                    this.val[3] = serial_eeprom.microwire.get_do();
+                return this.val;
+            }
+            // The write functionality is performed in after_write() to ensure
+            // that all the fields of the register are updated before actually
+            // performing the access., in particular the $sr field.
+        }
+        field res1  @ [9:8]   is zeros  "Reserved";
+        field reg   @ [10:10] is unimpl "External Register Select";
+        field sr    @ [11:11]           "Serial ROM Select";
+        field br    @ [12:12] is unimpl "Boot ROM Select";
+        field wr    @ [13:13]           "Write Operation";
+        field rd    @ [14:14]           "Read Operation";
+        field res2  @ [15:15] is ones   "Reserved";
+        field mii   @ [19:16]           "MII" {
+            param init_val = 0xF;
+            is read;
+            method read() -> (uint64) {
+                return this.val;
+            }
+            is write;
+            method write(uint64 value) {
+                this.val = value;
+                // No need to delay that access since it doesn't depend on
+                // other fields in the register
+                this.val[3] = mii_bus.mii_management.serial_access(
+                    this.val[1],                // MDO (data_in)
+                    this.val[0]);               // MDC (new_clock)
+            }
+        }
+        field res3  @ [31:20] is ones   "Reserved";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            // Side-effects of the $data write
+            if (sr.val == 1 && (wr.val == 1 || rd.val == 1)) {
+                // In order: Data In, Clock, Chip Select
+                serial_eeprom.microwire.set_di(data.val[2]);
+                serial_eeprom.microwire.set_sk(data.val[1]);
+                serial_eeprom.microwire.set_cs(data.val[0]);
+            }
+        }
+    }
+
+    register csr10 @ 0x50 is unimpl   "Boot ROM programming address";
+    register csr11 @ 0x58 is unimpl   "General-purpose timer";
+    register csr12 @ 0x60 is unimpl   "General-purpose port";
+    register csr13 @ 0x68 is reserved "Reserved";
+    register csr14 @ 0x70 is reserved "Reserved";
+    register csr15 @ 0x78 is unimpl   "Watchdog timer";
+}

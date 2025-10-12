@@ -1,0 +1,197 @@
+/*
+  © 2020 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "pci/pcie-capabilities.dml";
+import "simics/model-iface/transaction.dml";
+
+
+/* PCIe multi function devices may add this template to their bank */
+template pcie_message_handler {
+    param function_dev default dev;
+
+    method handle_message(transaction_t *t, uint64 addr)
+        -> (exception_type_t) default {
+        local pcie_message_type_t code = ATOM_get_transaction_pcie_msg_type(t);
+        if (code == PCIE_PRS_Response) {
+            foreach b in (each defining_pcie_prs_capability in (function_dev)) {
+                return b.page_response_received(t, addr);
+            }
+            log info, 2: "PRS Response without PRS capabilities";
+        } else if (code == PCIE_ATS_Invalidate) {
+            foreach b in (each defining_pcie_ats_capability in (function_dev)) {
+                return b.ats_invalidate_received(t, addr);
+            }
+            log info, 2: "ATS Invalidate without ATS capabilities";
+        } else {
+            log unimpl: "PCIe Msg with unhandled code '%d'", code;
+        }
+        return Sim_PE_IO_Error;
+    }
+}
+
+/* PCIe devices may implement a pcie_message port with transaction interface
+   receive messages */
+template providing_pcie_message_port {
+    port pcie_message {
+        is pcie_message_handler;
+        implement transaction {
+            method issue(transaction_t *t, uint64 addr)
+                -> (exception_type_t) default {
+                return handle_message(t, addr);
+            }
+        }
+    }
+}
+
+/* PCIe RCs should implement an 'upstream' port with transaction interface to
+   receive upstream transactions of all types */
+template providing_pcie_upstream_port {
+    port upstream {
+        implement transaction {
+            method issue(transaction_t *t, uint64 addr)
+                -> (exception_type_t) default {
+                local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+                if (type == PCIE_Type_Msg) 
+                    return handle_msg(t, addr);
+                if (type == PCIE_Type_Mem) 
+                    return handle_mem(t, addr);
+                else if (type == PCIE_Type_IO) 
+                    return handle_io(t, addr);
+                else if (type == PCIE_Type_Cfg) 
+                    return handle_cfg(t, addr);
+                else if (type == PCIE_Type_Other) 
+                    return handle_other(t, addr);
+
+                log error: "PCIe transaction with %s type %d",
+                    type == PCIE_Type_Not_Set ? "Not Set" : "Unknown", type;
+                return Sim_PE_IO_Error;
+            }
+        }
+
+        method handle_msg(transaction_t *t, uint64 addr)
+            -> (exception_type_t) default {
+            local pcie_message_type_t code = ATOM_get_transaction_pcie_msg_type(t);
+            if (code == PCIE_PRS_Request) {
+                foreach b in (each providing_pcie_prs_methods in (dev)) {
+                    return b.page_request_received(t, addr);
+                }
+                log info, 2: "PRS Request without PRS methods";
+            } else {
+                log unimpl: "PCIe Msg with unhandled code '%d'", code;
+            }
+            return Sim_PE_IO_Error;
+        }
+
+        method handle_mem(transaction_t *t, uint64 addr)
+            -> (exception_type_t) default {
+            if (ATOM_get_transaction_pcie_at(t) != PCIE_AT_Not_Set) {
+                foreach b in (each providing_pcie_ats_methods in (dev)) {
+                    return b.ats_transaction_received(t, addr);
+                }
+                log info, 2: "PCIe ATS transaction without ATS methods";
+            } else {
+                log unimpl: "PCIe transaction with unhandled type 'Mem'";
+            }
+            return Sim_PE_IO_Error;
+        }
+
+        method handle_io(transaction_t *t, uint64 addr)
+            -> (exception_type_t) default {
+            log unimpl: "PCIe transaction with unhandled type 'IO'";
+            return Sim_PE_IO_Error;
+        }
+
+        method handle_cfg(transaction_t *t, uint64 addr)
+            -> (exception_type_t) default {
+            log unimpl: "PCIe transaction with unhandled type 'Cfg'";
+            return Sim_PE_IO_Error;
+        }
+
+        method handle_other(transaction_t *t, uint64 addr)
+            -> (exception_type_t) default {
+            log unimpl: "PCIe transaction with unhandled type 'Other'";
+            return Sim_PE_IO_Error;
+        }
+    }
+}
+
+template providing_pcie_downstream_connect {
+    connect pcie_downstream "Downstream target for PCIe transactions" {
+        param configuration = pci_hotplug ? "optional" : "required";
+        session map_target_t *map_target;
+        param mt = map_target;  // legacy alias
+        interface transaction;
+        #if (dml_1_2) {
+             method after_set() {
+                 SIM_free_map_target(map_target);
+                 if (this.obj)
+                     map_target = SIM_new_map_target(this.obj, this.port, NULL);
+                 else
+                     map_target = NULL;
+             }
+        } #else {
+             method set(conf_object_t *obj) {
+                 default(obj);
+                 SIM_free_map_target(map_target);
+                 if (this.obj)
+                     map_target = SIM_new_map_target(this.obj, this.port, NULL);
+                 else
+                     map_target = NULL;
+             }
+        }
+    }
+}
+
+method require_pcie_downstream() throws {
+    if (!pcie_downstream.map_target) {
+        log error: "Trying to issue downstream transaction"
+            + "without pcie_downstream connected";
+        throw;
+    }
+}
+
+method require_pcie_upstream() throws {
+    if (!pci_bus.upstream) {
+        log error: "Trying to issue upstream transaction"
+            + "without upstream interface connected";
+        throw;
+    }
+}
+
+method get_pcie_rid() -> (uint16) {
+    #if (dml_1_2) {
+        return pci_config_bank.bus_address >> 12;
+    } #else {
+        return pci_config_bank.bus_address.get() >> 12;
+    }
+}
+
+method describe_pcie_exception(exception_type_t ex, pcie_error_t err)
+    -> (const char *) {
+    if (ex == Sim_PE_IO_Not_Taken)
+        return "Master Abort";
+    if (ex == Sim_PE_IO_Error) {
+        if (err == PCIE_Error_Not_Set)
+            return "Target Abort";
+        if (err == PCIE_Error_Unsupported_Request)
+            return "Unsupported Request";
+        if (err == PCIE_Error_Completer_Abort)
+            return "Completer Abort";
+        return "Target Abort (Unknown)";
+    }
+    if (ex == Sim_PE_No_Exception)
+        return "Success";
+    return "Unknown";
+}

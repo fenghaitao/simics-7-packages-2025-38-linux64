@@ -1,0 +1,524 @@
+/*
+  ich-acpi.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "simics/arch/x86.dml";
+import "io-apic.dml";
+
+extern void *malloc(size_t size);
+extern void free(void *ptr);
+
+attribute cpus {
+    parameter documentation = "CPUs receiving direct pin connections "
+        + "for NMI and SMI";
+    parameter type = "[o*]";
+    parameter configuration = "required";
+
+    data int len;
+    data conf_object_t **o;
+    data const x86_interface_t **x86;
+
+    method set(attr_value_t val) {
+        local int j;
+        $len = SIM_attr_list_size(val);
+        free($o);
+        $o = malloc($len * sizeoftype(conf_object_t *));
+        free($x86);
+        $x86 = malloc($len * sizeoftype(x86_interface_t *));
+        for (j=0; j<SIM_attr_list_size(val); j++) {
+            $o[j] = SIM_attr_object(SIM_attr_list_item(val, j));
+            $x86[j] = cast(SIM_c_get_interface($o[j], "x86"), const x86_interface_t *);
+            if (!$x86[j]) {
+                SIM_c_attribute_error(
+                    "the %s object does not implement the required %s interface",
+                    SIM_object_name($o[j]), "x86");
+                free($o); $o = NULL;
+                free($x86); $x86 = NULL;
+                $len = 0;
+                throw;
+            }
+        }
+    }
+    method get() -> (attr_value_t ret) {
+        local int j;
+        ret = SIM_alloc_attr_list($len);
+        for (j=0; j<$len; j++) {
+            SIM_attr_list_set_item(&ret, j, SIM_make_attr_object($o[j]));
+        }
+    }
+}
+
+template direct_cpu_pin {
+    parameter allocate_type = "uint8";
+    parameter configuration = "optional";
+    parameter pin default undefined;
+    method update(uint1 signal) {
+        local int i;
+        if (($this == 0) && (signal == 1)) {
+            // raise pin
+            $this = 1;
+            log "info", 2, 0: "pin %s raised", $name;
+            for (i=0; i<$cpus.len; i++)
+                    $cpus.x86[i]->set_pin_status($cpus.o[i], $pin, 1);
+        } else if (($this == 1) && (signal == 0)) {
+            // lower pin
+            $this = 0;
+            log "info", 2, 0: "pin %s lowered", $name;
+            for (i=0; i<$cpus.len; i++)
+                    $cpus.x86[i]->set_pin_status($cpus.o[i], $pin, 0);
+        }
+    }
+}
+
+attribute sci_pin {
+    parameter allocate_type = "uint8";
+    parameter configuration = "optional";
+    method update(uint1 signal) {
+        if (($this == 0) && (signal == 1)) {
+            // raise
+            $this = 1;
+            local uint8 irq;
+            inline $pci_config.acpi_control.sci_irq_sel.decode_sci() -> (irq);
+            $irq_dev.simple_interrupt.interrupt(irq);
+            $ioapic.ioapic.interrupt(irq);
+            
+        } else if (($this == 1) && (signal == 0)) {
+            // lower
+            $this = 0;
+            local uint8 irq;
+            inline $pci_config.acpi_control.sci_irq_sel.decode_sci() -> (irq);
+            $irq_dev.simple_interrupt.interrupt_clear(irq);
+            $ioapic.ioapic.interrupt_clear(irq);
+        }
+    }
+    parameter documentation = "SCI pin status";
+    parameter pin = -1;
+}
+
+attribute smi_pin {
+    is direct_cpu_pin;
+    parameter documentation = "SMI pin status";
+    parameter pin = Pin_Smi;
+}
+
+attribute nmi_pin {
+    is direct_cpu_pin;
+    parameter documentation = "SMI pin status";
+    parameter pin = Pin_Nmi;
+}
+
+template update_smi_sci_nmi {
+    method after_write(mop) {
+        call $acpi_io_regs.update_smi_sci_nmi_status();
+    }
+}
+
+bank apm_io_regs {
+    parameter function = 2;
+    parameter register_size = 1;
+    parameter byte_order = "little-endian";
+    parameter partial = true;
+
+    register apm_cnt size 1 @ 0x0 is (update_smi_sci_nmi) {
+        method write(value) {
+            if (value == 0xf0) {
+                log "info", 2, 0: "enable OSPM control of ACPI (emulated without SMI)";
+                $acpi_io_regs.pm1_cnt.SCI_EN = 1;
+            } else if (value == 0xf1) {
+                log "info", 2, 0: "enable SMI control of ACPI (emulated without SMI)";
+                $acpi_io_regs.pm1_cnt.SCI_EN = 0;
+            } else {
+                log "spec_violation", 2: "Unknown APMC command: 0x%x)", value;
+            }
+            $acpi_io_regs.smi_sts.APM_STS = 1;
+            $this = value;
+        }
+    }
+
+    register apm_sts size 1 @ 0x1;
+}
+
+event pm1_ovf {
+        parameter timebase = "seconds";
+        method event(void *data) {
+                log "info", 3: "pm1_tmr overflow";
+                call $acpi_io_regs.pm1_tmr_overflow();
+        }
+}
+
+
+bank acpi_io_regs {
+    parameter function = 1;
+    parameter register_size = 1;
+    parameter byte_order = "little-endian";
+    parameter partial = true;
+
+    method compute_sci_status() -> (uint1 signal) {
+        local int i;
+
+        signal =
+               $gpe0_sts.SMB_WAK_STS
+            | ($pm1_sts.RTC_STS      & $pm1_en.RTC_EN     )
+            | ($pm1_sts.PWRBTN_STS   & $pm1_en.PWRBTN_EN  )
+            | ($pm1_sts.GBL_STS      & $pm1_en.GBL_EN     )
+            | ($pm1_sts.TMROF_STS    & $pm1_en.TMROF_EN   )
+            | ($gpe0_sts.USB6_STS    & $gpe0_en.USB6_EN	   )
+            | ($gpe0_sts.USB4_STS    & $gpe0_en.USB4_EN	   )
+            | ($gpe0_sts.PME_B0_STS  & $gpe0_en.PME_B0_EN  )
+            | ($gpe0_sts.USB3_STS    & $gpe0_en.USB3_EN	   )
+            | ($gpe0_sts.PME_STS     & $gpe0_en.PME_EN	   )
+            | ($gpe0_sts.PCI_EXP_STS & $gpe0_en.PCI_EXP_EN )
+            | ($gpe0_sts.RI_STS      & $gpe0_en.RI_EN	   )
+            | ($gpe0_sts.TCOSCI_STS  & $gpe0_en.TCOSCI_EN  )
+            | ($gpe0_sts.USB5_STS    & $gpe0_en.USB5_EN	   )
+            | ($gpe0_sts.USB2_STS    & $gpe0_en.USB2_EN	   )
+            | ($gpe0_sts.USB1_STS    & $gpe0_en.USB1_EN	   )
+            | ($gpe0_sts.SWGPE_STS   & $gpe0_en.SWGPE_EN   )
+            | ($gpe0_sts.HOT_PLUG_STS& $gpe0_en.HOT_PLUG_EN)
+            | ($gpe0_sts.THRM_STS    & $gpe0_en.THRM_EN    );
+
+        // GPIO
+        for (i=0; i<16; i++) {
+            // TODO
+            //if ($pci_config.gpi_rout[2*i+1:2*i] == 0x2
+            //    && (($gpe0_sts.GPIn_STS[i] & $gpe0_en.GPIn_EN[i]) == 1)) {
+            //    signal = 1;
+            //    return;
+            //}
+        }
+
+        // add TCO
+    }
+
+    method compute_smi_status() -> (uint1 signal) {
+        local int i;
+
+        signal =
+              ($smi_sts.INTEL_USB2_STS  & $smi_en.INTEL_USB2_EN  )
+            | ($smi_sts.LEGACY_USB2_STS & $smi_en.LEGACY_USB2_EN )
+            |  $smi_sts.SERRIRQ_SMI_STS
+            | ($smi_sts.PERIODIC_STS    & $smi_en.PERIODIC_EN    )
+            | ($smi_sts.MCSMI_STS       & $smi_en.MCSMI_EN       )
+            | ($smi_sts.SWISMI_TMR_STS  & $smi_en.SWISMI_TMR_EN  )
+            | ($smi_sts.APM_STS         & $smi_en.APMC_EN        )
+            | ($smi_sts.SLP_SMI_STS     & $smi_en.SLP_SMI_EN     )
+            | ($smi_sts.LEGACY_USB_STS  & $smi_en.LEGACY_USB_EN  )
+            | ($smi_sts.BIOS_STS        & $smi_en.BIOS_EN        )
+            | ($tco1_sts.NMI2SMI_STS    & $tco1_cnt.NMI2SMI_EN   );
+            // DEVMON/DEVTRAP?
+            // SMBUS Host controller
+            // HOST NOTIFY STS
+
+        // TCO SMI
+        if ($smi_en.TCO_EN == 1) {
+            signal |=
+                   $tco1_sts.NEW_CENTURY_STS
+                | ($tco1_cnt.TCO_TMR_HLT ? 0 : $tco1_sts.TIMEOUT)
+                |  $tco1_sts.SW_TCO_SMI
+                |  $tco1_sts.BIOSWR_STS;
+            // add INTRUDER
+        }
+
+        // GPIO
+        for (i=0; i<16; i++) {
+            // TODO
+            //if ($pci_config.gpi_rout[2*i+1:2*i] == 0x1
+            //    && (($alt_gp_smi_sts[i] & $alt_gp_smi_en[i]) == 1)) {
+            //    signal = 1;
+            //    return;
+            //}
+        }
+    }
+
+    method compute_nmi_status() -> (uint1 signal) {
+        signal = $tco1_cnt.NMI_NOW;
+    }
+
+    method update_smi_sci_nmi_status() {
+        local uint1 sci_signal;
+        local uint1 smi_signal;
+        local uint1 nmi_signal;
+
+        inline $compute_sci_status() -> (sci_signal);
+        inline $compute_smi_status() -> (smi_signal);
+        inline $compute_nmi_status() -> (nmi_signal);
+
+        if ($pm1_cnt.SCI_EN == 0) {
+            // join SCI signal to SMI signal and lower SCI pin
+            smi_signal |= sci_signal;
+            call $sci_pin.update(0);
+        } else {
+            call $sci_pin.update(sci_signal);
+        }
+
+        if ($tco1_cnt.NMI2SMI_EN == 1) {
+            // join NMI signal to SMI signal and lower NMI pin
+            smi_signal |= nmi_signal;
+            call $nmi_pin.update(0);
+        } else {
+            call $nmi_pin.update(nmi_signal);
+        }
+
+        if ($smi_en.GBL_SMI_EN == 1)
+            call $smi_pin.update(smi_signal);
+        else
+            call $smi_pin.update(0);
+    }
+
+    method post_pm1_tmr_ovf() {
+        local uint64 v;
+        v = 0x1000000 - (cast(SIM_time($dev.obj) * 3579545, uint64)
+                         & 0xffffff);
+        local double s = (cast(v, double) / 3579545);
+        inline $pm1_ovf.post(s, NULL);
+    }
+
+    method post_init() {
+        SIM_require_object(SIM_object_clock($dev.obj));
+        call $post_pm1_tmr_ovf;
+    }
+
+    method pm1_tmr_overflow() {
+        log "info", 3, 0: "PM1_TMR overflow";
+        $pm1_sts.TMROF_STS = 1;
+        call $update_smi_sci_nmi_status();
+        call $post_pm1_tmr_ovf;
+    }
+
+    // ACPI and Legacy Power Management
+    register pm1_sts        size 2 @ 0x00 is (update_smi_sci_nmi) {
+        field WAK_STS    [15:15] is (write_1_clears);
+        field PCIEXPWAK_STS [14:14] is (write_1_clears);
+        field PRBNOR_STS [11:11] is (write_1_clears, sticky);
+        field RTC_STS    [10:10] is (write_1_clears);
+        field ME_STS      [9:9]  is (write_1_clears);
+        field PWRBTN_STS  [8:8]  is (write_1_clears);
+        field GBL_STS     [5:5]  is (write_1_clears);
+        field BM_STS      [4:4]  is (write_1_clears);
+        field TMROF_STS   [0:0]  is (write_1_clears);
+    }
+    register pm1_en         size 2 @ 0x02 is (update_smi_sci_nmi) {
+        field PCEXPWAK_DIS [14:14] is (unimplemented);
+        field RTC_EN     [10:10] is (unimplemented);
+        field PWRBTN_EN   [8:8]  is (unimplemented);
+        field GBL_EN      [5:5]  is (read_write);
+        field TMROF_EN    [0:0]  is (read_write);
+    }
+    register pm1_cnt        size 4 @ 0x04 is (update_smi_sci_nmi) {
+        field SLP_EN     [13:13] {
+            method write(value) {
+                if (value == 1) {
+                    if ($smi_en.SLP_SMI_EN) {
+                        $smi_sts.SLP_SMI_STS = 1;
+                    } else {
+                        log "unimplemented", 1: "Sleep state is unimplemented";
+                    }
+                }
+            }
+        }
+        field SLP_TYP    [12:10] is (read_write);
+        field GBL_RLS     [2:2] {
+             method write(value) {
+                if (value == 1)
+                    $smi_sts.BIOS_STS = 1;
+            }
+        }
+        field SCI_EN      [0:0]  is (read_write);
+    }
+    register pm1_tmr        size 4 @ 0x08 {
+        field TMR_VAL [23:0] {
+            is read_only;
+
+            method read() -> (value) {
+                local uint64 cycles;
+                cycles = cast(SIM_time($dev.obj) * 3579545, uint64);
+                value = cycles & 0xffffff;
+            }
+        }
+    }
+    register proc_cnt       size 4 @ 0x10 is (update_smi_sci_nmi) {
+        field THTL_STS   [17:17] is (read_only);
+        field FORCE_THTL  [8:8]  is (unimplemented);
+        field THRM_DTY    [7:5]  is (read_write);
+        field THTL_EN     [4:4]  is (unimplemented);
+        field THTL_DTY    [3:1]  is (read_write);
+    }
+    register lv2            size 1 @ 0x14 is (unimplemented); // TODO: Read should put the CPU in ACPI C2 state
+    register lv3            size 1 @ 0x15 is (unimplemented);
+    register lv4            size 1 @ 0x16 is (unimplemented);
+    register gpe0_sts       size 8 @ 0x20 is (update_smi_sci_nmi) {
+        field USB6_STS   [32:32] is (write_1_clears);
+        field GPIn_STS   [31:16] is (write_1_clears);
+        field USB4_STS   [14:14] is (write_1_clears);
+        field PME_B0_STS [13:13] is (write_1_clears);
+        field USB3_STS   [12:12] is (write_1_clears);
+        field PME_STS    [11:11] is (write_1_clears);
+        field PCI_EXP_STS [9:9]  is (write_1_clears);
+        field RI_STS      [8:8]  is (write_1_clears);
+        field SMB_WAK_STS [7:7]  is (write_1_clears);
+        field TCOSCI_STS  [6:6]  is (write_1_clears);
+        field USB5_STS    [5:5]  is (write_1_clears);
+        field USB2_STS    [4:4]  is (write_1_clears);
+        field USB1_STS    [3:3]  is (write_1_clears);
+        field SWGPE_STS   [2:2]  is (write_1_clears);
+        field HOT_PLUG_STS [1:1] is (write_1_clears);
+        field THRM_STS    [0:0]  is (write_1_clears);
+    }
+    register gpe0_en        size 8 @ 0x28 is (update_smi_sci_nmi) {
+        field USB6_EN    [32:32] is (read_write);
+        field GPIn_EN    [31:16] is (read_write);
+        field USB4_EN    [14:14] is (read_write);
+        field PME_B0_EN  [13:13] is (read_write);
+        field USB3_EN    [12:12] is (read_write);
+        field PME_EN     [11:11] is (read_write);
+        field PCI_EXP_EN  [9:9]  is (read_write);
+        field RI_EN       [8:8]  is (read_write);
+        field TCOSCI_EN   [6:6]  is (read_write);
+        field USB5_EN     [5:5]  is (read_write);
+        field USB2_EN     [4:4]  is (read_write);
+        field USB1_EN     [3:3]  is (read_write);
+        field SWGPE_EN    [2:2]  is (read_write);
+        field HOT_PLUG_EN [1:1]  is (read_write);
+        field THRM_EN     [0:0]  is (read_write);
+    }
+    register smi_en         size 4 @ 0x30 is (update_smi_sci_nmi) {
+        field GPIO_UNLOCK_SMI_EN [27:27] is (read_write);
+        field INTEL_USB2_EN  [18:18] is (read_write);
+        field LEGACY_USB2_EN [17:17] is (read_write);
+        field PERIODIC_EN    [14:14] is (read_write);
+        field TCO_EN         [13:13] {
+            method write(value) {
+                if ($tco1_cnt.TCO_LOCK == 0)
+                    $this = value;
+            }
+        }
+        field MCSMI_EN       [11:11] is (unimplemented);
+        field BIOS_RLS        [7:7] {
+            method write(value) {
+                if (value == 1)
+                    $pm1_sts.GBL_STS = 1;
+            }
+        }
+        field SWISMI_TMR_EN   [6:6]  is (unimplemented);
+        field APMC_EN         [5:5]  is (read_write);
+        field SLP_SMI_EN      [4:4]  is (read_write);
+        field LEGACY_USB_EN   [3:3]  is (read_write);
+        field BIOS_EN         [2:2]  is (read_write);
+        field EOS             [1:1]  is (unimplemented);
+        field GBL_SMI_EN      [0:0]  is (read_write) {
+            method write(value) {
+                if ($pci_config.gen_pmcon1.smi_lock && value != $this) {
+                    log "spec_violation", 2: "Write to GBL_SMI_EN when locked.";
+                } else {
+                    $this = value;
+                }
+            }
+        }
+    }
+    register smi_sts        size 4 @ 0x34 is (update_smi_sci_nmi) {
+        field GPIO_UNLOCK_SMI_STS [27:27] is (write_1_clears);
+        field SPI_STS         [26:26] is (ignore_write);
+        field MONITOR_STS     [21:21] is (ignore_write);
+        field PCI_EXP_SMI_STS [20:20] is (ignore_write);
+        field INTEL_USB2_STS  [18:18] is (ignore_write);
+        field LEGACY_USB2_STS [17:17] is (ignore_write);
+        field SMBUS_SMI_STS   [16:16] is (write_1_clears);
+        field SERRIRQ_SMI_STS [15:15] is (ignore_write);
+        field PERIODIC_STS    [14:14] is (write_1_clears);
+        field TCO_STS         [13:13] is (write_1_clears);
+        field DEVMON_STS      [12:12] is (ignore_write);
+        field MCSMI_STS       [11:11] is (write_1_clears);
+        field GPE1_STS        [10:10] is (ignore_write);
+        field GPE0_STS         [9:9]  is (ignore_write);
+        field PM1_STS_REG      [8:8]  is (ignore_write);
+        field SWISMI_TMR_STS   [6:6]  is (write_1_clears);
+        field APM_STS          [5:5]  is (write_1_clears);
+        field SLP_SMI_STS      [4:4]  is (write_1_clears);
+        field LEGACY_USB_STS   [3:3]  is (ignore_write);
+        field BIOS_STS         [2:2]  is (write_1_clears);
+    }
+    register alt_gp_smi_en  size 2 @ 0x38 is (read_write);
+    register alt_gp_smi_sts size 2 @ 0x3A is (write_1_clears);
+    register uprwc          size 2 @ 0x3C is (unimplemented);
+    register gpe_cntl       size 1 @ 0x42 is (unimplemented);
+    register devact_sts     size 2 @ 0x44 is (write_1_clears);
+    register pm2_cnt        size 1 @ 0x50 is (unimplemented);
+    register c3_res         size 4 @ 0x54 is (unimplemented);
+
+    // TCO
+    register tco_rld      size 2 @ 0x60 is (unimplemented);
+    register tco_dat_in   size 1 @ 0x62 is (update_smi_sci_nmi) {
+        method write(value) {
+            $tco1_sts.SW_TCO_SMI = 1;
+            $this = value;
+        }
+    }
+    register tco_dat_out  size 1 @ 0x63 {
+        // This should raise an interrupt also
+        method write(value) {
+            $tco1_sts.TCO_INT_STS = 1;
+            $this = value;
+        }
+    }
+    register tco1_sts     size 2 @ 0x64 is (update_smi_sci_nmi) {
+        field TCO_SLVSEL      [13:13] is (read_only);
+        field DMISERR_STS     [12:12] is (write_1_clears);
+        field DMISMI_STS      [10:10] is (write_1_clears);
+        field DMISCI_STS       [9:9]  is (write_1_clears);
+        field BIOSWR_STS       [8:8]  is (write_1_clears);
+        field NEW_CENTURY_STS  [7:7]  is (write_1_clears);
+        field TIMEOUT          [3:3]  is (write_1_clears);
+        field TCO_INT_STS      [2:2]  is (write_1_clears);
+        field SW_TCO_SMI       [1:1]  is (write_1_clears);
+        field NMI2SMI_STS      [0:0]  is (ignore_write);
+    }
+    register tco2_sts     size 2 @ 0x66 is (update_smi_sci_nmi) {
+        field ME_HRST_WARM_STS    [7:7] is (write_1_clears);
+        field ME_HRST_COLD_STS    [6:6] is (write_1_clears);
+        field ME_WAKE_STS         [5:5] is (write_1_clears);
+        field SMLINK_SLV_SMI_STS  [4:4] is (write_1_clears);
+        field BAD_BIOS            [3:3] is (zeros);
+        field BOOT_STS            [2:2] is (write_1_clears);
+        field SECOND_TO_STS       [1:1] is (write_1_clears);
+        field INTRD_DET           [0:0] is (write_1_clears);
+    }
+    register tco1_cnt     size 2 @ 0x68 is (update_smi_sci_nmi) {
+        field TCO_LOCK           [12:12] is (write_1_only);
+        field TCO_TMR_HLT        [11:11] is (read_write);
+        field SEND_NOW           [10:10] is (unimplemented);
+        field NMI2SMI_EN          [9:9]  is (read_write);
+        field NMI_NOW             [8:8] {
+            method write(value) {
+                $this ^= value;
+            }
+        }
+    }
+    register tco2_cnt     size 2 @ 0x6A is (update_smi_sci_nmi) {
+        field GPIO11_ALERT_DISABLE [3:3] is (unimplemented);
+        field INTRD_SE             [2:1] is (read_write);
+        parameter hard_reset_value = 0x0008;
+    }
+    register tco_message1 size 1 @ 0x6C is (unimplemented);
+    register tco_message2 size 1 @ 0x6D is (unimplemented);
+    register tco_wdcnt    size 1 @ 0x6E is (unimplemented);
+    register sw_irq_gen   size 1 @ 0x70 is (unimplemented) {
+        parameter hard_reset_value = 0x03;
+    }
+    register tco_tmr      size 2 @ 0x72 {
+        parameter hard_reset_value = 0x04;
+        field timer           [9:0] is (read_write);
+    }
+}

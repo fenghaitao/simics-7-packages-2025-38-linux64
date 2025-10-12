@@ -1,0 +1,234 @@
+/*
+  © 2011 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+header %{
+    #include "sata-util.h"
+    #include <string.h>
+%}
+
+import "simics/devs/signal.dml";
+import "simics/devs/sata-interface.dml";
+import "simics/devs/interrupt.dml";
+
+/* Here put the most common SATA definitions according to v2.6
+   TODO: Should be moved into device/common */
+
+// SATA modes, configured in MAP.SMS
+constant IDE_MODE  = 0;
+constant AHCI_MODE = 1;
+constant RAID_MODE = 2;
+
+// SATA device signature, read from PORT.sig
+constant SATA_SIG_ATA   = 0x00000101; // SATA drive
+constant SATA_SIG_ATAPI = 0xEB140101; // SATAPI drive
+constant SATA_SIG_SEMB  = 0xC33C0101; // Enclosure management bridge
+constant SATA_SIG_PM    = 0x96690101; // Port multiplier
+
+// Memory structure parameter
+constant COMMAND_LIST_ENTRY_SIZE = 0x20;
+constant FIS_ENTRY_SIZE          = 0x100;
+constant PRDT_ENTRY_SIZE         = 0x10;
+constant PRDT_MAX_ENTRIES        = 65535;
+constant DATA_FIS_SIZE_MAX       = 1024 * 8; // 8KBytes, only for payload size.
+constant ACMD_OFFSET             = 0x40;
+constant PRDT_OFFSET             = 0x80;
+
+// Controller States
+constant    H_INIT                  = 0x0;
+constant    H_WAIT_FOR_AHCI_ENABLE  = 0x1;
+constant    H_IDLE                  = 0x2;
+constant    CCC_ENABLE              = 0x3;
+constant    CCC_TIMER_DECREMENT     = 0x4;
+constant    CCC_SET_IS              = 0x5;
+constant    CCC_GEN_INTR            = 0x6;
+constant    EM_RESET                = 0x7;
+constant    EM_MSG_RECV             = 0x8;
+constant    EM_MSG_XMIT             = 0x9;
+
+// Port Idle States
+constant    P_NOT_RUNNING           = 0x12;
+constant    P_IDLE                  = 0x1a;
+constant    ERR_WAIT_FOR_CLEAR      = 0x20;
+
+// Combine a base address (low) with an extended base address (ext)
+// into a physical address when 64-bit address is supported, otherwise
+// return low part only.
+extern physical_address_t EXT_ADDR(uint32 low, uint32 ext, bool support_64);
+extern const char * sata_fis_type_name(int type);
+extern int FIS_REG_H2D;
+extern int FIS_REG_D2H;
+extern int FIS_DMA_ACTIVATE_D2H;
+extern int FIS_DMA_SETUP_BI;
+extern int FIS_DATA_BI;
+extern int FIS_BIST_ACTIVATE_BI;
+extern int FIS_PIO_SETUP_D2H;
+extern int FIS_SET_DEVICE_BIT_D2H;
+extern int FIS_COMINIT;
+
+/* Use the same structure for both Host to Device and Device to Host FISes 
+   Depends on the direction, some part of the FIS may have different meanings */
+typedef layout "little-endian" {
+    uint8   type;
+    bitfields 8 {
+        uint4   pm_port @ [3:0];
+        uint4   crrr    @ [7:4];
+    } byte2;
+    uint8   command;
+    uint8   features;
+
+    uint8   lba_low;
+    uint8   lba_mid;
+    uint8   lba_high;
+    uint8   device;
+
+    uint8   lba_low_exp;
+    uint8   lba_mid_exp;
+    uint8   lba_high_exp;
+    uint8   features_exp;
+
+    uint8   sector_cnt;
+    uint8   sector_cnt_exp;
+    uint8   _resv0;
+    uint8   control;
+
+    uint32  _resv1;
+} fis_t;
+
+template pirq_connect {
+    interface signal           { parameter required = false; }
+    interface simple_interrupt { parameter required = false; }
+
+    method raise(uint32 level) {
+        if ($signal)
+            $signal.signal_raise();
+        else if ($simple_interrupt)
+            $simple_interrupt.interrupt(level);
+    }
+
+    method lower(uint32 level) {
+        if ($signal)
+            $signal.signal_lower();
+        else if ($simple_interrupt)
+            $simple_interrupt.interrupt_clear(level);
+    }
+}
+
+template sata_superset_registers {
+    parameter g_offset default undefined;
+
+    register ssts @ ($g_offset) {
+        parameter desc = "Serial ATA Status";
+        field ipm [11:8] is (read_only);
+        field spd [ 7:4] is (read_only);
+        field det [ 3:0] is (read_only);
+    }
+    register sctl @ ($g_offset + 0x4) {
+        parameter desc = "Serial ATA Control";
+        field pmp [19:16] is (read_only);
+        field spm [15:12] is (read_only);
+        field ipm [11: 8] {
+            method write(value) {
+                if ($this != value) {
+                    if (value < 4)
+                        $this = value;
+                    else
+                        log "spec_violation", 2:
+                            "%s: invalid written value (%d). Ignored",
+                            $qname, value;
+                }
+            }
+        }
+        field spd [ 7: 4] {
+            method write(value) {
+                if ($this != value) {
+                    if (value < 3) {
+                        $this = value;
+                        if (value != 0 && $ssts.spd != 0)
+                            $ssts.spd = value;
+                    } else
+                        log "spec_violation", 2:
+                            "%s: invalid written value (%d). Ignored",
+                            $qname, value;
+                }
+            }
+        }
+        field det [ 3: 0] {
+            parameter hard_reset_value = 0x4;
+            method write(value) {
+                if ($this != value) {
+                    call $check_cmd_st($qname);
+                    if (value == 1) {
+                        call $initialize_interface();
+                    } else if (value == 4)
+                        call $disable_interface();
+                    else if (value == 0 && $this == 1)
+                        call $clear_det_after_init();
+                    else if (value != 0)
+                        log "spec_violation", 2:
+                            "%s: invalid written value (%d)",
+                            $qname, value;
+                    $this = value;
+                }
+            }
+        }
+    }
+    register serr @ ($g_offset + 0x8) {
+        parameter desc = "Serial ATA Error";
+        field x  [26] is (write_clear_is) {
+            parameter bit_num = 6;
+        }
+        field f  [25] is (write_clear_is) {
+            parameter bit_num = 4;
+        }
+        field t1 [24] is (write_1_clears);
+        field t0 [23] is (write_1_clears);
+        field h  [22] is (write_1_clears);
+        field c  [21] is (write_1_clears);
+        field d  [20] is (write_1_clears);
+        field b  [19] is (write_1_clears);
+        field w  [18] is (write_1_clears);
+        field i  [17] is (write_1_clears);
+        field n  [16] is (write_clear_is) {
+            parameter bit_num = 22;
+        }
+        field e  [11] is (write_1_clears);
+        field p  [10] is (write_1_clears);
+        field pcdie [9] is (write_1_clears);
+        field t     [8] is (write_1_clears);
+        field m     [1] is (write_1_clears);
+        field rdie  [0] is (write_1_clears);
+    }
+
+    method initialize_interface() default {
+    }
+    method disable_interface() default {
+    }
+    method clear_det_after_init() default {
+    }
+    method clear_is(int bit) default {
+    }
+    method check_cmd_st(const char* field_name) default {
+    }
+}
+
+template write_clear_is {
+    parameter bit_num default undefined;
+    method write(value) {
+        if (value == 1) {
+            $this = 0;
+            call $clear_is($bit_num);
+        }
+    }
+}

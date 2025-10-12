@@ -1,0 +1,19 @@
+ICH10 HPET Test Description
+===========================
+
+Included Cases
+--------------
+The ICH10 HPET test totally includes 7 cases:
+(1) s-hpe-timer-init-stat.py: tests initial status of HPET
+(2) s-hpe-timer-main-cnt.py: tests the main counter in HPET
+(3) s-hpe-timer-period.py: tests period mode of HPET
+(4) s-hpe-timer-intr.py: tests interrupting function of HPET
+(5) s-hpe-timer-stop-start.py: tests start, stop operation of HPET
+(6) s-hpe-timer-comp-lag-cnt.py: tests the case that compare register is 
+    smaller than main counter
+
+
+
+Not Tested Features
+-------------------
+None 

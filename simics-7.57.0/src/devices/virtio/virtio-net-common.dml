@@ -1,0 +1,377 @@
+/*
+  virtio-net-common.dml
+
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+loggroup virtio_net;
+
+param virtio_and_net = virtio | virtio_net;
+
+import "utility.dml";
+import "simics/devs/ethernet.dml";
+
+// These libc functions are not automatically declared in DML
+extern int sprintf(char *str, const char *format, ...);
+extern int sscanf(const char *str, const char *format, ...);
+
+extern uint64 ETHER_CRC_LEN;
+extern uint64 ETHER_MIN_LEN;
+extern uint64 ETHER_MAX_LEN;
+
+// Network device feature bits
+param VIRTIO_NET_F_CSUM                 = 0;
+param VIRTIO_NET_F_GUEST_CSUM           = 1;
+param VIRTIO_NET_F_CTRL_GUEST_OFFLOADS  = 2;
+param VIRTIO_NET_F_MTU                  = 3;
+param VIRTIO_NET_F_MAC                  = 5;
+param VIRTIO_NET_F_GUEST_TSO4           = 7;
+param VIRTIO_NET_F_GUEST_TSO6           = 8;
+param VIRTIO_NET_F_GUEST_ECN            = 9;
+param VIRTIO_NET_F_GUEST_UFO            = 10;
+param VIRTIO_NET_F_HOST_TSO4            = 11;
+param VIRTIO_NET_F_HOST_TSO6            = 12;
+param VIRTIO_NET_F_HOST_ECN             = 13;
+param VIRTIO_NET_F_HOST_UFO             = 14;
+param VIRTIO_NET_F_MRG_RXBUF            = 15;
+param VIRTIO_NET_F_STATUS               = 16;
+param VIRTIO_NET_F_CTRL_VQ              = 17;
+param VIRTIO_NET_F_CTRL_RX              = 18;
+param VIRTIO_NET_F_CTRL_VLAN            = 19;
+param VIRTIO_NET_F_GUEST_ANNOUNCE       = 21;
+param VIRTIO_NET_F_MQ                   = 22;
+param VIRTIO_NET_F_CTRL_MAC_ADDR        = 23;
+param VIRTIO_NET_F_RSC_EXT              = 61;
+param VIRTIO_NET_F_STANDBY              = 62;
+
+// Network pack flag bits
+param VIRTIO_NET_HDR_F_NEEDS_CSUM       = 1;
+param VIRTIO_NET_HDR_F_DATA_VALID       = 2;
+param VIRTIO_NET_HDR_F_RSC_INFO         = 4;
+
+// Network packet gso types
+param VIRTIO_NET_HDR_GSO_NONE   =    0;
+param VIRTIO_NET_HDR_GSO_TCPV4  =    1;
+param VIRTIO_NET_HDR_GSO_UDP    =    3;
+param VIRTIO_NET_HDR_GSO_TCPV6  =    4;
+param VIRTIO_NET_HDR_GSO_ECN    = 0x80;
+
+param RECEIVE_Q  = 0;
+param TRANSMIT_Q = 1;
+
+// Network packet header
+typedef layout "little-endian" {
+    uint8 flags;
+    uint8 gso_type;
+    uint16 hdr_len;
+    uint16 gso_size;
+    uint16 csum_start;
+    uint16 csum_offset;
+    uint16 num_buffers;
+} virtio_net_hdr_t;
+
+typedef layout "little-endian" {
+    uint8 flags;
+    uint8 gso_type;
+    uint16 hdr_len;
+    uint16 gso_size;
+    uint16 csum_start;
+    uint16 csum_offset;
+} virtio_net_hdr_legacy_t;
+
+attribute mac_address {
+    param documentation = "The MAC Address";
+    param configuration = "optional";
+    param type = "s";
+    session uint48 val = 0;
+
+    method get() -> (attr_value_t) {
+        local char mac_str[18];
+        sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
+                this.val[7:0], this.val[15:8], this.val[23:16],
+                this.val[31:24], this.val[39:32], this.val[47:40]);
+        return SIM_make_attr_string(mac_str);
+    }
+
+    method set(attr_value_t value) throws {
+        local int mac_byte[6];
+        if (sscanf(SIM_attr_string(value), "%02X:%02X:%02X:%02X:%02X:%02X",
+                   &mac_byte[0], &mac_byte[1], &mac_byte[2],
+                   &mac_byte[3], &mac_byte[4], &mac_byte[5]) == 6) {
+
+            this.val[7:0]   = mac_byte[0];
+            this.val[15:8]  = mac_byte[1];
+            this.val[23:16] = mac_byte[2];
+            this.val[31:24] = mac_byte[3];
+            this.val[39:32] = mac_byte[4];
+            this.val[47:40] = mac_byte[5];
+        }
+        else {
+            log error, 2: "MAC Address must be in xx:xx:xx:xx:xx:xx format.";
+            throw;
+        }
+    }
+}
+
+port eth {
+    connect link {
+        param configuration = "optional";
+        param documentation = "outgoing ethernet link to target";
+
+        interface ethernet_common;
+    }
+
+    implement ethernet_common {
+        method frame(const frags_t *frame, eth_frame_crc_status_t crc_status) {
+            local frags_t processed_frame;
+            local size_t data_len = frags_len(frame);
+            if (data_len < ETHER_MIN_LEN) {
+                log spec_viol, 1 then 3, virtio_and_net:
+                    "Received frame of size %u, less than ETHER_%s_LEN",
+                    data_len, data_len < ETHER_CRC_LEN ? "CRC" : "MIN";
+            } else if (data_len > ETHER_MAX_LEN) {
+                log spec_viol, 1 then 3, virtio_and_net:
+                    "Received frame of size %u, greater than ETHER_MAX_LEN."
+                    + " Discarding frame.",
+                    data_len;
+                return;
+            }
+            if (data_len < ETHER_CRC_LEN) {
+                processed_frame = *frame;
+            } else {
+                frags_init_add_from_frags(&processed_frame, frame, 0,
+                                          data_len - ETHER_CRC_LEN);
+            }
+            switch (crc_status) {
+                case Eth_Frame_CRC_Match: {
+                    break;
+                }
+                case Eth_Frame_CRC_Mismatch: {
+                    log info, 1 then 3, virtio_and_net:
+                        "Received frame with CRC mismatch";
+                    break;
+                }
+                case Eth_Frame_CRC_Unknown: {
+                    log info, 1 then 3, virtio_and_net:
+                        "Received frame with unknown CRC";
+                    break;
+                }
+            }
+            try {
+                receive_q_handler.receive(&processed_frame);
+            } catch {
+                log info, 2 then 3, virtio_and_net:
+                    "exception when handling received frame";
+            }
+        }
+    }
+}
+
+template virtio_net_regs {
+    param config_regs_offset : uint64;
+    param len = 6;
+
+    register mac size 6 @  config_regs_offset "MacAddress";
+
+    register mac is (read, read_only) {
+        param configuration = "pseudo";
+        param writable = false;
+
+        method read() -> (uint64) {
+            return mac_address.val;
+        }
+        method get() -> (uint64) {
+            return mac_address.val;
+        }
+    }
+}
+
+template virtio_net_device {
+    param NUM_QUEUES = 2;
+    param legacy_interface default false;
+
+    bank features {
+        group virtio_net_f_mac is feature {
+            param bit = VIRTIO_NET_F_MAC;
+        }
+    }
+
+    method handle_notify(uint16 virtq_idx) throws {
+            switch (virtq_idx) {
+                case RECEIVE_Q: {
+                    receive_q_handler.handle_notify(virtq_idx);
+                    break;
+                }
+                case TRANSMIT_Q: {
+                    transmit_q_handler.handle_notify(virtq_idx);
+                    break;
+                }
+                default: {
+                    log error, 1, virtio_and_net: "Bad virtq index";
+                    throw;
+                }
+            }
+        }
+
+    group receive_q_handler is soft_reset {
+        saved uint16 next_avail_idx;
+        method soft_reset() {
+            next_avail_idx = 0;
+        }
+
+        method receive(const frags_t *frame) throws {
+            if (virtqs[RECEIVE_Q].avail_ring_idx == next_avail_idx) {
+                log info, 1 then 3, virtio_and_net:
+                    "out of available buffers to store received packet. "
+                    + "Packet dropped.";
+                return;
+            }
+            log info, 4, virtio_and_net:
+                "storing received packet of length %u (Ethernet CRC excluded)",
+                frags_len(frame);
+            local uint32 id;
+            local virtq_desc_list_t desc_list;
+            (id, desc_list) = virtqs[RECEIVE_Q].acquire_buffer();
+
+            local uint32 used;
+            #if (legacy_interface) {
+                local virtio_net_hdr_legacy_t header;
+                virtq_desc_data_write(&desc_list, 0, sizeof(header), &header);
+                used = sizeof(header);
+            } #else {
+                local virtio_net_hdr_t header;
+                virtq_desc_data_write(&desc_list, 0, sizeof(header), &header);
+                used = sizeof(header);
+            }
+
+            local frags_it_t it = frags_it(frame, 0, frags_len(frame));
+            for (; !frags_it_end(it); it = frags_it_next(it)) {
+                virtq_desc_data_write(&desc_list, used, frags_it_len(it),
+                                      frags_it_data(it));
+                used += frags_it_len(it);
+            }
+            virtqs[RECEIVE_Q].commit_buffer(id, used);
+            virtqs[RECEIVE_Q].update_used_ring_info();
+            virtqs[RECEIVE_Q].interrupt_driver();
+        }
+
+        method handle_notify(uint16 virtq_idx) throws {
+            // Only update next_avail_idx
+            local ring_info_t avail_ring_info;
+            avail_ring_info = virtqs[virtq_idx].get_avail_ring_info();
+            if (next_avail_idx != avail_ring_info.idx) {
+                log info, 4, virtio_and_net:
+                    "Updating next_avail_idx: %u -> %u",
+                    next_avail_idx, avail_ring_info.idx;
+                next_avail_idx = avail_ring_info.idx;
+            }
+        }
+    }
+
+    group transmit_q_handler is virtq_request_handler {
+        method process_request(virtq_desc_list_t *desc_list)
+            -> (uint32) throws {
+            if (!eth.link.obj) {
+                log info, 1 then 3:
+                    "Cannot process request no link object attached";
+                return 0;
+            }
+            log info, 4, virtio_and_net:
+                "processing transmit request of size %u", desc_list->len;
+            local size_t header_len;
+            #if (legacy_interface) {
+                local virtio_net_hdr_legacy_t header;
+                virtq_desc_data_read(desc_list, 0, sizeof(header), &header);
+                header_len = sizeof(header);
+                log info, 4, virtio_and_net:
+                    "header: %02x %02x %04x %04x %04x %04x",
+                        header.flags, header.gso_type, header.hdr_len,
+                        header.gso_size, header.csum_start, header.csum_offset;
+            } #else {
+                local virtio_net_hdr_t header;
+                virtq_desc_data_read(desc_list, 0, sizeof(header), &header);
+                header_len = sizeof(header);
+                log info, 4, virtio_and_net:
+                    "header: %02x %02x %04x %04x %04x %04x",
+                        header.flags, header.gso_type, header.hdr_len,
+                        header.gso_size, header.csum_start, header.csum_offset;
+            }
+
+            local uint32 data_len = desc_list->len - header_len;
+
+            // unix may buffer packets smaller than the min ethernet frame
+            // length. In these cases, zero-padding is used to extend the
+            // packet.
+            // Also pad extra bytes for the CRC field.
+            local uint32 frame_len = data_len < ETHER_MIN_LEN - ETHER_CRC_LEN
+                                   ? ETHER_MIN_LEN : data_len + ETHER_CRC_LEN;
+
+            log info, 4, virtio_and_net:
+                "transmitting packet of size %u (frame length %u)",
+                data_len, frame_len;
+            local uint8 *buf = new uint8[frame_len];
+            try {
+                virtq_desc_data_read(desc_list, header_len, data_len, buf);
+
+                local frags_t frags;
+                frags_init_add(&frags, buf, frame_len);
+                eth.link.ethernet_common.frame(&frags, Eth_Frame_CRC_Match);
+            } catch {
+                delete buf;
+                throw;
+            }
+            delete buf;
+
+            // Unclear what reported number of used bytes should be.
+            // Going with 0, as the device has written no data to the buffers
+            return 0;
+        }
+    }
+}
+
+template virtio_feature_bit_strings_net is virtio_feature_bit_strings {
+    method feature_bit_to_string(uint64 feature_bit) -> (const char *) {
+        switch (feature_bit) {
+        case VIRTIO_NET_F_CSUM:                return "VIRTIO_NET_F_CSUM";
+        case VIRTIO_NET_F_GUEST_CSUM:          return "VIRTIO_NET_F_GUEST_CSUM";
+        case VIRTIO_NET_F_CTRL_GUEST_OFFLOADS: return "VIRTIO_NET_F_CTRL_GUEST_OFFLOADS";
+        case VIRTIO_NET_F_MTU:                 return "VIRTIO_NET_F_MTU";
+        case VIRTIO_NET_F_MAC:                 return "VIRTIO_NET_F_MAC";
+        case VIRTIO_NET_F_GUEST_TSO4:          return "VIRTIO_NET_F_GUEST_TSO4";
+        case VIRTIO_NET_F_GUEST_TSO6:          return "VIRTIO_NET_F_GUEST_TSO6";
+        case VIRTIO_NET_F_GUEST_ECN:           return "VIRTIO_NET_F_GUEST_ECN";
+        case VIRTIO_NET_F_GUEST_UFO:           return "VIRTIO_NET_F_GUEST_UFO";
+        case VIRTIO_NET_F_HOST_TSO4:           return "VIRTIO_NET_F_HOST_TSO4";
+        case VIRTIO_NET_F_HOST_TSO6:           return "VIRTIO_NET_F_HOST_TSO6";
+        case VIRTIO_NET_F_HOST_ECN:            return "VIRTIO_NET_F_HOST_ECN";
+        case VIRTIO_NET_F_HOST_UFO:            return "VIRTIO_NET_F_HOST_UFO";
+        case VIRTIO_NET_F_MRG_RXBUF:           return "VIRTIO_NET_F_MRG_RXBUF";
+        case VIRTIO_NET_F_STATUS:              return "VIRTIO_NET_F_STATUS";
+        case VIRTIO_NET_F_CTRL_VQ:             return "VIRTIO_NET_F_CTRL_VQ";
+        case VIRTIO_NET_F_CTRL_RX:             return "VIRTIO_NET_F_CTRL_RX";
+        case VIRTIO_NET_F_CTRL_VLAN:           return "VIRTIO_NET_F_CTRL_VLAN";
+        case VIRTIO_NET_F_GUEST_ANNOUNCE:      return "VIRTIO_NET_F_GUEST_ANNOUNCE";
+        case VIRTIO_NET_F_MQ:                  return "VIRTIO_NET_F_MQ";
+        case VIRTIO_NET_F_CTRL_MAC_ADDR:       return "VIRTIO_NET_F_CTRL_MAC_ADDR";
+        case VIRTIO_NET_F_RSC_EXT:             return "VIRTIO_NET_F_RSC_EXT";
+        case VIRTIO_NET_F_STANDBY:             return "VIRTIO_NET_F_STANDBY";
+        default:                               return default(feature_bit);
+        }
+    }
+}
+
+is virtio_feature_bit_strings_net;
+in each (virtio_device) {
+    is virtio_feature_bit_strings_net;
+}

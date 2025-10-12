@@ -1,0 +1,120 @@
+/*
+* i82583V-mac-rx.dml
+
+  © 2011 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter RA_CNT = 16;
+parameter MTA_CNT = 128; // 128 regs * 32 bits = 4096 bits
+
+parameter PKTTYPE_MAC_PAYLOAD      = 0x0; // device does not configured to provide offload that requires packet parsing
+parameter PKTTYPE_MAC_IPV4_PAYLOAD = 0x1;
+parameter PKTTYPE_MAC_IPV4_TCP_UDP = 0x2;
+parameter PKTTYPE_MAC_IPV6_PAYLOAD = 0x5;
+parameter PKTTYPE_MAC_IPV6_TCP_UDP = 0x6;
+
+bank csr {
+    /* --------------------------------------------------------------
+       RECEIVE REGISTERS
+       -------------------------------------------------------------- */
+
+    register psrctl @ 0x02170 "Packet Split Receive Control";
+
+    register radv   @ 0x0282c "Receive Interrupt Absolute Delay Timer";
+    register rsrpd  @ 0x02c00 "Receive Small Packet Detect";
+    register raid   @ 0x02c08 "Receive ACK Interrupt Delay";
+
+    group rx_queue [$NUM_RECEIVE_QUEUES] {
+        is rx_desc_queue;
+        is ext_rx_desc_queue;
+        parameter BA = 0x2800 + $i * 0x100;
+        parameter rdmts  = $rctl.rdmts;
+        parameter dtyp   = $rctl.dtyp;
+        parameter bsize  = $rctl.bsize;
+        parameter bsex   = $rctl.bsex;
+        parameter flxbuf = $rctl.flxbuf;
+        parameter psr_sz = $psrctl;
+    }
+    // This group defines the ral[0..15] and rah[0..15] registers, used to store receive MAC address
+    group ra [i in 0 .. ($RA_CNT-1)] {
+        is rx_mac_register;
+        register low  @ 0x05400 + $i * 8 "Receive Address Low";
+        register high @ 0x05404 + $i * 8 "Receive Address High";
+    }
+
+    event rx_delay is (intr_delay_evt) { parameter INTR = INTR_RXT0; }
+    event ack_delay is (intr_delay_evt) { parameter INTR = INTR_ACK; }
+
+    register rctl {
+        field en[1]     is (read_write) "Receiver Enable";
+        field sbp[2]    is (read_write) "Store Bad Packets";
+        field upe[3]    is (read_write) "Unicast Promiscuous Enabled";
+        field mpe[4]    is (read_write) "Multicast Promiscuous Enabled";
+        field lpe[5]    is (read_write) "Long Packet Reception Enabled" {
+            method write(value) {
+                if (value == 0x1) {
+                    log "spec_violation", 1: "jumbo frames are not supported";
+                }
+            }
+        }
+        field lbm[7:6]  is (unimplemented) "Loopback Mode";
+        field rdmts[9:8]is (read_write) "Receive Descriptor Minimum Threshold Size";
+        field dtyp[11:10] is (read_write) "Descriptor Type";
+        field mo[13:12] is (read_write) "Multicast Offset";
+        field bam[15]   is (read_write) "Broadcast Accept Mode";
+        field bsize[17:16] is (read_write) "Receive Buffer Size";
+        field vfe[18]   is (read_write) "VLAN Filter Enable";
+        field cfien[19] is (read_write) "Canonical Form Indicator Enable";
+        field cfi[20]   is (read_write) "Canonical Form Indicator Bit Value";
+        field dpf[22]   is (unimplemented) "Discard Pause Frames";
+        field pmcf[23]  is (unimplemented) "Pass MAC Control Frame";
+        field bsex[25]  is (read_write) "Buffer Size Extension";
+        field secrc[26] is (read_write) "Strip Ethernet CRC from incoming Packet";
+        field flxbuf[30:27] is (read_write) "Flexible Buffer Size";
+    }
+    register psrctl is (write_mask) {
+        parameter mask = 0x7F7F7F7F;
+        parameter hard_reset_value = 0x00040402;
+    }
+
+    register radv  is (unimplemented);
+    register rsrpd is (write_mask) { parameter mask = 0x00000FFF; }
+    register raid  is (write_mask) { parameter mask = 0x0000FFFF; }
+    register rxcsum {
+        field pcss[7:0]  is (read_write) "Packet Checksum Start";
+        field ipofld[8]  is (read_write) "IP Checksum Off-load Enable";
+        field tuofld[9]  is (read_write) "TCP/UDP Checksum Off-load Enable";
+        field crcofl[11] is (unimplemented) "CRC32 Offload Enable";
+        field ippcse[12] is (unimplemented) "IP Payload Checksum Enable";
+        field pcsd[13]   is (read_write) "Packet Checksum Disable";
+    }
+    register rfctl {
+        field iscsi_dis[0]   is (read_write) "iSCSI Disable";
+        field iscsi_dwc[5:1] is (read_write) "iSCSI Dword Count";
+        field nfsw_dis[6]    is (read_write) "NFS Write Disable";
+        field nfsr_dis[7]    is (read_write) "NFS Read Disable";
+        field nfs_ver[9:8]   is (read_write) "NFS Version";
+        field ipv6_dis[10]   is (unimplemented) "IPv6 Disable";
+        field ipv6xsum_dis[11] is (unimplemented) "IPv6 Xsum Disable";
+        field ackdis[12]     is (read_write) "ACK Accelerate Disable";
+        field ackd_dis[13]   is (read_write) "ACK Data Disable";
+        field ipfrsp_dis[14] is (read_write) "IP Fragment Split Disable";
+        field exsten[15]     is (read_write) "Extended Status Enable";
+    }
+}
+
+template flow_ctl_register {
+    field rt[15:3] is (unimplemented) "Receive Threshold Value";
+    field b31[31] is (unimplemented) "XON Enable";
+}

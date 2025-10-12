@@ -1,0 +1,66 @@
+/*
+  sata-common.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+/* The common file for IA sata */
+import "ide-export.dml";
+
+import "sata-util.dml";
+import "sata-pci.dml";
+import "sata-bm.dml";
+import "sata-sidp.dml";
+import "ich-pci-common.dml";
+
+parameter ich9_desktop = $ich_name == "ICH9"   ? true
+                       : $ich_name == "ICH9R"  ? true
+                       : $ich_name == "ICH9DH" ? true
+                       : $ich_name == "ICH9DO" ? true
+                       : false;
+parameter ich9_mobile = $ich_name == "ICH9M"   ? true
+                      : $ich_name == "ICH9M-E" ? true
+                      : false;
+parameter ich9_base = $ich_name == "ICH9";
+parameter ich10_corporate = false;
+parameter ich10_consumer = $ich_name == "ICH10";
+
+template write_once {
+    is _reg_or_field;
+    parameter _def_value =
+             ((defined $hard_reset_value) ? $hard_reset_value :
+              ((defined $reg.hard_reset_value)
+               ? ($reg.hard_reset_value)[$msb:$lsb] : 0));
+
+    method write(value) {
+        if (value != $this) {
+            if ($this != $_def_value) {
+                log "spec_violation":
+                    "%s %s %s (value written = %#x, contents = %#x).",
+                    "multiple update to write-once",
+                    $reg_or_field, $qname, value, $this;
+            } else {
+                inline $update(value);
+            }
+        }
+    }
+
+    method update(value) default {
+        $this = value;
+    }
+}
+
+method read_chipset_config(uint32 num) -> (uint32 value) {
+    value = $chipset_config.int_register.read(num);
+}

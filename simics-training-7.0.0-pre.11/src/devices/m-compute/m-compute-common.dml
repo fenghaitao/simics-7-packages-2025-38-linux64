@@ -1,0 +1,821 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  m-compute : Mandelbrot fractal compute device, in DML 
+            : With some parts in C
+            : Part of Simics training materials
+
+*/
+
+
+dml 1.4;
+
+// Dummy vs real implementation of the algorithm
+param dummy_implementation;
+
+// Enable threaded execution of the algorithm code
+// Using a parameter means the code needs to be recompiled to 
+// change between parallel and serial mode. 
+//
+// The code guarded with #if(threaded_compute) in the code
+// will be removed while compiling DML and thus no trace of
+// threading will be present in the final binary.  
+param threaded_compute;
+
+param desc = "mandelbrot compute unit " +
+              (threaded_compute || dummy_implementation? "(" : "") + 
+              (threaded_compute? "threaded" : "") +
+              (threaded_compute && dummy_implementation? " " : "") +
+              (dummy_implementation? "dummy" : "") +
+              (threaded_compute || dummy_implementation? ")" : "");
+
+param documentation = "A " + (threaded_compute? "multi-threaded ":"") +
+                      "compute unit for the mandelbrot hardware accelerator." +
+                      (dummy_implementation? " The device only uses a dummy" +
+                              " implementation of compute_single_pixel." : "");
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+import "simics/devs/memory-space.dml";
+import "simics/simulator-api.dml";
+import "m-compute-control-interface.dml";
+
+loggroup control;      // operations that control the computation
+loggroup compute;      // actual compute work
+loggroup performance;  // performance
+
+
+//----------------------------------------------------------------------
+//
+// Configuration attributes
+//
+//----------------------------------------------------------------------
+attribute pixel_compute_time is (uint64_attr, init) {
+    param documentation = "Time to process one pixel (ps)";
+    param configuration = "optional";
+    method init() {
+      this.val = 10000;  // 10000 ps = 10 ns = device can do 100Mpx/s 
+    }
+}
+
+attribute individual_pixel_update is (bool_attr, init) {
+    param documentation = "Update each pixel at a time";
+    param configuration = "optional";
+    method init() {
+      this.val = false;  // Do not update each pixel at a time
+    }
+}
+
+attribute is_threaded is (read_only_attr) {
+    param documentation = "Is this model compiled to be threaded?";
+    param type="b";
+    param internal=true;   // do not show in default list-attributes
+    method get() -> (attr_value_t ) {
+        return (SIM_make_attr_boolean(threaded_compute));
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Connects   
+// - Reference to the memory space where we do DMA.
+// - Reference to the object to signal completion to. 
+//
+//----------------------------------------------------------------------
+connect local_memory is map_target {
+    param configuration = "required";
+    param internal = false;       // = list-attributes shows it by default
+    param desc = "Memory space used for work descriptors and results";
+}
+
+// Semantics of operation done:
+// - State of this signal should follow the state of the "done" 
+//   flag in the status register
+connect operation_done "Object to receive completion notifications" {
+    param configuration = "optional";  
+    param internal = false;       // = list-attributes shows it by default
+    interface signal;
+
+    // Signal that the operation completed
+    // But only if something is connected
+    method signal_done() {
+        if(obj) {
+            log info, 2, control: "Signalling completion";            
+            signal.signal_raise();
+        } else {
+            log info, 2, control: "No connected object to signal completion to";
+        }
+    }
+
+    // Lower signal only on clearing the status
+    method signal_done_clear() {
+        if(obj) {
+            log info, 2, control: "Lowering completion signal";            
+            signal.signal_lower();
+        } else {
+            log info, 2, control: "No connected object to signal completion to";
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Memory access utilities, using the local_memory connect 
+// 
+//----------------------------------------------------------------------
+method write_memory_block(physical_address_t target_addr, 
+                          uint8 *            local_buf, 
+                          physical_address_t buf_size) {
+    try {
+        local_memory.write_bytes(target_addr, buf_size, local_buf);
+    } catch {
+        log error: "Error writing to target memory (address=0x%x, %d bytes)", 
+                    target_addr, buf_size ;
+    }
+}
+
+method read_memory_block(void *dst,
+                        physical_address_t src_addr,
+                        physical_address_t len) throws {
+    try {
+        local_memory.read_bytes(src_addr,len,dst);
+    } catch {
+        log error: "Error reading target memory (addr=0x%x, %d bytes)", src_addr, len;
+        throw;
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Memory layout of work descriptor
+// -- Design assumes that the actual memory to work in is 
+//    right after this header. 
+//
+// And struct used in the computations in the device model
+// -- Same data, but converted to host format for computation. 
+//
+//----------------------------------------------------------------------
+
+typedef layout "little-endian" {
+
+    // Parameters to define the area to compute
+    //   Format is biased to cover the range [-2, 2]
+    //   float_value = (uint32_value - 2Gi) / 1Gi
+    uint32 bottom;
+    uint32 left;
+    uint32 top;
+    uint32 right;
+
+    // Pixel area to compute over
+    uint32 width_px;
+    uint32 height_px;
+
+    // Maximum iteration count 
+    uint32 max_iter;
+
+    // To put the address field on an 8-byte boundary
+    uint32 _reserved;
+
+    // Address to work Area
+    uint64 addr_px;
+
+} work_descriptor_layout_t;
+
+typedef struct {
+
+    // Parameters to define the area to compute
+    double bottom;
+    double left;
+    double top;
+    double right;
+
+    // Pixel area to compute over
+    uint32 width_px;
+    uint32 height_px;
+
+    // Maximum iteration count 
+    uint32 max_iter;
+
+    // start of pixel block
+    physical_address_t addr_px;  
+
+    // Cache some derived values that are used 
+    // repeatedly in all computations
+    double             width_f;
+    double             height_f;
+    uint32             count_px;
+
+} work_descriptor_t;
+
+// The type of the value to be computed 
+typedef uint16 iter_count_type;
+
+
+//----------------------------------------------------------------------
+//
+// Compute state, as device-level variables 
+// - Adding the functionality to the names and offsets declared above
+//
+//----------------------------------------------------------------------
+saved    work_descriptor_t current_work_descriptor; 
+session  iter_count_type*  current_scratch_buffer;
+
+
+//----------------------------------------------------------------------
+//
+// Read a descriptor from memory, store it in a work descriptor
+// -- Fill in a given descriptor in the device that it gets a pointer to
+// -- Return False in case setup failed
+//----------------------------------------------------------------------
+
+method descriptor_value_to_double(uint32 dvalue) -> (double) {
+    // Convert encoding from descriptor to double for 
+    // model code to work on. 
+    return (cast(dvalue, double) - 0x8000_0000 ) /0x4000_0000;
+}
+
+method read_descriptor(work_descriptor_t* d) -> (bool) {
+    // Use the layout type to interpret the data read from memory
+    local work_descriptor_layout_t desc_mem;
+ 
+    // And the struct type to track values
+    *d = {0,0,0,0,0,0,0,0,0,0,0};    
+
+    // Compute address of layout in the local_memory map
+    local physical_address_t desc_addr;
+    desc_addr = ctrl.descriptor_addr.val;
+
+    // Read descriptor from memory into model-local storage
+    try {
+        read_memory_block(&desc_mem, desc_addr, sizeof desc_mem);
+        }    catch {
+                log error: "Descriptor read failed";
+        return false;    // should be all zeroes at this point
+    }
+
+    // Pick up values from descriptor
+    d->bottom = descriptor_value_to_double( desc_mem.bottom );
+    d->left =   descriptor_value_to_double( desc_mem.left   );
+    d->top =    descriptor_value_to_double( desc_mem.top    );
+    d->right =  descriptor_value_to_double( desc_mem.right  );
+    d->width_px = desc_mem.width_px;
+    d->height_px = desc_mem.height_px;
+    d->max_iter  = desc_mem.max_iter;
+    d->addr_px   = desc_mem.addr_px;
+
+    // Derived values
+    d->width_f  = d->right - d->left;
+    d->height_f = d->top - d->bottom;
+    d->count_px = d->width_px * d->height_px;
+
+    // Log what is going on
+    log info, 2, compute: "Work descriptor read-> Area: (%f, %f) - (%f, %f) (%d, %d) iter: %d pixels  @ 0x%x", 
+                           d->bottom, d->left, d->top, d->right, 
+                           d->width_px, d->height_px, d->max_iter,
+                           d->addr_px;
+
+    return true;
+}
+
+//----------------------------------------------------------------------
+//
+// Core algorithm functions  
+// 
+//----------------------------------------------------------------------
+
+//
+//  compute_in_model_scratch 
+//  -- compute the Mandelbrot set
+//  -- from a work descriptor
+//  -- putting results into a buffer 
+//
+// "independent" = can be called from both threaded and non-threaded code in the
+// device model.  Works like if this was a regular C function in a separate C file. 
+// It does not have access to any other variables or DML objects. 
+//
+independent method compute_in_model_scratch(work_descriptor_t *d,
+                                            iter_count_type* result_buf) {
+    // Pixel iteration
+    local int   x = 0;
+    local int   y = 0;
+    local iter_count_type pixval;
+
+    for (x=0; x < d->width_px; x++ ) {
+        for (y=0; y < d->height_px; y++) {
+            #if (dummy_implementation) {
+                // Just color the buffer
+                pixval = 0xff00;
+            } #else {
+                // Actual compute
+                pixval = compute_single_pixel(x,y,d);
+            } // end dummy implementation       
+            *(result_buf + 
+            (x + (y * (d->width_px)))) = pixval;
+        }  // y loop 
+    } // x loop
+}
+
+// 
+// Core logic to compute a single pixel 
+//
+independent method compute_single_pixel(int x, int y, work_descriptor_t *d) -> (iter_count_type) {
+    // 
+    local int    iter_count = 0;
+    local double x0 = d->left + (cast(x,double) /d->width_px * d->width_f);
+    local double y0 = d->top - (cast(y,double) /d->height_px * d->height_f);
+
+    local double xi = 0.0;
+    local double yi = 0.0;
+
+    while( (xi*xi + yi*yi < 4.0) && (iter_count < d->max_iter)) {
+        local double xi_old = xi;
+        local double yi_old = yi;
+
+        xi = xi_old * xi_old - yi_old * yi_old + x0;
+        yi = 2 * xi_old * yi_old + y0;
+        iter_count ++;
+    }
+
+    return iter_count;
+}
+
+
+
+//  compute_each_pixel_to_sim_memory 
+//  -- set each pixel in memory as soon as it is computed
+//  -- generates MANY simulated memory accesses 
+//  -- do NOT use with threading
+//
+//  -- to make code more consistent, takes a work descriptor argument
+//     even though in principle it can get at a device-level variable
+//
+// This method cannot be "independent" as it needs the object
+// reference in order to continuously do memory accesses
+// 
+method compute_each_pixel_to_sim_memory(work_descriptor_t *d) {
+    // Pixel iteration
+    local int   x = 0;
+    local int   y = 0;
+    local iter_count_type pixval;
+    local physical_address_t pixaddr;
+
+    // Basic test: color the data 
+    for (x=0; x < d->width_px; x++ ) {
+        for (y=0; y < d->height_px; y++) {
+            pixaddr = d->addr_px + 
+                      ((x + y*d->width_px) * sizeoftype iter_count_type);
+
+            #if (dummy_implementation) {
+                // Just color the buffer
+                pixval = 0xff00;
+            } #else {
+                // Actual compute
+                pixval = compute_single_pixel(x,y,d);
+            } // end dummy implementation      
+            write_memory_block(pixaddr, cast(&pixval,uint8 *), sizeof pixval );
+        }  // y loop
+    } // x loop
+}
+
+
+//----------------------------------------------------------------------
+//
+// Do the compute work, in the main thread.  For non-threaded/serial case. 
+//
+//----------------------------------------------------------------------
+method do_compute_work() {
+    // Copy the pointer to the work descriptor to a local variable
+    // to make the code easier to read
+    local work_descriptor_t *d = &current_work_descriptor;
+
+    // Variant implementations, controlled via attribute
+    if (individual_pixel_update.val==true) {
+        compute_each_pixel_to_sim_memory(d);  
+    } else {
+        // Allocate scratch buffer for the code to put
+        // results into. 
+        current_scratch_buffer = new iter_count_type[current_work_descriptor.count_px];
+        // Compute to the scratch buffer
+        compute_in_model_scratch(d,current_scratch_buffer);
+        // Copy the results from scratch buffer to memory
+        log info, 3, compute : "Copying results from buffer to target memory";
+        write_memory_block(current_work_descriptor.addr_px, 
+                           cast(current_scratch_buffer,uint8 *), 
+                           current_work_descriptor.count_px * sizeoftype iter_count_type );
+        // clean  up memory allocation 
+        delete current_scratch_buffer;
+        current_scratch_buffer = NULL;
+        // Note that the scratch buffer only lives for a single simulation step
+        // so it does not need to be checkpointed. 
+    }
+}
+
+
+
+//----------------------------------------------------------------------
+//
+// Thread handling, for offload threaded computations 
+//
+//----------------------------------------------------------------------
+
+// Extended work descriptor for the thread. 
+// Collect ALL data items that the thread needs into a 
+// single struct that we can allocate and point at. 
+typedef struct {
+    // The base descriptor
+    work_descriptor_t * work_descriptor;
+
+    // Buffer to compute the result to
+    iter_count_type * result_buf;
+
+    // Locking variables
+    pthread_mutex_t * worker_thread_lock;
+    pthread_cond_t *  worker_thread_condvar;
+    bool *            worker_thread_done;    
+
+} thread_extended_work_descriptor_t;
+
+import "pthread.dml";
+typedef void (*callback_type)(void *);
+
+#if(threaded_compute) {
+    // Variables used to synchronize between the offload thread 
+    // and the main Simics thread.  They are accessed from the offload
+    // thread via pointers in the extended work descriptor. 
+    session pthread_mutex_t  worker_thread_lock;
+    session pthread_cond_t   worker_thread_condvar;
+    session bool             worker_thread_done;
+
+    // Extended thread descriptor 
+    session thread_extended_work_descriptor_t *current_ted;
+
+    // Callback from Simics when the thread starts
+    // This code runs in "Thread Context", and as such it must be
+    // decoupled from the rest of the device.  It does not have access
+    // to the device object, in particular.  
+    independent method do_compute_work_in_thread_callback(thread_extended_work_descriptor_t *ed) {        
+        // Do the actual compute work
+        // -- In code shared with the non-threaded case 
+        // -- Just like it would be in case the code was in a separate C file
+        compute_in_model_scratch(ed->work_descriptor, ed->result_buf);
+
+        // Tell the "after" callback that we are well and truly done
+        pthread_mutex_lock(ed->worker_thread_lock);
+        *(ed->worker_thread_done) = true;
+        pthread_cond_signal(ed->worker_thread_condvar);
+        pthread_mutex_unlock(ed->worker_thread_lock);
+    }
+
+    // Makes Simics start a worker thread to run the compute job
+    //
+    //   Called if threaded_compute is set to true. 
+    //
+    method do_compute_work_in_thread() {
+        // Set completion signal BEFORE starting thread = no lock needed
+        // to protect this shared variable. 
+        worker_thread_done = false;
+
+        // Set up the extended work descriptor 
+        current_ted = new thread_extended_work_descriptor_t;
+        current_scratch_buffer = new iter_count_type[current_work_descriptor.count_px];
+
+        current_ted->work_descriptor       = &current_work_descriptor;
+        current_ted->result_buf            = current_scratch_buffer;
+        current_ted->worker_thread_lock    = &worker_thread_lock;
+        current_ted->worker_thread_condvar = &worker_thread_condvar;
+        current_ted->worker_thread_done    = &worker_thread_done;
+
+        // Use the Simics API to call a function in a worker thread provided
+        // by the Simics core itself.  
+        log info, 3, control | compute : "Creating thread to do compute in the background";
+        SIM_run_in_thread(cast(&do_compute_work_in_thread_callback,callback_type), 
+                        current_ted);
+
+        // The control flow rejoins in the compute_operation_complete() callback method
+    }
+
+    // Called from init function for this object. 
+    method init_thread_sync() {
+        worker_thread_done = false;
+        pthread_mutex_init(&worker_thread_lock, NULL);
+        pthread_cond_init(&worker_thread_condvar, NULL);
+    }
+
+}  // End of block controlled by threaded compute
+
+//----------------------------------------------------------------------
+//
+// Callback for compute operation completion - from "after" statement
+// - Used to pass the descriptor as an argument
+// - As part of threading re-org, use a saved variable instead. 
+// 
+//----------------------------------------------------------------------
+
+method compute_operation_complete() {        
+    // Called after the operation has completed
+    log info, 2, compute : "Compute operation nominally finished";
+
+    // If threaded, wait to signal operation completion until
+    // the compute thread has actually completed the work.  
+    //
+    // If this callback gets called BEFORE the thread is done, 
+    // it will block the entire simulation execution here until
+    // the thread has completed.  This might seem a bit clumsy,
+    // and an alternative could be to re-post the waiting event
+    // for a later time.  However, that would make the target 
+    // system behavior change depending on the speed and scheduling
+    // of threads on the host, which is not a good idea in general. 
+    //
+    #if(threaded_compute) {
+        // Before using pthread locks, make sure to drop any Simics
+        // native locks held by the thread. This is necessary to 
+        // avoid deadlocks from mixing two different sets of locks. 
+        //
+        // Since this code is called from the main Simics execution, 
+        // it does hold one or more thread domains.  
+        local domain_lock_t * dlt;
+        dlt = SIM_drop_thread_domains();
+
+        // thread locking, coordinating with the worker thread
+        // Standard idiom to wait for another thread to signal
+        // a variable. 
+        pthread_mutex_lock(&worker_thread_lock);
+        while(!worker_thread_done) {
+            pthread_cond_wait(&worker_thread_condvar, &worker_thread_lock);
+        }
+        pthread_mutex_unlock(&worker_thread_lock);
+
+        // Pick up the locks again. 
+        SIM_reacquire_thread_domains(dlt);
+
+        // Copy the results from scratch buffer to memory, 
+        // if we did indeed compute to a scratch buffer
+        // -- This includes results from a threaded computation 
+        log info, 3, compute : "Copying results from threaded compute buffer to target memory";
+        write_memory_block(current_work_descriptor.addr_px, 
+                           cast(current_scratch_buffer,uint8 *), 
+                           current_work_descriptor.count_px * sizeoftype iter_count_type );
+
+        // clean  up memory allocation for the scratch buffer
+        delete current_scratch_buffer;
+        current_scratch_buffer = NULL;
+
+        // delete the extended descriptor 
+        delete current_ted;
+        current_ted = NULL;
+    }  #else {
+
+        // For the serial case, we do the computation here.
+        // -- That means the buffer to compute into lives for zero 
+        //    simulated time, and thus it is not an issue for checkpointing. 
+        log info, 3, compute : "Doing computation inline in main thread";        
+        do_compute_work();
+    }
+
+    // Update status register 
+    // - count, done, processing  
+    log info, 2, compute : "Setting processing=0";
+    ctrl.status.processing.val = 0;
+    ctrl.status.count.val = current_work_descriptor.count_px;
+
+    // Signal the outbound signal and the done flag
+    do_set_done();
+
+    // Signal notifier, for scripting to use 
+    SIM_notify(this.obj, complete_notifier());
+}
+
+
+//----------------------------------------------------------------------
+//
+// Start the compute job - regardless of how it is being implemented
+// 
+//----------------------------------------------------------------------
+
+method start_compute_job() {
+    // Debug log 
+    log info, 3, compute : "start_compute_job called";
+
+    // When called, assume that we checked that there is no operation 
+    // in progress.  You could use assert, but an error log is nicer
+    // as it keeps Simics alive for diagnosis of the problem. 
+    if(ctrl.status.processing.val==1) {
+        log error, 1, control: 
+          "Internal inconsistency - %s called when operation in progress", qname;
+        return;
+    }
+
+    // Check a consistency issue between threading and individual pixels
+    // -- The worker thread does not support calling back in to the cell
+    //    to write individual pixels.  
+    #if(threaded_compute) {
+        if(individual_pixel_update.val==true) {
+            log error, 1, control: 
+            "Individual pixel update does not work with threading";
+            return;
+        }
+    } // End if threaded
+
+    // Read work descriptor from memory into the device-local descriptor
+    read_descriptor(&current_work_descriptor);
+
+    // Completion callback after the specified delay (in virtual time)
+    //   Same used for both threaded and serial cases
+    local double delay;
+    delay = cast(pixel_compute_time.val, double) 
+                * current_work_descriptor.width_px 
+                * current_work_descriptor.height_px    // number of pixels
+                * 1e-12;           // picoseconds conversion
+    log info, 2, compute : "Compute operation time: %.10f s", delay;
+    after delay s: compute_operation_complete();
+
+    // Set status register to indicate the operation is starting
+    ctrl.status.done.val = 0;
+    ctrl.status.processing.val = 1;
+    ctrl.status.count.val = 0;
+
+    // Kick off the work
+    //   Different function for starting a threaded job. 
+    #if(threaded_compute)  {
+        log info, 3, performance | compute : "Starting computation in offload thread";
+        do_compute_work_in_thread();
+    } 
+    #else {
+        // Do the compute in the "operation completed" callback.
+        // Doing it here only makes sense for threading - since starting it now
+        // provides a time window where the computation can happen in parallel
+        // to the main simulation. 
+        // 
+        // For the serial case, doing the computation here involves tracking
+        // additional state. Doing it in the completion callback is easier
+        // as that means everything happens in the same simulation step. 
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Ports   
+// - Incoming connections. Both methods are wrapped in the same
+//   custom interface.  
+//   - "start operation": Start a compute operation 
+//   - "clear done": Clear the done flag
+//
+// Having this as a custom interface instead of as two separate
+// signal interfaces simplifies the code as well as the setup. 
+// And avoids the need to consider raise/lower logic for signals
+// that add no value to single "do X" signals like those.  In hardware
+// it would be necessary to send in a clock pulse or something, but a
+// TLM model can abstract.
+//
+//----------------------------------------------------------------------
+port control_in "control input from the control unit" {
+    implement m_compute_control {
+
+        // Start an operation
+        method start_operation() {
+            log info, 2, control: "Received request to start compute job";
+            if (ctrl.status.processing.val == 1) {
+                // Getting to this error state requires that the
+                // external world calls start_operation() twice without
+                // completing the operation in the meantime. 
+                log spec_viol, 1, control :
+                    "Operation start request while operation in progress";
+                return;
+            } 
+
+            // Note that it is OK to start a new operation if the device
+            // is in state "done".  You can add a test here if you do not
+            // think that is a good design.  
+            start_compute_job();
+        }
+
+        method clear_done() {
+            log info, 2, control: "Received request to clear done flag";
+            // Sanity check 
+            if (ctrl.status.done.val == 0) {
+                log spec_viol, 1, control :
+                "Clear done signal received when done flag is not set.";
+                return;
+            }    
+            log info, 2, control: "Clearing done flag from signal %s", this.qname;
+            do_clear_done();
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Device control register bank 
+// - The compute unit has as a single register bank 
+//
+//-----------------------------------------------------------------------------
+bank ctrl "control registers" {
+    param documentation = "Control register bank for this " +
+                          "compute unit.";
+
+    param register_size = 8;
+    
+    // Pointing at the descriptor in memory
+    // Setting register has no side effect
+    register descriptor_addr @ 0x00 "Descriptor address";
+
+    // Status register
+    register status @ 0x08 "Compute status" {
+        field done        @ [63] is (write)       "Compute completed" ;
+        field processing  @ [62] is (read_only)   "Compute in progress" ;
+        field unused      @ [61:32] is (reserved) "unused" ; 
+        field count       @ [31:0] is (read_only) "Processed pixel count" ;
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Register bank implementation  
+// - Adding the functionality to the names and offsets declared above
+//
+//----------------------------------------------------------------------
+bank ctrl {
+    register status {
+        field done is write {
+            method write(uint64 v) {
+                if (v==1) {
+                    if(this.val==1) {
+                        do_clear_done();
+                    } else {
+                        log spec_viol, 1, control: "Attempt to clear already clear done flag";
+                    }
+                } else {
+                    log spec_viol, 1, control: "Writing zero to done has no effect";
+                }
+            }
+        }
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Logic for done flag and completion signal
+//
+//----------------------------------------------------------------------
+
+method do_set_done() {
+    log info, 2, control: "Setting done flag";
+    operation_done.signal_done();
+    ctrl.status.done.val = 1;
+}
+
+method do_clear_done() {
+    log info, 2, control: "Clearing done flag";
+    operation_done.signal_done_clear();
+    ctrl.status.done.val = 0;
+}
+
+
+//----------------------------------------------------------------------
+//
+// Device initialization 
+// 
+//----------------------------------------------------------------------
+independent startup memoized method complete_notifier() -> (notifier_type_t) {
+    // Runs at module load time to create the notifier
+    //
+    // All future calls to method will return the same value,
+    //   cached automatically in DML  
+    local notifier_type_t t = SIM_notifier_type("m-compute-complete");
+
+    SIM_register_notifier(SIM_get_class(dev.classname),
+                          t,
+                          "Triggered when the compute unit operation completes");
+
+    return t;
+}
+
+method init () {
+
+    // Initialize thread synchronization variables
+    //   For clarity, the code lives with the rest of the
+    //   threading control code earlier in this file. 
+    #if(threaded_compute) {
+        init_thread_sync();
+    }
+}
+
+

@@ -1,0 +1,181 @@
+/*
+  goldfish-rtc.dml - Goldfish virtual hardware real-time clock
+
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device goldfish_rtc;
+param classname = "goldfish-rtc";
+param desc = "goldfish virtual hardware real-time clock";
+
+import "utility.dml";
+
+is hreset;
+
+connect irq_dev is (signal_connect, hard_reset) {
+    param documentation = "RTC alarm interrupt request";
+
+    method update() {
+        set_level(cast(regs.irq_enabled.val, bool) && regs.irq_pending);
+    }
+
+    method hard_reset() {
+        default();
+        set_level(0);
+    }
+}
+
+bank regs is hard_reset {
+    param use_io_memory = false;
+    param register_size = 4;
+
+    saved uint64 current_time; // all 64 bits of current time
+    saved bool irq_pending;
+
+    method hard_reset() {
+        default();
+        current_time = 0;
+        irq_pending = false;
+    }
+
+    register time size 8        @  0x0 {
+        field low @ [31:0]
+            "Lower 32 bits of current time in ns. Reading updates register time_high";
+        field high @ [63:32]
+            "Higher 32 bits of current time in ns. Reading returns time at last read of register time_low";
+    }
+    register alarm size 8       @  0x8 {
+        field low @ [31:0]
+            "Set lower 32 bits of alarm in ns and then arm it";
+        field high @ [63:32]
+            "Set higher 32 bits of alarm in ns";
+    }
+    register irq_enabled        @ 0x10 "Enable alarm interrupt";
+    register clear_alarm        @ 0x14 "Disarm an existing alarm";
+    register alarm_status       @ 0x18 "Alarm status (armed/disarmed)";
+    register clear_interrupt    @ 0x1c "Clear interrupt";
+}
+
+method sim_time_to_ns(double time) -> (uint64) {
+    return cast(1000 * 1000 * 1000 * time, uint64);
+}
+
+bank regs {
+    register time is hard_reset {
+        method hard_reset() {
+            default();
+            this.val = initial_time.val * 1000_000_000;
+        }
+
+        method calc_current_time() -> (uint64) {
+                local double now = SIM_time(dev.obj);
+                local uint64 result = this.val + sim_time_to_ns(now);
+
+                log info, 4: "start time: %lu ns, current sim time: %lu ns, result: %lu ns",
+                    this.val, sim_time_to_ns(now), result;
+                return result;
+        }
+
+        field low is (get, read) {
+            method get() -> (uint64) {
+                return calc_current_time() & 0xffff_ffff;
+            }
+
+            method read() -> (uint64) {
+                current_time = calc_current_time();
+
+                return current_time & 0xffff_ffff;
+            }
+        }
+
+        field high is (get, read) {
+            method get() -> (uint64) {
+                return calc_current_time() >> 32;
+            }
+
+            method read() -> (uint64) {
+                return current_time >> 32;
+            }
+        }
+    }
+
+    register alarm is (write_register, hard_reset) {
+        method on_alarm() {
+            log info, 2: "Alarm triggered";
+            regs.irq_pending = true;
+            regs.alarm_status.set(0);
+            irq_dev.update();
+        }
+
+        method write_register(uint64 val, uint64 enabled_bytes, void *aux) {
+            default(val, enabled_bytes, aux);
+
+            // writing to the lower 32 bits arms the alarm
+            if ((enabled_bytes & 0xffff_ffff) != 0) {
+                cancel_after();
+                if (this.val <= time.get()) {
+                    log info, 2: "Trigger alarm now";
+                    after: on_alarm();
+                } else {
+                    local uint64 ns_remaining = this.val - time.get();
+                    log info, 2: "Trigger alarm in %lu ns", ns_remaining;
+                    after 1000 * ns_remaining ps : on_alarm();
+                }
+                regs.alarm_status.set(1);
+            }
+        }
+
+        method hard_reset() {
+            default();
+            cancel_after();
+        }
+    }
+
+    register irq_enabled is (write) {
+        method write(uint64 value) {
+            default(value);
+            irq_dev.update();
+        }
+    }
+
+    register clear_alarm is (write, write_only) {
+        method write(uint64 value) {
+            alarm_status.set(0);
+            alarm.cancel_after();
+        }
+    }
+
+    register alarm_status is (read_only) {
+    }
+
+    register clear_interrupt is (write, write_only) {
+        method write(uint64 value) {
+            irq_pending = false;
+            irq_dev.update();
+        }
+    }
+}
+
+attribute initial_time is uint64_attr {
+    param documentation = "Time at reset in seconds";
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(val);
+    }
+
+    method set(attr_value_t value) throws {
+        default(value);
+        regs.time.val = SIM_attr_integer(value) * 1000_000_000;
+    }
+}

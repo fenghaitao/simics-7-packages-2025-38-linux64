@@ -1,0 +1,383 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device sample_serial_device;
+
+parameter desc = "sample serial device";
+
+parameter documentation =
+    "The <class>" + $classname + "</class> implements a serial device.";
+
+import "utility.dml";
+import "simics/devs/serial-device.dml";
+import "simics/devs/signal.dml";
+
+struct buffer {
+    uint8 *buffer;       // pointer to buffer
+    uint32 size;         // size of buffer
+    uint32 next;         // index for next character to deliver from buffer
+    uint32 count;        // the number of characters in the buffer
+}
+
+connect console {
+    parameter documentation =
+        "Name of a console object that is used for character "
+        + "output.";
+    interface serial_device;
+    parameter configuration = "optional";
+}
+
+connect irq_dev {
+    parameter documentation = "Input characters pending interrupt.";
+    parameter configuration = "optional";
+    interface signal;
+}
+
+attribute input_buffer is (io_buffer) {
+    parameter documentation = "Input buffer.";
+    parameter io_buffer = $in_buffer;
+}
+
+attribute output_buffer is (io_buffer) {
+    parameter documentation = "Output buffer.";
+    parameter io_buffer = $out_buffer;
+}
+
+attribute irq_level {
+    parameter documentation = "Input characters pending interrupt level.";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint32";
+
+    method raise() {
+        if ($registers.mask.input != 0) {
+            if ($this == 0) {
+                if ($irq_dev.obj != NULL) {
+                    $irq_dev.signal.signal_raise();
+                }
+                $this = 1;
+            }
+        }
+    }
+
+    method lower() {
+        if ($registers.mask.input != 0) {
+            if ($this != 0) {
+                if ($irq_dev.obj != NULL) {
+                    $irq_dev.signal.signal_lower();
+                }
+                $this = 0;
+            }
+        }
+    }
+}
+
+bank registers {
+    parameter register_size = 1;
+    register rw @ 0x00 "Read/write character register";
+    register status @ 0x01 "Status register";
+    register mask @ 0x02 "Interrupt mask register";
+}
+
+implement serial_device {
+    method write(int value) -> (int count) {
+        call $receive(value);
+        count = 1;
+    }
+
+    method receive_ready() {
+        call $send_console();
+    }
+}
+
+/*
+ * Hard reset port.
+ */
+port hreset {
+    implement signal {
+        method signal_raise() {
+            call $before_hard_reset();
+            call $hard_reset();
+        }
+
+        method signal_lower() {
+            return;
+        }
+    }
+
+    method before_hard_reset() {
+        call $buffer_clear(&$in_buffer);
+        call $buffer_clear(&$out_buffer);
+    }
+}
+
+data buffer in_buffer;  // input (keyboard) buffer
+data buffer out_buffer; // output buffer (characters to send to the screen)
+
+method free_buffer(buffer *buffer) {
+    if (buffer->size != 0) {
+        delete buffer->buffer;
+        buffer->size = 0;
+    }
+}
+
+// Round up to nearest power of 2 (from hacker's delight)
+method clp2(uint32 x) -> (uint32 r)
+{
+    x = x - 1;
+    x = x | (x >> 1);
+    x = x | (x >> 2);
+    x = x | (x >> 4);
+    x = x | (x >> 8);
+    x = x | (x >> 16);
+    r = x + 1;
+}
+
+// Allocate a buffer that can hold at least nmemb elements
+method allocate_buffer(buffer *buffer, uint32 nmemb)
+{
+    local uint32 size;
+    call $clp2(nmemb) -> (size);
+    buffer->buffer = new uint8[size];
+    buffer->size = size;
+    buffer->count = 0;
+}
+
+// Copy the contents of an attr_value_t list into a buffer. The buffer must
+// be large enough to hold the contents of the list.
+method fill_buffer(attr_value_t attr_value, buffer *buffer) {
+    local uint32 nmemb = SIM_attr_list_size(attr_value);
+
+    assert buffer->size >= nmemb;
+    buffer->count = nmemb;
+    local uint32 i;
+    for (i = 0; i < nmemb; i++) {
+        buffer->buffer[i] =
+            SIM_attr_integer(SIM_attr_list_item(attr_value, i));
+    }
+}
+
+method set_buffer(attr_value_t attr_value, buffer *buffer) {
+    call $free_buffer(buffer);
+    call $allocate_buffer(buffer, SIM_attr_list_size(attr_value));
+    call $fill_buffer(attr_value, buffer);
+}
+
+method get_buffer(buffer *buffer) -> (attr_value_t attr_return) {
+    attr_return = SIM_alloc_attr_list(buffer->count);
+    local uint32 i;
+    for (i = 0; i < buffer->count; i++) {
+        SIM_attr_list_set_item(&attr_return, i,
+                               SIM_make_attr_uint64(buffer->buffer[i]));
+    }
+}
+
+/*
+ * Put a character on the input buffer. If appropriate, raises the input
+ * character interrupt.
+ */
+method receive(uint32 value) {
+    local bool full_flag;
+    call $buffer_is_full(&$in_buffer) -> (full_flag);
+    if (full_flag) {
+        call $buffer_expand(&$in_buffer);
+    }
+    call $buffer_write(&$in_buffer, value);
+    call $irq_level.raise();
+}
+
+
+/*
+ * Send as many characters as possible from the output buffer to the console.
+ */
+method send_console() {
+    while (true) {
+        local bool empty_flag;
+        call $buffer_is_empty(&$out_buffer) -> (empty_flag);
+        if (empty_flag) {
+            break;
+        }
+        local int character;
+        call $buffer_get(&$out_buffer) -> (character);
+        if ($console.obj != NULL) {
+            if ($console.serial_device.write(character) == 0) {
+                break;
+            }
+        }
+        call $buffer_remove(&$out_buffer);
+    }
+}
+
+/*
+ * A set of functions used to operate on buffer structures.
+ */
+// return true if a buffer is full
+method buffer_is_full(buffer *buffer) -> (bool full_flag) {
+    full_flag = (buffer->count == buffer->size);
+}
+
+// return true if a buffer is empty
+method buffer_is_empty(buffer *buffer) -> (bool empty_flag) {
+    empty_flag = (buffer->count == 0);
+}
+
+// write a character to a buffer, i.e. append a character to the end of a
+// buffer
+method buffer_write(buffer *buffer, int value) {
+    assert buffer->count < buffer->size;
+    local uint32 index = (buffer->next + buffer->count) % buffer->size;
+    buffer->buffer[index] = value;
+    buffer->count += 1;
+}
+
+// get the next character from a buffer without removing it
+method buffer_get(buffer *buffer) -> (int value) {
+    assert buffer->count != 0;
+    value = buffer->buffer[buffer->next];
+}
+
+// remove the next character from a buffer
+method buffer_remove(buffer *buffer) {
+    assert buffer->count != 0;
+    buffer->count -= 1;
+    buffer->next += 1;
+    if (buffer->next == buffer->size) {
+        buffer->next = 0;
+    }
+}
+
+// clear (remove all characters from) a buffer
+method buffer_clear(buffer *buffer) {
+    buffer->next = 0;
+    buffer->count = 0;
+}
+
+// increase the size of a buffer
+method buffer_expand(buffer *buffer) {
+    if (buffer->size == 0)
+        call $allocate_buffer(buffer, 32);
+    else
+        call $realloc_buffer(buffer, 2 * buffer->size);
+}
+
+method realloc_buffer(buffer *buffer, uint32 new_size) {
+    assert new_size > buffer->size;
+
+    local uint8 *new_buffer;
+    new_buffer = new uint8[new_size];
+    local uint32 i;
+    for (i = 0; i < buffer->count; i++) {
+        local uint32 j = (buffer->next + i) % buffer->size;
+        new_buffer[i] = buffer->buffer[j];
+    }
+
+    call $free_buffer(buffer);
+
+    buffer->buffer = new_buffer;
+    buffer->size = new_size;
+    buffer->next = 0;
+}
+
+template io_buffer {
+    parameter type = "[i*]";
+    parameter configuration = "optional";
+
+    method set(attr_value_t attr_value) {
+        call $set_buffer(attr_value, &$io_buffer);
+    }
+    method get() -> (attr_value_t attr_return) {
+        call $get_buffer(&$io_buffer) -> (attr_return);
+    }
+}
+
+bank registers {
+    register rw is (read_write, noalloc) {
+        parameter configuration = "pseudo";
+
+        // Write characters to the serial device (e.g. write characters to
+        // the screen).
+        method write(value) {
+            local bool full_flag;
+            call $buffer_is_full(&$out_buffer) -> (full_flag);
+            if (full_flag) {
+                call $buffer_expand(&$out_buffer);
+            }
+            call $buffer_write(&$out_buffer, value);
+            call $send_console();  // try sending it
+        }
+
+        // Read characters from the serial device (e.g. read characters from
+        // the keyboard). Returns a null character if the input buffer is
+        // empty. The status register can be used to check if anything is
+        // pending.
+        method read() -> (value) {
+            local bool empty_flag;
+            call $buffer_is_empty(&$in_buffer) -> (empty_flag);
+            if (empty_flag) {
+                value = 0;
+            } else {
+                call $buffer_get(&$in_buffer) -> (value);
+                call $buffer_remove(&$in_buffer);
+                call $irq_level.lower();
+                call $buffer_is_empty(&$in_buffer) -> (empty_flag);
+                if (!empty_flag) {
+                    call $irq_level.raise();
+                }
+            }
+        }
+
+        method set(value) {}
+        method get() -> (value) { value = 0; }
+    }
+
+    register status {
+        field reserved [7:1] is (reserved);
+        field input [0:0] is (read_only) "Input pending" {
+            parameter hard_reset_value = 0;
+
+            method read() -> (value) {
+                local bool empty_flag;
+                call $buffer_is_empty(&$in_buffer) -> (empty_flag);
+                if (empty_flag) {
+                    value = 0;
+                } else {
+                    value = 1;
+                }
+            }
+        }
+    }
+
+    register mask {
+        field reserved [7:1] is (reserved);
+        field input [0:0] is (read_write) "Input interrupt mask" {
+            parameter hard_reset_value = 0;
+
+            method write(value) {
+                if (value != $this) {
+                    if (value == 0) {
+                        call $irq_level.lower();
+                        $this = 0;
+                    } else {
+                        $this = 1;
+                        local bool empty_flag;
+                        call $buffer_is_empty(&$in_buffer) -> (empty_flag);
+                        if (!empty_flag) {
+                            call $irq_level.raise();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

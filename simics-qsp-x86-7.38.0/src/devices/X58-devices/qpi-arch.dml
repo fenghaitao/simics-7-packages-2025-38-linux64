@@ -1,0 +1,289 @@
+/*
+
+  qpi-arch.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device x58_qpi_arch;
+param classname = "x58-qpi-arch";
+
+param desc = "Intel® Core™ i7 QPI Architecture Device";
+param documentation = "Intel® QuickPath Architecture Non-Core and"
+    + " System Address Decoder Registers in the Core™ i7 processor.";
+
+param limitations = "<ul>"
+    + "<li>The device is mostly dummy.</li>"
+    + "</ul>";
+
+import "x58-common.dml";
+import "simics/devs/translator.dml";
+
+extern void VADD(...);
+extern void VADD_NODUPLICATE(...);
+extern void VREMOVE(...);
+extern void VREMOVE_FIRST_MATCH(...);
+extern void VFREE(...);
+extern void VCLEAR(...);
+extern int VLEN(...);
+extern bool VEMPTY(...);
+extern void VGET(...);
+
+
+constant MB = 1024 * 1024;
+
+is pcie_multifunction_endpoint;
+
+connect upstream_target {
+    session const pcie_port_control_interface_t *ppci;
+    session conf_object_t *dp;
+    method set_secondary_bus_number(uint8 bus) {
+        if (obj) {
+            if (!ppci) {
+                dp = SIM_object_descendant(obj, "port.downstream");
+                assert dp;
+                ppci = SIM_c_get_interface(dp, "pcie_port_control");
+                assert ppci;
+            }
+            ppci->set_secondary_bus_number(dp, bus);
+        } else {
+            log info, 2: "Can't set secondary bus number, no upstream target";
+        }
+    }
+}
+
+connect cfg_space is map_target {
+    param desc = "Downstream PCIe Config space, mapped by PCIEXBAR";
+    param configuration = "required";
+}
+
+attribute socket_id is uint64_attr;
+
+template socket_ep_config is x58_ep_config {
+    register command is (read_only) {
+        field mem { param init_val = 1; }
+        field m { param init_val = 1; }
+    }
+    register status is (read_only) {
+        field c { param init_val = 1; }
+        field fbb { param init_val = 1; }
+    }
+    register revision_id { param init_val = 0; }
+    register class_code {
+        field base_class_code { param init_val = 6; }
+    }
+    register subsystem_vendor_id { param init_val = 0x8086; }
+    register subsystem_id { param init_val = 0x8086; }
+}
+
+bank f0 is socket_ep_config {
+    param desc = "non-core registers";
+    param function = 0;
+
+    register device_id { param init_val = 0x2c41; }
+}
+
+bank f1 is socket_ep_config {
+    param desc = "system address decoder registers";
+    param function = 1;
+
+    register device_id { param init_val = 0x2c01; }
+
+    group sad {
+        register pciexbar size 8 @ 0x50 "PCIEXBAR address space";
+        register pam      size 8 @ 0x40 is unimpl;
+        register hen      size 4 @ 0x48 is unimpl;
+        register smram    size 4 @ 0x4c is unimpl;
+        group dram[i < 8] {
+            register rule       size 4 @ 0x80 + i * 4 is unimpl;
+            register interleave size 4 @ 0xc0 + i * 4 is unimpl;
+        }
+
+        register pciexbar is (abstract_base_address, post_init) {
+            param type = PCIE_Type_Mem;
+            param map_obj = mcfg.obj;
+            /* All processor registers appear on the PCI bus assigned for the
+               processor socket. Bus number is derived by the max bus range
+               setting and processor socket number. */
+            param max_bus =
+                sz.val == 0 ? 255 :
+                sz.val == 6 ? 127 :
+                sz.val == 7 ?  63 : 0;
+            param bus = max_bus - socket_id.val;
+
+            field address @ [39:20];
+            field sz      @ [3:1];
+            field enable  @ [0];
+
+            field sz is (write) {
+                method write(uint64 value) {
+                    if (value != 0 && value != 6 && value != 7) {
+                        log spec_viol: "Writing reserved value %d to %s",
+                            value, qname;
+                        return;
+                    }
+                    this.val = value;
+                }
+            }
+
+            method write_register(uint64 val, uint64 bytes, void *aux) {
+                default(val, bytes, aux);
+                after_write();
+            }
+
+            method post_init() {
+                if (!SIM_is_restoring_state(obj))
+                    after_write();
+            }
+
+            method after_write() {
+                update_map();
+                if (bus > 0)
+                    upstream_target.set_secondary_bus_number(bus);
+            }
+
+            method enabled() -> (bool) {
+                return enable.val && max_bus != 0;
+            }
+
+            method get_map_info() -> (map_info_t) {
+                local map_info_t nfo;
+                nfo.length = (max_bus + 1) * MB;
+                nfo.priority = socket_id.val;
+                nfo.base = (address.val << 20) & ~(nfo.length - 1);
+                if (nfo.base != (address.val << 20)) {
+                    log spec_viol: "%s (0x%x) not aligned to size 0x%x",
+                        address.qname, address.val << 20, nfo.length;
+                }
+                return nfo;
+            }
+        }
+    }
+}
+
+typedef struct {
+    transaction_t t;
+    atom_t atoms[4];
+} pcie_transaction_t;
+
+port mcfg {
+    implement transaction_translator {
+        method translate(uint64 addr,
+                         access_t access,
+                         transaction_t *prev,
+                         exception_type_t (*callback)(translation_t translation,
+                                                      transaction_t *transaction,
+                                                      cbdata_call_t cbdata),
+                         cbdata_register_t cbdata) -> (exception_type_t) {
+            /* PCIEXBAR expects Device ID in address bits [27:12] while PCIe
+               config space has them on [31:16] */
+            local translation_t txl;
+            txl.base[27:12] = addr[27:12];
+            txl.start[31:16] = addr[27:12];
+            txl.size = 1 << 12;
+            txl.target = cfg_space.map_target;
+
+            local pcie_transaction_t pt;
+            pt.t.atoms = pt.atoms;
+            pt.t.prev = prev;
+
+            pt.atoms[0] = ATOM_pcie_type(PCIE_Type_Cfg);
+            pt.atoms[1] = ATOM_owner(dev.obj);
+            pt.atoms[2] = ATOM_completion(&empty_completion);
+            pt.atoms[3] = ATOM_list_end(0);
+            local exception_type_t exc = callback(txl, &pt.t, cbdata);
+            if (exc == Sim_PE_Deferred) {
+                local pcie_transaction_t *new_pt = new pcie_transaction_t;
+                memcpy(new_pt->atoms, pt.atoms, sizeof(pt.atoms));
+                new_pt->t.atoms = new_pt->atoms;
+                new_pt->t.atoms[2] = ATOM_completion(&completion);
+                new_pt->t.prev = prev;
+                SIM_replace_transaction(&pt.t, &new_pt->t);
+                VADD(chained_transactions.val, new_pt);
+                return SIM_monitor_chained_transaction(&new_pt->t, exc);
+            } else {
+                // Cannot return exc directly here. If the parent transaction_t
+                // has a completion atom that it expects to be called,
+                // it will only be called if SIM_monitor_chained_transaction
+                // is called by this transaction.
+                return SIM_monitor_chained_transaction(&pt.t, exc);
+            }
+        }
+    }
+}
+
+method empty_completion(transaction_t *t, exception_type_t e)
+    -> (exception_type_t) {
+    return e;
+}
+method completion(transaction_t *t,
+                  exception_type_t e) -> (exception_type_t) {
+    local pcie_transaction_t *pt = cast(t, pcie_transaction_t *);
+    VREMOVE_FIRST_MATCH(chained_transactions.val, pt);
+    delete pt;
+    return e;
+}
+
+attribute chained_transactions {
+    param type = "[i*]";
+    param internal = true;
+    session pcie_transaction_t * vect val;
+
+    method set(attr_value_t value) throws {
+        if (!SIM_is_restoring_state(obj)) {
+            SIM_attribute_error("must only be set during checkpoint restore");
+            throw;
+        }
+
+        for (local int i = 0; i < VLEN(this.val); i++)
+            delete this.val[i];
+
+        VFREE(this.val);
+
+        for (local int i = 0; i < SIM_attr_list_size(value); i++) {
+            local attr_value_t li = SIM_attr_list_item(value, i);
+            local int64 id = SIM_attr_integer(SIM_attr_list_item(li, 0));
+
+            local pcie_transaction_t *pt = new pcie_transaction_t;
+            pt->t.atoms = pt->atoms;
+            pt->atoms[0] = ATOM_pcie_type(PCIE_Type_Cfg);
+            pt->atoms[1] = ATOM_owner(dev.obj);
+            pt->atoms[2] = ATOM_completion(&completion);
+            pt->atoms[3] = ATOM_list_end(0);
+
+            VADD(this.val, pt);
+            SIM_reconnect_transaction(&pt->t, id);
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(this.val));
+        for (local int i = 0; i < VLEN(this.val); i++) {
+            local attr_value_t li = SIM_make_attr_list(
+                1,
+                SIM_make_attr_uint64(SIM_get_transaction_id(&this.val[i]->t)));
+            SIM_attr_list_set_item(&value, i, li);
+        }
+        return value;
+    }
+
+    method destroy() {
+        // Deferred transactions are completed by Simics Core, we just need to
+        // free the vect
+        VFREE(this.val);
+    }
+}
+method destroy() {
+    chained_transactions.destroy();
+}

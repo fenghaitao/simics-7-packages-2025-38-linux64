@@ -1,0 +1,406 @@
+/*
+  virtio-mmio-common.dml
+
+  © 2020 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/* Implementation of common virtio device functionality:
+   - Virtqeues
+   - Common MMIO registers
+   - Interrupts
+
+   Only the legacy device interface is supported, and only for little endian
+   guests (in the legacy interface many memory structures use guest endian, but
+   we currently always use little endian).
+
+   The virtio specification is available here:
+   https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html
+
+   However, the Linux kernel does not entirely follow the specification, so
+   when they differ we make some exceptions for the Linux kernel. */
+
+dml 1.4;
+
+import "virtio-common.dml";
+import "simics/devs/memory-space.dml";
+
+// We need soft reset.
+
+is sreset;
+
+method soft_reset() {
+    log info, 4, virtio: "Soft reset triggered.";
+    default();
+    // Trigger an interrupt update.
+    mmio.interrupt_status.set(
+        mmio.interrupt_status.get());
+}
+
+connect irq {
+    param configuration = "required";
+    param documentation = "interrupt signal target";
+
+    interface signal;
+
+    method set_state(bool raised) {
+        saved bool is_raised = false;
+
+        if (raised != is_raised) {
+            if (raised) {
+                log info, 4, virtio: "Raising interrupt.";
+                signal.signal_raise();
+            } else {
+                log info, 4, virtio: "Lowering interrupt.";
+                signal.signal_lower();
+            }
+            is_raised = raised;
+        }
+    }
+}
+
+// Physical memory.
+connect phys_mem {
+    param configuration = "required";
+    param documentation = "physical memory space";
+
+    interface memory_space;
+
+    // It is hard to handle all the ways that things could go wrong after a
+    // failed read, so we bail out by throwing an exception.
+
+    method read(physical_address_t addr, physical_address_t len, void *buf) throws {
+        local exception_type_t exc = memory_space.access_simple(
+            dev.obj, addr, buf, len, Sim_RW_Read, Sim_Endian_Target);
+        if (exc != Sim_PE_No_Exception) {
+            log error, 1, virtio:
+                "Failed to read 0x%llx bytes at 0x%llx.", len, addr;
+            throw;
+        }
+    }
+
+    method write(physical_address_t addr, physical_address_t len, void *buf) throws {
+        local exception_type_t exc = memory_space.access_simple(
+            dev.obj, addr, buf, len, Sim_RW_Write, Sim_Endian_Target);
+        if (exc != Sim_PE_No_Exception) {
+            log error, 1, virtio:
+                "Failed to write 0x%llx bytes at 0x%llx.", len, addr;
+            throw;
+        }
+    }
+}
+
+// Templates for registers whose contents are queue-dependent
+template virtq_reg is register {
+    param configuration = "none";
+    param selector_reg;
+
+    // Avoid having the saved array be part of the template type,
+    // so that its size may depend on num_queues.
+    // This is a workaround for SIMICS-18391.
+    #if (true) {
+        saved uint32 vals[NUM_QUEUES];
+    }
+
+
+    method init() default {
+        for (local uint64 i = 0; i < NUM_QUEUES; ++i) {
+            vals[i] = init_val;
+        }
+    }
+
+    // Get and set the value for the specified virtqueue
+    shared method get_for_virtq(uint32 idx) -> (uint32);
+    method get_for_virtq(uint32 idx) -> (uint32) default {
+        return vals[idx];
+    }
+
+    shared method set_for_virtq(uint32 idx, uint32 value);
+    method set_for_virtq(uint32 idx, uint32 value) default {
+        vals[idx] = value;
+    }
+
+    // Get and set the value of the currently selected bank.
+    method get_selected() -> (uint32) {
+        return get_for_virtq(selector_reg.val);
+    }
+
+    method set_selected(uint32 value) {
+        set_for_virtq(selector_reg.val, value);
+    }
+}
+
+template banked_read is read {
+    method read() -> (uint64) default {
+        return this.get_selected();
+    }
+}
+
+template banked_write is write {
+    method write(uint64 value) default {
+        this.set_selected(value);
+    }
+}
+
+template virtq_reg_selector is selector_reg {
+    param num_banks = NUM_QUEUES;
+}
+
+
+// Common registers for virtio MMIO devices.
+template mmio_virtio_device is virtio_device {
+    param device_id_val : uint32;
+    param config_regs_offset = 0x100;
+
+    group virtqs[i < NUM_QUEUES] is virtq_mmio {
+        param virtio_dev = cast(this.parent, virtio_device);
+        param virtq_idx = i;
+    }
+
+    method get_virtq(uint16 virtq_idx) -> (virtq) {
+        if (virtq_idx > NUM_QUEUES) {
+            log error, 1, virtio: "get_virtq: out-of-bounds virtq_idx %u",
+                virtq_idx;
+            virtq_idx = 0;
+        }
+        return cast(virtqs[virtq_idx], virtq);
+    }
+
+    bank mmio {
+
+        param register_size = 4;
+
+        register magic_value        @ 0x00 "MagicValue";
+        register version            @ 0x04 "Version";
+        register device_id          @ 0x08 "DeviceID";
+        register vendor_id          @ 0x0c "VendorID";
+        register host_features      @ 0x10 "HostFeatures";
+        register host_features_sel  @ 0x14 "HostFeaturesSel";
+        register guest_features     @ 0x20 "GuestFeatures";
+        register guest_features_sel @ 0x24 "GuestFeaturesSel";
+        register guest_page_size    @ 0x28 "GuestPageSize";
+        register queue_sel          @ 0x30 "QueueSel";
+        register queue_num_max      @ 0x34 "QueueNumMax";
+        register queue_num          @ 0x38 "QueueNum";
+        register queue_align        @ 0x3c "QueueAlign";
+        register queue_pfn          @ 0x40 "QueuePFN";
+        register queue_notify       @ 0x50 "QueueNotify";
+        register interrupt_status   @ 0x60 "InterruptStatus";
+        register interrupt_ack      @ 0x64 "InterruptAck";
+        register status             @ 0x70 "Status";
+
+        register magic_value is (read, read_only) {
+            param init_val = 0x74726976;
+        }
+
+        register version is (read, read_only) {
+            param init_val = 0x1;
+        }
+
+        register device_id is (read, read_only) {
+            param init_val = device_id_val;
+        }
+
+        register vendor_id is (read, read_only) {
+            param init_val = 0x00001af4;
+        }
+
+        register host_features is (read, read_only) {
+            param configuration = "pseudo";
+            method read() -> (uint64) {
+                return features.feature[host_features_sel.val].val;
+            }
+            method get() -> (uint64) {
+                return features.feature[host_features_sel.val].val;
+            }
+            method set(uint64 value) {
+                features.feature[host_features_sel.val].val = value;
+            }
+        }
+
+        register host_features_sel is selector_reg;
+
+        register guest_features is (read, write) {
+            param configuration = "pseudo";
+            method write(uint64 value) {
+                features.feature_enable[guest_features_sel.val].val = value;
+            }
+            method set(uint64 value) {
+                features.feature_enable[guest_features_sel.val].val = value;
+            }
+            method read() -> (uint64) {
+                return features.feature_enable[guest_features_sel.val].val;
+            }
+            method get() -> (uint64) {
+                return features.feature_enable[guest_features_sel.val].val;
+            }
+        }
+
+        register guest_features_sel is selector_reg;
+
+        register guest_page_size is (write, write_only) {
+            method write(uint64 value) {
+                if (!is_power_of_2(value)) {
+                    log spec_viol, 1, virtio:
+                        "Write of invalid guest page size 0x%llx"
+                        + " ignored.", value;
+                } else
+                    default(value);
+            }
+        }
+
+        register queue_sel is virtq_reg_selector;
+
+        in each virtq_reg {
+            param selector_reg = queue_sel;
+        }
+
+        register queue_num_max is (virtq_reg, banked_read, read_only) {
+            param init_val = QUEUE_NUM_MAX;
+        }
+
+        register queue_num is (virtq_reg, banked_write, write_only) {
+            method write(uint64 value) {
+                if (value > queue_num_max.get_selected()) {
+                    log spec_viol, 1, virtio:
+                        "Attempt to enable more virtqueue descriptors"
+                        + " than supported ignored.";
+                } else
+                    default(value);
+            }
+        }
+
+        register queue_align is (virtq_reg, banked_write, write_only) {
+            method write(uint64 value) {
+                if (!is_power_of_2(value)) {
+                    log spec_viol, 1, virtio:
+                        "Write of invalid queue alignment 0x%llx"
+                        + " ignored.", value;
+                } else {
+                    default(value);
+                }
+            }
+        }
+
+        register queue_pfn is (virtq_reg, banked_read, banked_write) {
+            method read() -> (uint64) {
+                // QueuePfn should be write-only according to the specification but
+                // Linux kernel 5.4.0 reads it, so let's allow reads.
+                log spec_viol, 2, virtio: "Read of write-only register QueuePFN.";
+                return default();
+            }
+        }
+
+        register queue_notify is (write, write_only) {
+            param configuration = "none";
+
+            method write(uint64 value) {
+                // Check for requests in the notified virtqueue
+                if (value >= NUM_QUEUES) {
+                    log spec_viol, 1 then 2, virtio:
+                    "Queue notify to nonexistent virtqueue %u",
+                        value;
+                } else {
+                    try
+                        handle_notify(value);
+                    catch
+                        log error, 1, virtio:
+                            "Error while processing notification.";
+                }
+            }
+        }
+
+        register interrupt_status is (read, read_only) {
+            method set(uint64 value) {
+                default(value);
+                irq.set_state(get() != 0);
+            }
+        }
+
+        register interrupt_ack is (write, write_only) {
+            param configuration = "none";
+
+            method write(uint64 value) {
+                interrupt_status.set(interrupt_status.get() & ~value);
+            }
+        }
+
+        register status is (read, write) {
+            method write(uint64 value) {
+                if (value == 0) {
+                    dev.soft_reset();
+                } else {
+                    default(value);
+                }
+            }
+        }
+    }
+
+    method sys_mem_read(uint64 addr, size_t len, void *buf) throws {
+        phys_mem.read(addr, len, buf);
+    }
+
+    method sys_mem_write(uint64 addr, size_t len, void *buf) throws {
+        phys_mem.write(addr, len, buf);
+    }
+}
+
+template virtq_mmio is virtq {
+    method desc_table_address() -> (uint64) {
+        local uint64 page_size;
+        if (mmio.guest_page_size.val == 0x0) {
+            // The specification says that GuestPageSize should be used when
+            // calculating the descriptor table address in legacy devices,
+            // however, Linux kernel 5.4.0 does not set GuestPageSize so we use
+            // QueueAlign instead in that case.
+            log spec_viol, 2 then 5, virtio:
+                "GuestPageSize not set, using QueueAlign instead.";
+            page_size = mmio.queue_align.vals[virtq_idx];
+        } else {
+            page_size = mmio.guest_page_size.val;
+        }
+        return mmio.queue_pfn.vals[virtq_idx] * page_size;
+    }
+
+    method avail_ring_address() -> (uint64) {
+        local uint64 desc_table_size =
+            mmio.queue_num.vals[virtq_idx] *
+            sizeoftype(virtq_desc_t);
+        return desc_table_address() + desc_table_size;
+    }
+
+    method used_ring_address() -> (uint64) {
+        local uint64 align_mask = (
+            mmio.queue_align.vals[virtq_idx] - 1);
+        local uint64 avail_ring_size =
+            (3 + mmio.queue_num.vals[virtq_idx]) *
+             sizeoftype(uint16);
+        return ((avail_ring_address() + avail_ring_size + align_mask)
+                & ~align_mask);
+    }
+
+    method num_descs() -> (uint32) {
+        return mmio.queue_num.vals[virtq_idx];
+    }
+
+    method interrupt_driver() throws {
+        local ring_info_t avail_ring_info;
+        avail_ring_info = get_avail_ring_info();
+        // Raise the interrupt only if the driver has not disabled all
+        // notifications.
+        if ((avail_ring_info.flags & VIRTQ_AVAIL_F_NO_INTERRUPT) == 0x0) {
+            mmio.interrupt_status.set(
+                mmio.interrupt_status.get() | 0x1);
+        } else {
+            log info, 4, virtio: "Interrupt skipped.";
+        }
+    }
+}

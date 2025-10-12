@@ -1,0 +1,93 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device sample_pcie_sriov_device;
+param desc = "sample PCIe SR-IOV";
+param documentation = "A sample PCI Express SR-IOV device.";
+
+import "pcie/common.dml";
+import "pf0.dml";
+import "pf5.dml";
+
+is pcie_multifunction_endpoint;
+
+constant TOTAL_VFS = 6;
+constant MSIX_VECTORS = 64 * 2;
+
+template physical_function is type_0_bank {
+    register vendor_id {
+        param init_val = 0x104C;  // Texas Instruments
+    }
+    register device_id {
+        param init_val = 0xAC10;  // PC Card Controller
+    }
+
+    register base_address_01 @ 0x10 is memory_base_address_64;
+    register base_address_45 @ 0x20 is memory_base_address_64 {
+        param size_bits = 20;
+    }
+
+    register capabilities_ptr {
+        param init_val = msix_offset;
+    }
+
+    is defining_msix_capability;
+    param msix_offset = 0x70;
+    param msix_next_ptr = 0;
+    param msix_num_vectors = MSIX_VECTORS;
+    param msix_table_offset_bir = 0x1000;
+    param msix_pba_offset_bir   = 0x5000;
+
+    is defining_ari_capability;
+    param ari_offset = 0x100;
+    param ari_next_ptr = sriov_offset;
+
+    is defining_sriov_capability;
+    param sriov_offset = 0x160;
+    param sriov_next_ptr = 0;
+    group sriov {
+        register vf_bar_01 @ base + 0x24 is vf_bar_64 "VF BAR0-1";
+        register vf_bar_45 @ base + 0x34 is vf_bar_64 "VF BAR4-5" {
+            param size_bits = 20;
+        }
+        register vf_device_id {
+            param init_val = 0xabcd;
+        }
+        method get_offset() -> (uint16) {
+            return 0x100;  // keep VFs away from PFs
+        }
+        method get_stride() -> (uint16) {
+            return 0x10;  // produce human-decodable address
+        }
+    }
+
+}
+
+template virtual_function is vf_type_0_bank {
+    register capabilities_ptr {
+        param init_val = msix_offset;
+    }
+
+    is defining_sriov_msix_capability;
+    param msix_offset = 0x70;
+    param msix_next_ptr = 0;
+    param msix_num_vectors = MSIX_VECTORS;
+    param msix_table_offset_bir = 0x1000;
+    param msix_pba_offset_bir   = 0x5000;
+
+    is defining_sriov_ari_capability;
+    param ari_offset = 0x100;
+    param ari_next_ptr = 0x0;
+}

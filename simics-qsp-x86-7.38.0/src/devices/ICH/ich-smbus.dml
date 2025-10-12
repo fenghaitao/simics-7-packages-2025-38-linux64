@@ -1,0 +1,180 @@
+/*
+  ich-smbus.dml - SMBus
+
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+param uses_i2c_v2               = false;
+import "ich-smbus-common.dml";
+
+implement i2c_master {
+    method bus_freed() {
+        log info, 4: "i2c master IF: SMBus freed";
+        smbus_func.ma_event.val = SMBus_Master_Ev_Bus_Freed;
+        smbus_func.proc_cmd_event.post(0.0);
+    }
+
+    method start_response(i2c_status_t status) {
+        log info, 4:
+            "i2c master IF: a start response with a status %d",status;
+        smbus_func.ma_event.val = SMBus_Master_Ev_Start_Response;
+        smbus_func.ma_start_res.val = cast(status, uint8);
+        smbus_func.proc_cmd_event.post(0.0);
+    }
+
+    method read_response(uint8 value) {
+        log info, 4:
+            "i2c master IF: a read response with 0x%02x", value;
+        smbus_func.ma_event.val = SMBus_Master_Ev_Read_Response;
+        smbus_func.ma_read_byte.val = value;
+        smbus_func.proc_cmd_event.post(0.0);
+    }
+
+    method ack_read_response() {
+        log info, 4: "i2c master IF: a read response acknowledge";
+        smbus_func.ma_event.val = SMBus_Master_Ev_Ack_Read_Response;
+        smbus_func.proc_cmd_event.post(0.0);
+    }
+
+    method write_response(i2c_status_t status) {
+        log info, 4:
+            "i2c master IF: a write response with a status %d", status;
+        smbus_func.ma_event.val = SMBus_Master_Ev_Write_Response;
+        smbus_func.ma_write_res.val = cast(status, uint8);
+        smbus_func.proc_cmd_event.post(0.0);
+    }
+}
+
+implement i2c_slave {
+    method start_request(uint32 address) {
+        log info, 4:
+            "i2c slave IF: a start request with an address 0x%x", address;
+        if ((address >> 1) != smbus_func.rcv_slva.val) {
+            log spec_viol, 3:
+                "slave addr 0x%0x is not the addr of SMBus controller 0x%x",
+                (address >> 1), smbus_func.rcv_slva.val;
+            smbus.i2c_link.start_response(dev.obj, I2C_status_noack);
+        } else {
+            if (smbus_func.sl_state.val != SMBus_Slave_St_Idle) {
+                log spec_viol, 3:
+                    "slave state %d is not idle state when a start request",
+                    smbus_func.sl_state.val;
+            }
+            smbus.i2c_link.start_response(dev.obj, I2C_status_success);
+            smbus_func.sl_state.val = SMBus_Slave_St_Started;
+        }
+    }
+
+    method read_request() {
+        log info, 4: "i2c slave IF: a read request";
+        // No data to be read, so always gives 0
+        if (smbus_func.sl_state.val != SMBus_Slave_St_Started) {
+            log spec_viol, 3:
+                "slave state %d is not started when a read request",
+                smbus_func.sl_state.val;
+        }
+        smbus.i2c_link.read_response(dev.obj, 0);
+    }
+
+    method ack_read_request(i2c_status_t ack) {
+        log info, 4: "i2c slave IF: a ack read request";
+        if (smbus_func.sl_state.val != SMBus_Slave_St_Started) {
+            log spec_viol, 3:
+                "slave state %d is not started when an ack read request",
+                smbus_func.sl_state.val;
+        }
+        smbus.i2c_link.ack_read_response(dev.obj);
+        smbus_func.sl_state.val = SMBus_Slave_St_Idle;
+    }
+
+    method write_request(uint8 value) {
+        log info, 4:
+            "i2c slave IF: a write request with a byte 0x%x", value;
+        if (smbus_func.sl_state.val != SMBus_Slave_St_Started) {
+            log spec_viol, 3:
+                "slave state %d is not started when a write request",
+                smbus_func.sl_state.val;
+        }
+        smbus_func.sl_wr_repeats.val++;
+        if (smbus_func.sl_wr_repeats.val == 1)
+            smbus_func.slv_data.data_msg0.val = value;
+        else {
+            smbus_func.slv_data.data_msg1.val = value;
+            smbus_func.sl_wr_repeats.val = 0;
+        }
+        smbus.i2c_link.write_response(dev.obj, I2C_status_success);
+    }
+
+    method stop(uint8 repeated_start) {
+        log info, 4:
+            "i2c slave IF: a stop which is %s",
+            (repeated_start == 1) ? "that caused by a repeated start"
+                                  : "a normal stop";
+        smbus_func.sl_state.val = SMBus_Slave_St_Idle;
+    }
+}
+
+connect smbus {
+    param documentation = "The I2C-bus.";
+    param configuration = "required";
+    interface i2c_link {
+        param required = true;
+    }
+
+    method validate(conf_object_t *obj) -> (bool) {
+        if (smbus.obj != NULL)
+            smbus.i2c_link.unregister_slave_address(
+                dev.obj, smbus_func.rcv_slva.val << 1, 0xFFFFFFFE);
+        return true;
+    }
+
+    method set(conf_object_t *obj) {
+        default(obj);
+        if (smbus.obj != NULL)
+            smbus.i2c_link.register_slave_address(
+                dev.obj, smbus_func.rcv_slva.val << 1, 0xFFFFFFFE);
+    }
+}
+
+bank smbus_func {
+    method i2c_start(uint8 addr) {
+        smbus.i2c_link.start_request(dev.obj, addr);
+    }
+
+    method i2c_restart(uint8 addr) {
+        smbus.i2c_link.stop(dev.obj);
+        smbus.i2c_link.start_request(dev.obj, addr);
+    }
+    
+    method i2c_write(uint8 value) {
+        smbus.i2c_link.write_request(dev.obj, value);
+    }
+
+    method i2c_read() {
+        smbus.i2c_link.read_request(dev.obj);
+    }
+
+    method i2c_stop() {
+        smbus.i2c_link.stop(dev.obj);
+    }
+
+    method i2c_on_read_request() {
+        // Send the acknowledge of read request to the slave device
+        log info, 4:
+            "send the ack of read response to slave %d",
+            xmit_slva.ADDRESS.val;
+        smbus.i2c_link.ack_read_request(dev.obj, I2C_status_success);
+        ma_state.val = SMBus_Master_St_Read_Ack_Requested;
+    }
+}

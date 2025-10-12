@@ -1,0 +1,227 @@
+/*
+  virtio-blk-common.dml
+
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "simics/model-iface/image.dml";
+
+param SECTOR_SIZE = 512;
+
+// The number of image connectors to create
+param BLK_N_IMAGES default undefined;
+
+// Block device feature bits
+param VIRTIO_BLK_F_SIZE_MAX     = 1;
+param VIRTIO_BLK_F_SEG_MAX      = 2;
+param VIRTIO_BLK_F_GEOMETRY     = 4;
+param VIRTIO_BLK_F_RO           = 5;
+param VIRTIO_BLK_F_BLK_SIZE     = 6;
+param VIRTIO_BLK_F_FLUSH        = 9;
+param VIRTIO_BLK_F_TOPOLOGY     = 10;
+param VIRTIO_BLK_F_CONFIG_WCE   = 11;
+param VIRTIO_BLK_F_MQ           = 12;
+param VIRTIO_BLK_F_DISCARD      = 13;
+param VIRTIO_BLK_F_WRITE_ZEROES = 14;
+param VIRTIO_BLK_F_LIFETIME     = 15;
+param VIRTIO_BLK_F_SECURE_ERASE = 16;
+param VIRTIO_BLK_F_ZONED        = 17;
+
+// Block device request types.
+param VIRTIO_BLK_T_IN           =  0;
+param VIRTIO_BLK_T_OUT          =  1;
+param VIRTIO_BLK_T_FLUSH        =  4;
+param VIRTIO_BLK_T_GET_ID       =  8;
+param VIRTIO_BLK_T_DISCARD      = 11;
+param VIRTIO_BLK_T_WRITE_ZEROES = 13;
+
+// Block device request statuses.
+param VIRTIO_BLK_S_OK     = 0;
+param VIRTIO_BLK_S_IOERR  = 1;
+param VIRTIO_BLK_S_UNSUPP = 2;
+
+// Block device request header.
+typedef layout "little-endian" {
+    uint32 type;
+    uint32 reserved;
+    uint64 sector;
+} virtio_blk_req_t;
+
+#if(defined(BLK_N_IMAGES)) {
+connect image[i < BLK_N_IMAGES] {
+    param configuration = "required";
+    param documentation = "disk image";
+
+    interface image;
+
+    method set(conf_object_t *obj) {
+        default(obj);
+        image.set_persistent();
+    }
+}
+} #else {
+connect image {
+    param configuration = "required";
+    param documentation = "disk image";
+
+    interface image;
+
+    method set(conf_object_t *obj) {
+        default(obj);
+        image.set_persistent();
+    }
+}
+}
+
+method image_obj(uint32 index) -> (conf_object_t *) {
+#if(defined(BLK_N_IMAGES)) {
+    return image[index].obj;
+} #else {
+    return image.obj;
+}
+}
+
+method image_size(uint32 index) -> (uint64) {
+#if(defined(BLK_N_IMAGES)) {
+    return image[index].image.size();
+} #else {
+    return image.image.size();
+}
+}
+
+method image_read(uint32 index, uint8 *buffer, uint64 offset, uint64 len) {
+#if(defined(BLK_N_IMAGES)) {
+    image[index].image.read(buffer, offset, len);
+} #else {
+    image.image.read(buffer, offset, len);
+}
+}
+
+method image_write(uint32 index, uint8 *buffer, uint64 offset, uint64 len) {
+#if(defined(BLK_N_IMAGES)) {
+    image[index].image.write(buffer, offset, len);
+} #else {
+    image.image.write(buffer, offset, len);
+}
+}
+
+template virtio_blk_regs {
+    param config_regs_offset : uint64;
+    param len = 8;
+
+    register capacity size 8 @  config_regs_offset "Capacity";
+
+    register capacity is (read, read_only) {
+        method read() -> (uint64) {
+            if (image_obj(function_index) == NULL) {
+                log error: "No image set for virtual function with index %d."
+                    + " Can't report size.", function_index;
+                return 0;
+            }
+            return image_size(function_index) / SECTOR_SIZE;
+        }
+    }
+}
+
+template virtio_blk_device {
+    param NUM_QUEUES = 1;
+
+    method handle_notify(uint16 virtq_idx) throws {
+        request_q_handler.handle_notify(virtq_idx);
+    }
+
+    group request_q_handler is virtq_request_handler {
+        // Handle the request in the supplied descriptor list and return the number of
+        // used bytes.
+        method process_request(virtq_desc_list_t *desc_list) ->
+                (uint32) throws {
+            if (image_obj(function_index) == NULL) {
+                log error: "No image set for virtual function with index %d."
+                    + " Can't handle I/O request.", function_index;
+                throw;
+            }
+
+            local virtio_blk_req_t req;
+            local uint8 status = VIRTIO_BLK_S_OK;
+            virtq_desc_data_read(desc_list, 0, sizeof(req), &req);
+            local uint32 header_len = sizeof(req);
+            local uint32 data_len = desc_list->len - header_len -
+                                    sizeof(status);
+            local uint16 used = 0;
+
+            local uint8 *buf = new uint8[data_len];
+            try {
+                if (req.type == VIRTIO_BLK_T_IN) {
+                    image_read(function_index, buf, req.sector * SECTOR_SIZE, data_len);
+                    virtq_desc_data_write(desc_list, header_len, data_len, buf);
+                    used += data_len;
+                } else if (req.type == VIRTIO_BLK_T_OUT) {
+                    virtq_desc_data_read(desc_list, header_len, data_len, buf);
+                    image_write(function_index, buf, req.sector * SECTOR_SIZE, data_len);
+                } else if (req.type == VIRTIO_BLK_T_GET_ID) {
+                    local const char *str = "Simics Virtio Block";
+                    assert(strlen(str) < 21);
+                    if (data_len < 20) {
+                        log spec_viol: "Supplied buffer is too small for"
+                            + " VIRTIO_BLK_T_GET_ID request"
+                            + " (%d bytes, 20 required)", data_len;
+                        throw;
+                    }
+                    virtq_desc_data_write(desc_list, header_len, data_len, str);
+                } else {
+                    status = VIRTIO_BLK_S_UNSUPP;
+                    used = 0;
+                    log unimpl, 1: "Unsupported request type %d.", req.type;
+                }
+                delete buf;
+            } catch {
+                delete buf;
+                throw;
+            }
+
+            virtq_desc_data_write(desc_list, header_len + data_len,
+                                  sizeof(status), &status);
+            used += sizeof(status);
+            return used;
+        }
+    }
+}
+
+template virtio_feature_bit_strings_blk is virtio_feature_bit_strings {
+    method feature_bit_to_string(uint64 feature_bit) -> (const char *) {
+        switch (feature_bit) {
+        case VIRTIO_BLK_F_SIZE_MAX:     return "VIRTIO_BLK_F_SIZE_MAX";
+        case VIRTIO_BLK_F_SEG_MAX:      return "VIRTIO_BLK_F_SEG_MAX";
+        case VIRTIO_BLK_F_GEOMETRY:     return "VIRTIO_BLK_F_GEOMETRY";
+        case VIRTIO_BLK_F_RO:           return "VIRTIO_BLK_F_RO";
+        case VIRTIO_BLK_F_BLK_SIZE:     return "VIRTIO_BLK_F_BLK_SIZE";
+        case VIRTIO_BLK_F_FLUSH:        return "VIRTIO_BLK_F_FLUSH";
+        case VIRTIO_BLK_F_TOPOLOGY:     return "VIRTIO_BLK_F_TOPOLOGY";
+        case VIRTIO_BLK_F_CONFIG_WCE:   return "VIRTIO_BLK_F_CONFIG_WCE";
+        case VIRTIO_BLK_F_MQ:           return "VIRTIO_BLK_F_MQ";
+        case VIRTIO_BLK_F_DISCARD:      return "VIRTIO_BLK_F_DISCARD";
+        case VIRTIO_BLK_F_WRITE_ZEROES: return "VIRTIO_BLK_F_WRITE_ZEROES";
+        case VIRTIO_BLK_F_LIFETIME:     return "VIRTIO_BLK_F_LIFETIME";
+        case VIRTIO_BLK_F_SECURE_ERASE: return "VIRTIO_BLK_F_SECURE_ERASE";
+        case VIRTIO_BLK_F_ZONED:        return "VIRTIO_BLK_F_ZONED";
+        default:                        return default(feature_bit);
+        }
+    }
+}
+
+is virtio_feature_bit_strings_blk;
+in each (virtio_device) {
+    is virtio_feature_bit_strings_blk;
+}

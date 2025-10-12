@@ -1,0 +1,86 @@
+Intel (r) VT-d Hardware Test Description
+========================================
+
+Included Cases
+--------------
+The Intel (r) VT-d hardware test totally includes 9 cases:
+(1) s-vtd-reset.py: tests default state of the Intel (r) VT-d hardware after
+    a RESET
+(2) s-vtd-remap-dma.py: tests the remapping of DMA requests from different
+    devices on different PCI buses assigned to different domains.
+(3) s-vtd-switch-domain.py: tests the switching from one domain to another
+    just simulating multiple guest software are running on the VMM.
+(4) s-vtd-remap-int.py: tests the remapping of interrupt requests from
+    different devices on different PCI buses under different remapping
+    parameters.
+(5) s-vtd-inv-cache.py: tests the invalidation of kinds of caches
+    in the Intel (r) VT-d hardware through the register or queue interface.
+(6) s-vtd-fault-event.py: tests the reporting of events in the Intel (r) VT-d.
+(7) s-vtd-log-fault.py: tests the logging of fault events in the Intel (r) VT-d
+    in the primary or advanced log mode.
+(8) s-vtd-protect-mem.py: tests the protecting of low and upper memory
+    regions of host memory by the Intel (r) VT-d hardware.
+(9) s-vtd-bound-cond.py: tests the boundary conditions which won't happen
+    and be tested in above 8 cases.
+
+
+Not Tested Features
+-------------------
+(1) Currently the device-IOTLB invalidation is not tested for unknown
+    how to do it.
+(2) Currently the cache invalidation test is disabled for the vtd model
+    doesn't cache anything.
+(3) Currently the DMA remapping test can pass on the Simics 4.4, but it
+    will fail on the Simics 4.2 due to the vtd model cannot recognize the
+    device id of the DMA requestor on the Simics 4.2.
+
+
+Details on Some Cases
+---------------------
+(1) s-vtd-remap-dma.py: its test way is to construct any count of
+domains, any count of devices on any count of PCI buses, then assign
+every device to a domain and map a same address for every device to
+its assigned domain. At last to read/write the bytes at that address
+from every device, and it should read/write in the assigned domain
+of that device.
+
+(2) s-vtd-switch-domain.py: its test way is construct any count of
+domains and one context table for each domain with the assignment
+of all I/O devices to it, then switch the domain by changing the
+current context pointer (CTP) in a common root entry table. The
+last step is to read a same address in the guest space of current
+domain from any I/O device, and it should result in the magic
+string pre-written in the host memory of current domain.
+
+(3) s-vtd-remap-int.py: its test way is to issue an interrupt
+from an device with any PCI bus id, device id and function id
+under any combination of the parameters allowed in the interrupt
+remapping table entry. The resulting outcome from the Intel (r) VT-d
+hardware should observe the Intel (r) VT-d specification 1.2.
+
+(4) s-vtd-inv-cache.py: its test way is to assume a fixed DMA
+remapping and interrupt remapping configurations, firstly 
+do a remapping to fill an entry into the cache, secondly change
+the real value of the cached object stealthily and the read
+of the cached object should be the value in the cache, thirdly
+invalidate the cache and read again, then it should be the real
+value of changed cached object.
+
+(5) s-vtd-log-fault.py: its test way is to generate a fault for
+a fault reason and then check that reason is recorded in the
+recording registers or memory-resident log structure.
+
+(6) s-vtd-protect-mem.py: its test way is to construct one low
+and one upper protected memory regions and then try to access
+these two regions, and it should be blocked or passed due to
+the translation type specified in the DMA remapping table entry.
+
+(7) s-vtd-fault-event.py: its test way is to generate a fault
+and then the interrupt is correctly generated, interrupt status
+is correctly set and can be cleared.
+
+(8) s-vtd-bound-cond.py: its test way is to configure a simple
+workable DMA and interrupt remapping in the vtd. Then change some
+parameters in the configuration to generate a boundary condition
+and capture-then-check the fault or running result. After that,
+restore the configuration and do the next boundary condition test.

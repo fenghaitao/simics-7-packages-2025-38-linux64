@@ -1,0 +1,79 @@
+/*
+  DAVICOM DM9161 PHY
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+device dm9161;
+param documentation = "DAVICOM DM9161 10/100M PHY Transceiver";
+param desc = "model of DM9161 10/100M PHY transceiver";
+
+import "ieee_phy.dml";
+import "ieee_mii_regs.dml";
+
+param limitations = "<ul>"
+    + "<li>Reports support for 100BASE-T4 by default, which the real hardware"
+    + " doesn't do. This behavior can be overridden by setting the"
+    + " <tt>register_defaults<tt> attribute.</li>"
+    + "</ul>";
+
+// Default PHY ID = 0x0181b880
+param default_phy_id = 0x0181b880;
+
+bank mii_regs {
+    register control {
+        field ss_lsb { param init_val = 1; }
+        field duplex_mode { param init_val = 1; }
+    }
+
+    param override_vendor_specific = true;
+
+    register dcsr @ 16 * 2 is (mii_reg, design_limitation) "Configuration" {
+        param init_val = 0x0410;
+    }
+    register dscsr @ 17 * 2 is (mii_reg, design_limitation)
+        "Configuration and Status" {
+        param init_val = 0xf000;
+    }
+    register d10btcsr @ 18 * 2 is (mii_reg, design_limitation)
+        "10BASE-T Configuration/Status" {
+        param init_val = 0x7800;
+    }
+    register dsir @ 21 * 2 is (mii_reg, unimpl) "Interrupt" {
+        param init_val = 0x0f00;
+    }
+    register recr @ 22 * 2 is (mii_reg, design_limitation)
+        "Receive Error Counter";
+    register discr @ 23 * 2 is (mii_reg, unimpl) "Disconnect Counter";
+    register rlsr @ 24 * 2 is (mii_reg, design_limitation)
+        "Hardware Reset Latch State" {
+        param init_val = 0x04e0;
+    }
+}
+
+
+is hard_reset;
+method hard_reset() {
+    default();
+    mii_regs.control.an_enable.write(1);
+}
+
+is soft_reset;
+method soft_reset() {
+    default();
+    mii_regs.control.an_enable.write(1);
+}
+
+method post_init() {
+    mii_regs.control.an_enable.write(1);
+}

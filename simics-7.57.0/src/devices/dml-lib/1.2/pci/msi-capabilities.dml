@@ -1,0 +1,305 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+// Message Signaled Interrupts (MSI) Capability 
+template _defining_pci_msi_capability_common {
+    parameter msi_offset   default undefined;
+    parameter msi_next_ptr default undefined;
+
+    register msi_capability_header size 2 @ ($msi_offset + 0x0) {
+        parameter documentation = "Capability Header";
+    }
+    register msi_control           size 2 @ ($msi_offset + 0x2) {
+        parameter documentation = "Message Control";
+    }
+    register msi_address           size 4 @ ($msi_offset + 0x4) {
+        parameter documentation = "Message Address";
+    }
+    register msi_data              size 2 {
+        parameter documentation = "Message Data";
+    }
+
+    register msi_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter value = 0x5;
+        }
+        field next_ptr [15:8] is (read_only) "Next Capability Pointer" {
+            parameter hard_reset_value = $msi_next_ptr;
+        }
+    }
+    register msi_control {
+        field msie [0:0] is (read_write) "MSI Enable";
+        field mmc  [3:1] is (ignore_write) "Multiple Message Capable";
+        field mme  [6:4] is (read_write) "Multiple Message Enable" {
+            method write(value) {
+                if (value > $mmc) {
+                    log spec_viol, 1, PCI_config:
+                        "MSI: the number of allocated vectors"
+                        + " (%d) must be no more than the number of requested"
+                        + " vectors (%d)", value, $mmc;
+                    $this = $mmc;
+                } else {
+                    $this = value;
+                }
+            } 
+        }
+        field ac64 [7:7] is (ignore_write) "64-bit Address Capable";
+        field pvmc [8:8] is (ignore_write) "Per-Vector Masking Capable";
+    }
+    register msi_address is (read_write);
+    register msi_data is (read_write);
+}
+
+template _defining_pci_pvm_capability_common {
+    parameter msi_mask_offset default undefined;
+
+    register msi_mask    size 4 @ ($msi_mask_offset + 0x0) "Mask Bits";
+    register msi_pending size 4 @ ($msi_mask_offset + 0x4) "Pending Bits";
+
+    register msi_control {
+        field pvmc {
+            parameter hard_reset_value = 0x1;
+        }
+    }
+}
+
+// MSI Capability Structure for 32-bit Message Address (MSI)
+template defining_pci_msi_capability {
+    is _defining_pci_msi_capability_common;
+
+    register msi_data @ ($msi_offset + 0x8);
+}
+
+// MSI Capability Structure for 64-bit Message Address (MSI64)
+template defining_pci_msi64_capability {
+    is _defining_pci_msi_capability_common;
+
+    register msi_upper_address size 4 @ ($msi_offset + 0x8) {
+        parameter documentation = "Message Upper Address";
+    }
+    register msi_data @ ($msi_offset + 0xc);
+
+    register msi_control {
+        field ac64 {
+            parameter hard_reset_value = 0x1;
+        }
+    }
+    register msi_upper_address is (read_write);
+}
+
+// MSI Capability for 32-bit Message Address (MSI) and Per-Vector Masking (PVM)
+template defining_pci_msi_pvm_capability {
+    is defining_pci_msi_capability;
+    is _defining_pci_pvm_capability_common;
+
+    parameter msi_mask_offset = $msi_offset + 0xc;
+}
+
+// MSI Capability for 64-bit Message Address (MSI64) and Per-Vector Masking (PVM)
+template defining_pci_msi64_pvm_capability {
+    is defining_pci_msi64_capability;
+    is _defining_pci_pvm_capability_common;
+
+    parameter msi_mask_offset = $msi_offset + 0x10;
+}
+
+// Message Signaled Interrupts eXtended (MSI-X) Capability 
+template defining_pci_msix_capability {
+    parameter msix_offset default undefined;
+    parameter msix_next_ptr default undefined;
+    parameter msix_vectors default undefined;
+    parameter msix_table_bank default undefined;
+    parameter msix_pba_bank default undefined;
+
+    register msix_capability_header size 2 @ ($msix_offset + 0x0) {
+        parameter documentation = "Capability Header";
+    }
+    register msix_control           size 2 @ ($msix_offset + 0x2) {
+        parameter documentation = "Message Control";
+    }
+    register msix_table             size 4 @ ($msix_offset + 0x4) {
+        parameter documentation = "MSIX Table Offset and BIR";
+    }
+    register msix_pba               size 4 @ ($msix_offset + 0x8) {
+        parameter documentation = "MSIX PBA Offset and BIR";
+    }
+
+    register msix_capability_header {
+        field id       [7:0]  is (constant) "Capability ID" {
+            parameter hard_reset_value = 0x11;
+        }   
+        field next_ptr [15:8] is (read_only) "Next Capability Pointer" {
+            parameter hard_reset_value = $msix_next_ptr;
+        }   
+    } 
+    register msix_control {
+        field ts [10:0]  is (ignore_write) "Table Size" {
+            parameter hard_reset_value = $msix_vectors - 1;
+        }
+        field fm [14:14] is (read_write) "Function Mask";
+        field en [15:15] is (read_write) "MSI-X Enable";
+
+        method after_write(generic_transaction_t *mop) {
+            // Compile-time check for invalid use of templates.
+            // The model can be reconfigured (in component or from CLI) to
+            // simulate broken HW, i.e. where a larger TS value would cause the
+            // SW to write to offsets outside of the MSI-X vectors.
+            if ($msix_vectors > $msix_table_bank.num_of_vectors
+                || $msix_vectors > $msix_pba_bank.num_of_vectors) {
+                error "$msix_vectors must be less or equal to"
+                    + " $msix_table_bank.num_of_vectors and"
+                    + " $msix_pba_bank.num_of_vectors";
+            }
+    
+            local int i;
+            if ($en == 1 && $fm == 0) {
+                for (i = 0; i < $msix_table_bank.num_of_vectors; i++) {
+                    if ($msix_table_bank.vector_control[i].mb == 0
+                        && $msix_pba_bank.pending_bits[i / 64][i % 64] == 1) {
+                        call $pci_signal_msix_vector(i);
+                    }
+                }
+            }
+        }
+    }
+
+    register msix_table {
+        field to   [31:3] is (read_only) "Table Offset";
+        field tbir [2:0]  is (read_only) "Table BIR";
+    }
+    register msix_pba {
+        field po   [31:3] is (read_only) "PBA Offset";
+        field pbir [2:0]  is (read_only) "PBA BIR";
+    }
+}
+
+// Utility template for implementing the MSI-X table in a bank
+template msix_table_bank {
+    parameter partial = true;
+    parameter num_of_vectors default undefined;
+    parameter msix_table_offset default 0;
+
+    register message_address[$num_of_vectors] size 8 @ $msix_table_offset + $i * 16 {
+        parameter documentation = "Message Address for MSI-X Table Entries";
+    }
+    register message_data[$num_of_vectors]    size 4 @ $msix_table_offset + $i * 16 + 8 {
+        parameter documentation = "Message Data for MSI-X Table Entries";
+    }
+    register vector_control[$num_of_vectors]  size 4 @ $msix_table_offset + $i * 16 + 12 {
+        parameter documentation = "Vector Control for MSI-X Table Entries";
+        field mb [0:0] is (read_write) "Mask Bit" {
+            parameter hard_reset_value = 1;
+        }
+
+        method after_write(generic_transaction_t *mop) {
+            if ($pci_config_bank.msix_control.en == 1
+                && $pci_config_bank.msix_control.fm == 0
+                && $mb == 0
+                && $pci_config_bank.msix_pba_bank.pending_bits[
+                    $i / 64][$i % 64] == 1) {
+                call $pci_config_bank.pci_signal_msix_vector($i);
+            }
+        }
+    }
+}
+
+template _pending_bits {
+    parameter pba_offset default 0;
+    register pending_bits[($num_of_vectors + 63) / 64] size 8 @ $pba_offset + $i * 8 { 
+        parameter documentation = "Pending Bits for MSI-X PBA Entries";
+    }
+}
+
+template msix_table_bank_with_pba {
+    is msix_table_bank;
+    is _pending_bits;
+}
+
+// Utility template for implementing the MSI-X pending bit array in a bank
+template msix_pba_bank {
+    parameter partial = true;
+    parameter num_of_vectors default undefined;
+    is _pending_bits;
+}
+
+// Utility template for providing MSI-X methods
+template providing_msix_interrupts {
+    register msix_interrupts[($msix_vectors + 63) / 64] size 8 {
+        parameter documentation = "MSI-X raised or lowered. For debug only.";
+        parameter offset = undefined;
+        parameter configuration = "pseudo";
+    }
+
+    method pci_raise_msix_interrupt(uint16 vector) default {
+        assert vector < 2048;
+        if (vector > $pci_config_bank.msix_control.ts) {
+            log error: "trying to raise MSI-X interrupt for unsupported"
+                + " vector %d (configured table size is %d)",
+                vector, $pci_config_bank.msix_control.ts + 1;
+            return;
+        }
+        if (vector >= $msix_table_bank.num_of_vectors) {
+            log error: "trying to raise MSI-X interrupt for unsupported"
+                + " vector %d (maximum table size is %d)",
+                vector, $msix_table_bank.num_of_vectors;
+            return;
+        }
+        log info, 4, PCI_IRQ: "Raise MSI-X interrupt, vector %d", vector;
+        $msix_pba_bank.pending_bits[vector / 64][vector % 64] = 1;
+        if ($pci_config_bank.msix_control.en == 1
+            && $pci_config_bank.msix_control.fm == 0
+            && $msix_table_bank.vector_control[vector].mb == 0) {
+            call $pci_signal_msix_vector(vector);
+        }
+    }
+
+    method pci_lower_msix_interrupt(uint16 vector) default {
+        assert vector < 2048;
+        if (vector > $pci_config_bank.msix_control.ts) {
+            log error: "trying to lower MSI-X interrupt for unsupported"
+                + " vector %d (configured table size is %d)",
+                vector, $pci_config_bank.msix_control.ts + 1;
+            return;
+        }
+        if (vector >= $msix_table_bank.num_of_vectors) {
+            log error: "trying to lower MSI-X interrupt for unsupported"
+                + " vector %d (maximum table size is %d)",
+                vector, $msix_table_bank.num_of_vectors;
+            return;
+        }
+        log info, 4, PCI_IRQ: "Lower MSI-X interrupt, vector %d", vector;
+        $msix_pba_bank.pending_bits[vector / 64][vector % 64] = 0;
+        if (vector < $msix_vectors)
+            $pci_config_bank.msix_interrupts[vector / 64][vector % 64] = 0;
+    }
+
+    method pci_signal_msix_vector(uint16 vector) default {
+        assert vector < 2048;
+        local uint32 data = $msix_table_bank.message_data[vector];
+        local uint64 addr = $msix_table_bank.message_address[vector];
+        local exception_type_t ex;
+        log info, 4, PCI_IRQ: "Signal MSI-X interrupt, vector %d", vector;
+        call $pci_value_to_memory(Sim_Addr_Space_Memory, data, addr, 4)
+            -> (ex);
+        if (ex == Sim_PE_No_Exception) {
+            $msix_pba_bank.pending_bits[vector / 64][vector % 64] = 0;
+            if (vector < $msix_vectors)
+                $pci_config_bank.msix_interrupts[vector / 64][vector % 64] = 1;
+        } else {
+            log error: "failed to signal interrupt, writing %#x at %#x",
+                data, addr;
+        }
+    }
+}

@@ -1,0 +1,1336 @@
+/*
+  © 2018 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+----------------------------------------------------------------------------------
+
+  led_system_controller_bb 
+     : Black-box DML device that implements the controller functionality
+     : that would be implemented by a processor + peripherals in hardware
+*/
+
+
+dml 1.4;
+
+device led_system_controller_bb;
+
+// Make this a PCIe device
+import "pci/common.dml";
+is pcie_device;
+
+// This device does not really support real hotplugging for PCI
+param pci_hotplug = true;
+
+// Import headers for interfaces used 
+import "utility.dml";
+import "simics/devs/signal.dml";
+import "simics/devs/i2c.dml";
+import "simics/devs/memory-space.dml";
+
+// Description for the Simics UI
+param desc = "training card main controller";
+param documentation = "Device that controls the LED panel over I2C, " +
+                      "including multicolor LEDs and button and toggle inputs. " +
+                      "Implements the PCIe interface towards the system the " +
+                      "card is connected to, and the I2C interface towards " +
+                      "the devices visible in the panel. " +
+                      "Used in the Simics training, as the master controller " +
+                      "of the training PCIe card subsystem.";
+
+// Device building parameters
+param MSIX_VECTORS = 2 ;        // Number of MSI-X interrupts vectors possible. Total overkill. 
+param I2C_DATA_BUF_SIZE = 16;   // Number of bytes in i2c data buffer for sending and receiving 
+param NO_ACTIVE_TOGGLES = 2;    // Number of toggles that we actually check for data 
+
+// Log groups, custom for this device
+loggroup i2c_comms;
+loggroup periodic_checks;
+loggroup MSIX_interrupt;
+
+//----------------------------------------------------------------------
+//
+// Constants - for state machines
+// 
+// This device in essence implements several separate i2c state machines.
+// Whose current states are stored in a set of registers in the i2cregs
+// bank.  The states have constants here - each machine have its own 
+// set of constants, except they all share the OP_idle for ease of coding.
+//----------------------------------------------------------------------
+param OP_idle = 0;
+
+// Operation Write LEDs
+param OP_WLED_wait_for_free_bus    = 11;
+param OP_WLED_wait_for_arbitration = 12; 
+param OP_WLED_wait_for_write_ack   = 13; // Will loop in this state
+                                            // using the data_ptr
+
+// Operation Read Toggles
+param OP_RTOG_wait_for_free_bus    = 21;
+param OP_RTOG_wait_for_arbitration = 22; 
+param OP_RTOG_wait_for_read_response = 23;   
+
+// Operation receive button writes
+param OP_IWRI_receiving            = 31;
+
+//----------------------------------------------------------------------
+//
+// Configuration attributes
+//
+//----------------------------------------------------------------------
+attribute i2c_address is (uint64_attr) {
+    param documentation = "The 7-bit address on the i2c bus that this device responds to";
+    param configuration = "required";
+}
+
+//
+// Attributes modeling the behavior of firmware in the hypothetical processor
+//
+// To initialize to default values, have to include the "init" template and an 
+// init() method for each attribute.  This is nicer than putting all the 
+// initial value into the class-global init() method
+// 
+param DEFAULT_FW_CLOCK_FREQUENCY = 100*1000*1000;
+
+attribute fw_clock_frequency is (uint64_attr, init) {
+    param documentation = "The clock frequency of the processor whose behavior is being modeled (Hz)";
+    param configuration = "optional";
+    method init() {
+       // Default 100 MHz
+       val = DEFAULT_FW_CLOCK_FREQUENCY; 
+    }
+}
+
+attribute pixel_update_time is (uint64_attr, init) {
+    param documentation = "Time for software delay between pixel updates (modeling internal firmware operations)";
+    param configuration = "optional";
+    method init() {
+      val = 20;  // 20 cycles for the clock 
+    }
+}
+
+attribute toggle_check_interval is (uint64_attr, init) {
+    param documentation = "Time between periodic checks of the toggles (modeling internal firmware operations) (in fw clocks)";
+    param configuration = "optional";
+    method init() {
+       // default to checking at 20 Hz
+       // -- Note that if the creator of the object sets the fw_clock_frequency to
+       //    something else than default, they had better update this attribute
+       //    as well to preserve the desired behavior. 
+       val = DEFAULT_FW_CLOCK_FREQUENCY / 20;
+    }
+}
+
+//----------------------------------------------------------------------
+//
+// Attributes recording current operation state
+//
+// - Basically, they model the state that firmware would have in a 
+//   whitebox model with a processor
+//
+//----------------------------------------------------------------------
+
+attribute current_operation is (uint64_attr, init) {
+    param documentation = "Current device operation (modeling internal firmware operations)";
+    param configuration = "optional";
+    method init() {
+        // Initial value - idle (will be overwritten by checkpoint restore)
+        val = OP_idle;
+    }
+}
+
+attribute icolumn is (uint64_attr) {
+    param documentation = "Loop variable: column (modeling internal firmware operations)";
+    param configuration = "optional";
+}
+
+attribute irow is (uint64_attr) {
+    param documentation = "Loop variable: row (modeling internal firmware operations)";
+    param configuration = "optional";
+}
+
+attribute next_toggle_to_check is (uint64_attr) {
+    param documentation = "Loop variable: toggle to check (modeling internal firmware operations) ";
+    param configuration = "optional";
+    // This attribute will move from zero to one (and possibly higher)
+    // Code talking to I2C will convert the index to a toggle register and 
+    // associated I2C address
+}
+
+
+
+//----------------------------------------------------------------------
+//
+// Doing work: Handle inbound writes over i2c
+//
+//----------------------------------------------------------------------
+method IWRI_raise_interrupt() {
+    // Send PCIe MSI-X interrupt 0
+    // If interrupts are enabled for button presses
+    // Single interrupt shared by all buttons, software will
+    // have to scan status registers -- and remember to turn
+    // off the status bit for any button it has processed
+    if(regs.button_interrupt_control.enable.get_val() == 1) {
+       	log info, 3, MSIX_interrupt : "Raising interrupt for MSI-X for button press.";
+        pci_config.pci_raise_msix_interrupt(0);
+    }
+}
+
+method IWRI_interpret_write() {
+    // When called, we should have an inbound write in the $i2cregs.data_buffer 
+    if(i2cregs.i2c_data_buffer[0].val == 'b') {
+        if(i2cregs.i2c_data_buffer[1].val == regs.button_a_i2c_address.addr.get_val() ) {
+            // Hit button A
+            regs.button_a_status.val = 1;
+            IWRI_raise_interrupt();
+            return;
+        }
+        if(i2cregs.i2c_data_buffer[1].val == regs.button_b_i2c_address.addr.get_val() ) {
+            // Hit button B
+            regs.button_b_status.val = 1;            
+            IWRI_raise_interrupt();
+            return;
+        }
+    }
+    
+    // default is to log that this was not a known message
+    log spec_viol, 2 : "Someone sent us an i2c message that is not ['b',ID] : [%d,%d]", i2cregs.i2c_data_buffer[0].val, i2cregs.i2c_data_buffer[1].val;
+}
+
+
+//----------------------------------------------------------------------
+//
+// Doing work: Polling the toggles  
+//
+// - Each periodic event triggers a check of a single toggle
+// - Each event starts the I2C process
+//
+//----------------------------------------------------------------------
+
+// Call this to start polling the next toggle in line
+method RTOG_start() {
+    
+    // Check for a busy bus
+    if( (i2cregs.i2c_bus_state.busy.get_val() == 0) &&
+        (i2cregs.i2c_bus_requested.busy.get_val() ==0) ) {
+        // Bus is free, see if we can win arbitration
+        RTOG_try_to_grab_bus();
+    } else {
+        // Note that we are waiting for the bus to be free
+        log info, 3, i2c_comms: "I2C (read from toggle) - time to start read, bus busy, wait for bus to become free";
+        i2cregs.i2c_read_toggle_state.val=OP_RTOG_wait_for_free_bus;
+    } 
+    
+}
+
+method RTOG_try_to_grab_bus() {
+
+    // Issue i2c start
+    local uint8 i2c_toggle_addr = regs.toggle_i2c_address[next_toggle_to_check.val].addr.get_val();
+
+    // Next phase: waiting for ack, winning the bus
+    i2cregs.i2c_read_toggle_state.val=OP_RTOG_wait_for_arbitration;
+    
+    // Block other operations from simultaneously requesting the bus
+    i2cregs.i2c_bus_requested.busy.set_val(1);
+    
+    // Try to get the bus
+    //   + 1 to set it for read 
+    log info, 3, i2c_comms : "I2C (read from toggle) request bus (for i2c address=%d, toggle ID=%d)", i2c_toggle_addr, next_toggle_to_check.val;
+    i2c_link.i2c_slave_v2.start( (i2c_toggle_addr << 1) + 1);
+}
+
+// Call this once we have an ack for the start and know we have the bus at hand
+// We have issued a successful start, now we have to pull in the data
+method RTOG_do_read() {
+    // Reset data ptr
+    i2cregs.i2c_data_ptr.val = 0;
+
+    // Set the next state for the state machine - waiting for read to return value
+    i2cregs.i2c_read_toggle_state.val = OP_RTOG_wait_for_read_response;
+    
+    // Issue read operation
+    log info, 3, i2c_comms : "I2C (read from toggle) issue read operation for state";
+    i2c_link.i2c_slave_v2.read();
+}
+
+// Call this to finish up a read operation 
+// and release the I2C bus
+method RTOG_stop() {    
+    // pick up the current index for easier coding
+    local uint32 n = next_toggle_to_check.val;        
+    
+    // Interpret the byte that was read - 
+    // Basically, 0 or 1
+    // Assume values are good 
+    regs.toggle_status[n].val = i2cregs.i2c_data_buffer[0].val; 
+    
+    // Set state machine to idle
+    i2cregs.i2c_read_toggle_state.val = OP_idle;
+    // Finish i2c transaction properly 
+    log info, 3, i2c_comms : "I2C (read from toggle) issue stop to release bus";    
+    i2cregs.i2c_bus_state.busy.set_val(0);    
+    i2c_link.i2c_slave_v2.stop();
+    
+    // Update toggle number for next check 
+    // Next check has already been scheduled 
+    n++;
+    if( n>= NO_ACTIVE_TOGGLES) {
+        n = 0;
+    }
+    next_toggle_to_check.val = n;    
+}
+
+// DML 1.4 event: 
+// - simple = no data sent with event, as none is needed
+// - time, since it is time-based
+//
+// Seconds, since the device should operate on its own time base and
+// not on processor cycles (as it has no tight relationship to the processor
+// using cycles does not make sense)
+event toggle_check is simple_time_event {
+    
+    method event() {        
+        // Called when the event triggers
+        log info, 2, periodic_checks : "Toggle check event for toggle index %d", next_toggle_to_check.val;
+        
+        // Do the work of checking - 
+        RTOG_start();
+        
+        // Repost so that we check regularly -- which would be what a timer-driven 
+        // piece of firmware would do too
+        this.post_next_toggle_check();
+    }
+    
+    method post_next_toggle_check() {
+        // Call this method to post the next toggle check
+        local double delay;
+        delay = cast(toggle_check_interval.val, double) / cast(fw_clock_frequency.val, double);
+        this.post(delay);
+    }
+    
+    // Called from init to start the process of checking toggles;
+    // should only be called when setting up the system 
+    method get_started() {
+        log info, 3, periodic_checks  : "Starting recurring toggle check (posting event)";
+        next_toggle_to_check.val = 0;
+        this.post_next_toggle_check();
+    }
+    method stop_it() {
+        if(this.posted()) {
+            log info, 3, periodic_checks : "Removed posted toggle check event from queue";
+            this.remove();
+        } 
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// Doing work: Write the LED values to the bus
+// - Each pixel is handled as a discrete event in Simics
+// - Once completed, post event to do the next pixel
+// - Create each pixel output in the 
+//
+//----------------------------------------------------------------------
+
+method WLED_raise_interrupt() {
+    // Send PCIe MSI-X interrupt 1
+    // If interrupts are enabled for display update complete
+    if(regs.update_display_interrupt_control.enable.get_val() == 1) {
+    	log info, 3, MSIX_interrupt : "Raising interrupt for MSI-X for display complete";
+        pci_config.pci_raise_msix_interrupt(1);
+    }
+}
+
+// Memory layout for pixels in memory
+typedef layout "little-endian" {
+    uint8 red;
+    uint8 green;
+    uint8 blue;
+    uint8 alpha; 
+} pixel_in_memory_t;
+
+
+// This method computes out the current I2C address 
+// based on the I2C address base, 
+method WLED_compute_xy_offset() -> (uint32) {
+    local uint32 offset;
+    local uint32 a = 0;
+    // Column
+    a += icolumn.val;
+    // add the row offset
+    a += (regs.display_width.val) * irow.val;
+    // return value
+    offset = a;
+    return offset;
+}
+
+method WLED_current_i2c_addr() -> (uint8) {
+    local uint8 addr;
+    local uint8 a;
+    // Compute offset
+    a = WLED_compute_xy_offset();
+    // add i2c base address
+    a += regs.display_i2c_base.addr.get_val();    
+    // return value 
+    log info, 3: "(write to led) Writing to LED at i2c address %d (for row=%d, column=%d) ", a, irow.val, icolumn.val;
+    addr = a;
+    return addr;
+}
+
+// Call this to start writing an LED
+method WLED_start() {
+    
+    // Check for a busy bus - and that we are not requesting the
+    // bus for a different operation on this very same cycle 
+    if( (i2cregs.i2c_bus_state.busy.get_val() == 0) && 
+        (i2cregs.i2c_bus_requested.busy.get_val() ==0) ) {
+        // Bus is free, see if we can win arbitration
+        WLED_try_to_grab_bus();
+    } else {
+        // Note that we are waiting for the bus to be free
+        log info, 3, i2c_comms: "I2C (write to led) - time to start write, but bus busy, waiting for it to free";
+        i2cregs.i2c_write_led_state.val=OP_WLED_wait_for_free_bus;
+    } 
+    
+}
+
+// 
+method WLED_try_to_grab_bus() {
+        
+    // Issue i2c start
+    local uint8 i2c_led_addr;
+    i2c_led_addr = WLED_current_i2c_addr();
+
+    // Next phase: waiting for ack, winning the bus
+    i2cregs.i2c_write_led_state.val=OP_WLED_wait_for_arbitration;
+    
+    // Block other operations from simultaneously requesting the bus
+    i2cregs.i2c_bus_requested.busy.set_val(1);
+    
+    // Try to get the bus 
+    log info, 3, i2c_comms : "I2C (write to led) request bus (for i2c address=%d)", i2c_led_addr; 
+    i2c_link.i2c_slave_v2.start( (i2c_led_addr << 1));
+}
+
+method WLED_initialize_write() {
+    // DMA from memory to get the pixel value to display
+    // Read 4 bytes
+    local pixel_in_memory_t pxl; 
+    local exception_type_t exc;
+    local physical_address_t addr;
+    local uint32 a;
+    
+    a = WLED_compute_xy_offset();
+    a *= 4;  // 4 bytes per pixel
+    addr = a + regs.framebuffer_base_address.val;  // base address as set by software
+    log info, 3 : "(write to led) DMA read from memory at address 0x%lx (for row=%d, column=%d)", 
+                    addr, irow.val, icolumn.val;     
+    exc = local_memory.memory_space.access_simple(dev.obj,
+                                                    addr,                  // address to read
+                                                    cast(&pxl,uint8 *),   // local buffer
+                                                    4,                   // length 
+                                                    Sim_RW_Read,        // read memory 
+                                                    Sim_Endian_Target  // according to docs
+                                                    );
+
+    // Memory accessed failed. In hardware, garbage data would likely be used
+    if (exc != Sim_PE_No_Exception) {
+        log error: "Error reading LED values from target memory (address=0x%x)", addr;
+        // Set some non-random garbage values resulting in a yellow pixel
+        pxl.red   = 128;
+        pxl.green = 128;
+        pxl.blue  = 0; 
+    }
+    
+    // Create the I2C data buffer to send
+    i2cregs.i2c_data_ptr.val = 0;
+    i2cregs.i2c_counter.val  = 4;        // 4 bytes to write
+    i2cregs.i2c_data_buffer[0].val = 99; // 'c'
+    i2cregs.i2c_data_buffer[1].val = pxl.red;
+    i2cregs.i2c_data_buffer[2].val = pxl.green;
+    i2cregs.i2c_data_buffer[3].val = pxl.blue;
+
+    WLED_write_next();
+}
+
+// Called from write ack function, try to send the next byte
+method WLED_write_next() {
+    // Check for termination - 
+    if( i2cregs.i2c_data_ptr.val >= i2cregs.i2c_counter.val) {
+        // Done, no more writing to do 
+        WLED_stop();
+    } else {
+        local uint8 value;
+        value =  i2cregs.i2c_data_buffer[i2cregs.i2c_data_ptr.val].val;
+        
+        // Increment the pointer - will be checked on next call to this function
+        i2cregs.i2c_data_ptr.val += 1;
+        
+        // Write...
+        log info, 3, i2c_comms : "I2C (write to led) writing byte to bus (%d)", value; 
+        
+        // Next state is waiting for an ack
+        i2cregs.i2c_write_led_state.val=OP_WLED_wait_for_write_ack;
+        // Send the next byte to the recipient
+        i2c_link.i2c_slave_v2.write(value);
+    }    
+}
+
+method WLED_stop() {
+    
+    // Finish the i2c transaction 
+    log info, 3, i2c_comms : "I2C (write LED) issue stop to release bus";    
+    i2cregs.i2c_write_led_state.val = OP_idle;
+    i2cregs.i2c_bus_state.busy.set_val(0);
+    i2c_link.i2c_slave_v2.stop();
+    
+    // Schedule next pixel to draw
+    local uint32 col = icolumn.val;
+    local uint32 row = irow.val;
+    col = col+1;
+    if(col >= regs.display_width.val) {
+        col = 0;
+        row = row+1;
+        if(row >= regs.display_height.val) {
+            log info, 2 : "LED display update operation completed";    
+            // DONE!
+            // Intentionally leave row and column attributes at current value
+             
+            // Update registers to reflect the current status
+            regs.update_display_request.val = 0;     // Lower flag about ongoing operation
+            regs.update_display_status.done.set_val(1); // Set flag for operation done 
+            
+            // Send interrupt, if enabled
+            WLED_raise_interrupt();
+            
+            // Return out to avoid triggering another update event 
+            return;
+        }
+    }
+    // Store new values
+    icolumn.val = col;
+    irow.val = row;
+    
+    // Jump to next pixel
+    wled_next_pixel.post_next();    
+}
+
+// Call only once per complete redraw
+method WLED_update_display_start() {
+    // We assume that this is called properly, when
+    // there is no current operation running.  This is
+    // the job of the register write to guard against.
+    
+    // Log
+    log info, 2 : "Starting new display update operation";
+    
+    // Get back to top-left corner of the display
+    icolumn.val = 0;
+    irow.val    = 0;
+
+    // Note that operation is NOT done
+    regs.update_display_status.done.set_val(0); // Set flag for operation done 
+       
+    // Kick off write state machine for the first pixel 
+    // Note that this carries a certain delay, which is reasonable
+    // as we would model the firmware discovering the register change
+    // and then moving to start updating the LEDs.  
+    wled_next_pixel.post_next();
+}
+
+// DML 1.4 event: 
+// - simple = no data sent with event, as none is needed
+// - time, since it is time-based
+//
+// Seconds, since the device should operate on its own time base and
+// not on processor cycles (as it has no tight relationship to the processor
+// using cycles does not make sense)
+event wled_next_pixel is simple_time_event {
+    
+    method event() {        
+        // Called when the event triggers
+        log info, 2 : "Start next LED pixel update";
+        
+        // Get the I2C transaction going for this pixel 
+        WLED_start();
+        
+        // No reposting yet... we wait until the pixel is done just to
+        // do things differently from the read toggle variant.  After
+        // all we are trying to model software operation intervals.
+    }
+    
+    method post_next() {
+        // Call this method to post the next LED write
+        local double delay;
+        delay = cast(pixel_update_time.val, double) / cast(fw_clock_frequency.val, double);
+        this.post(delay);
+    }
+}
+
+
+
+//----------------------------------------------------------------------
+//
+// Device enable and disable logic
+//
+//----------------------------------------------------------------------
+method dev_enable() {
+    log info, 2 : "Device enabled, starting periodic events";
+    // Start the toggle check
+    toggle_check.get_started();
+}
+
+method dev_disable() {
+    log info, 2 : "Device disabled, stopping periodic events";
+    // Stop the toggle check
+    toggle_check.stop_it();
+}
+
+
+//----------------------------------------------------------------------
+//
+// Connect - outbound connections from this device
+//
+//----------------------------------------------------------------------
+
+//
+// The i2c bus to connect to (actually, it will point to an endpoint 
+// object but that is entirely transparent for the device)
+//
+// We use both the master and slave interfaces on the bus to do the 
+// work of this device. 
+//
+connect i2c_link {
+    param desc = "The I2C link that the device uses to reach LEDs, Buttons, and Toggles";
+    param configuration = "required";
+    interface i2c_master_v2;
+    interface i2c_slave_v2;
+}
+
+connect local_memory {
+    param desc = "The memory space for the local memory map of the PCIe device";
+    param configuration = "required";
+    interface memory_space;
+}
+
+
+//----------------------------------------------------------------------
+//  
+// Ports and implements - inbound connections from other devices 
+//
+//----------------------------------------------------------------------
+
+//
+// i2c_slave_v2 inbound interface, in a port 
+// i2c_master_v2 inbound interface, in the same port 
+//
+port i2c_in {
+    param desc = "Inbound I2C traffic - both master and slave interfaces";
+     
+    implement i2c_master_v2 {
+        
+        // Acknowledge 
+        // - ack that we get the bus, from a start
+        // - ack that a write came through, from a write
+        method acknowledge(i2c_ack_t ack_value) {
+            log info, 3, i2c_comms : "I2C ack incoming (%d)", ack_value;
+
+            // Handle the ack depending on current state
+
+            // Waiting for a bus ack to win arbitration for write?
+            if( i2cregs.i2c_write_led_state.val==OP_WLED_wait_for_arbitration ) {
+                if( ack_value == I2C_ack ) {
+                    // Got bus, update state, send out the first write
+                    log info, 3, i2c_comms : "I2C (write LED) we won arbitration, continue to write";
+                    // Lower flag for bus request active
+                    i2cregs.i2c_bus_requested.busy.set_val(0);      
+                    i2cregs.i2c_bus_state.busy.set_val(1);
+                    WLED_initialize_write();
+                } else {
+                    log info, 3, i2c_comms : "I2C (write LED) waiting for a start or ack for arbitration for LED write, but got a no_ack. Probably a bad I2C address for the toggle.  Not expected, aborting operation.";
+                    i2cregs.i2c_write_led_state.val = OP_idle;
+                    i2cregs.i2c_bus_state.busy.set_val(0);
+                    i2cregs.i2c_bus_requested.busy.set_val(0);                  
+                    i2c_link.i2c_slave_v2.stop();
+                }
+            } else
+            
+            // Waiting for a bus ack for a write?
+            if( i2cregs.i2c_write_led_state.val==OP_WLED_wait_for_write_ack ) {
+                if( ack_value == I2C_ack ) {
+                    // Write succeeded, write the next
+                    WLED_write_next();
+                } else {
+                    log info, 3, i2c_comms : "I2C (write LED) write got a No_Ack... aborting write operation";
+                    i2cregs.i2c_write_led_state.val = OP_idle;
+                    i2cregs.i2c_bus_state.busy.set_val(0);
+                    i2c_link.i2c_slave_v2.stop();
+                }   
+            } else
+
+            // Waiting for a bus ack to win arbitration for read?
+            if( i2cregs.i2c_read_toggle_state.val==OP_RTOG_wait_for_arbitration ) {
+                if( ack_value == I2C_ack ) {
+                    // Got bus, note state, and go on to send off a read
+                    log info, 3, i2c_comms : "I2C (read toggle) won arbitration, continue to read";
+                    // Lower flag for bus request active
+                    i2cregs.i2c_bus_requested.busy.set_val(0);
+                    i2cregs.i2c_bus_state.busy.set_val(1);
+                    RTOG_do_read();
+                } else {
+                    log info, 3, i2c_comms : "I2C (read toggle) waiting for a start or ack for arbitration for read toggle, but got a no_ack. Probably a bad I2C address for the toggle.  Not expected, aborting toggle read operation.";
+                    i2cregs.i2c_read_toggle_state.val = OP_idle;
+                    i2cregs.i2c_bus_state.busy.set_val(0);
+                    i2cregs.i2c_bus_requested.busy.set_val(0);                    
+                    i2c_link.i2c_slave_v2.stop();
+                }
+            } 
+        }
+        
+        // The other side sending the response to a read operation
+        method read_response(uint8 value) {
+            log info, 3, i2c_comms : "I2C read_response incoming (value = 0x%x)", value;
+            
+            // Store the received byte, no matter what
+            // assume that all reads go to the same buffer
+            i2cregs.buffer_store_byte(value);
+            
+            // If we were doing a toggle read... 
+            if( i2cregs.i2c_read_toggle_state.val==OP_RTOG_wait_for_read_response ) {
+                // And we only needed a single byte, stop the operation 
+                // This basically assumes that we only ever see this from a 
+                // read toggle operation.  
+                RTOG_stop();
+            } else {
+                log error, 1, i2c_comms : "I2C read_response when device was not expecting it!";
+            }
+        }
+    }
+    
+    implement i2c_slave_v2 {        
+        //
+        // Start can be called:
+        // - Another device starts an operation to yet another device
+        // - Another device starts writing to us 
+        // - Lost arbitration for read or write operation
+        // 
+        method start(uint8 address) {
+            // Just log the call
+            log info, 3, i2c_comms: "I2C start called with address([%d][%d])", address[7:1], address[0];
+
+            // Note that the bus becomes busy - this is a top-level state that is 
+            // always tracked no matter of which operation is going on 
+            log info, 4, i2c_comms: "I2C bus is now marked as busy";
+            i2cregs.i2c_bus_state.busy.set_val(1);            
+            
+            // Are we waiting for an ack to gain the bus for a write?
+            if (i2cregs.i2c_write_led_state.val == OP_WLED_wait_for_arbitration) {
+                // Lower flag for bus request active
+                i2cregs.i2c_bus_requested.busy.set_val(0);                
+                //  
+                log info, 3, i2c_comms : "I2C (write to LED) Lost this arbitration round, wait for bus to free up";
+                i2cregs.i2c_write_led_state.val = OP_WLED_wait_for_free_bus;
+            }
+            
+            // Are we waiting for an ack to gain the bus for a read?
+            if (i2cregs.i2c_read_toggle_state.val == OP_RTOG_wait_for_arbitration) {
+                // Lower flag for bus request active
+                i2cregs.i2c_bus_requested.busy.set_val(0);                
+                // 
+                log info, 3, i2c_comms : "I2C (read from toggle) Lost this arbitration round, wait for bus to free up";
+                i2cregs.i2c_read_toggle_state.val = OP_RTOG_wait_for_free_bus;
+            }
+            
+            // Is this start() targeting our device?
+            if (address[7:1] == i2c_address.val) {            
+                // Check for read or write start
+                if(address[0] == 0) {
+                    log info, 3, i2c_comms: "I2C inbound write transaction starting, sending ack";
+                    
+                    // Targeting us with a write - means to start the operation to receive
+                    i2cregs.i2c_inbound_writing_state.val = OP_IWRI_receiving;
+                    i2cregs.i2c_data_ptr.init_transfer();
+                    
+                    // and then send ack to master that we did indeed get it 
+                    i2c_link.i2c_master_v2.acknowledge(I2C_ack);
+                } else {
+                    // Read start - ignore, operation not supported 
+                    log info, 3, i2c_comms: "I2C Rejecting start for read - device does not support reading, sending no_ack";
+                    // Doing a read from us - which is not supported by this device
+                    i2c_link.i2c_master_v2.acknowledge(I2C_noack);
+                }
+            } else {
+                log info, 3, i2c_comms: "I2C start was not for this device, sending no_ack";
+                // Start was for some other device. We have noted that the bus is busy.  
+                // Send a noack to follow protocol. 
+                i2c_link.i2c_master_v2.acknowledge(I2C_noack);
+            }
+            
+        } // end start()
+
+        //
+        // Read - should never be called, nobody should be reading from this device
+        // 
+        method read() {
+            // Log that we receive
+            log spec_viol, 2, i2c_comms: "I2C read call received, which is odd since this device does not support that operation";
+            i2c_link.i2c_master_v2.read_response(0);            
+        }
+
+        //
+        // Write - called when receiving from a button device
+        // 
+        method write(uint8 value) {
+            // Log that we received a byte
+            log info, 3, i2c_comms: "I2C Write incoming (data=0x%x)", value;
+        
+            assert(i2cregs.i2c_inbound_writing_state.val == OP_IWRI_receiving);
+        
+            // This really means we should be in state OP_IWRI_receiving 
+            // trust the bus system to be correct
+            i2cregs.buffer_store_byte(value);
+            
+            // Ack the write
+            i2c_link.i2c_master_v2.acknowledge(I2C_ack);
+        }
+
+        method stop() {
+            // Log that we see a stop - 
+            // i2c in Simics makes ALL devices see this, even if they were
+            // not the device targeted by the current transaction 
+            log info, 3, i2c_comms: "I2C stop incoming - noting bus as free";
+        
+            // Note that bus is now free
+            i2cregs.i2c_bus_state.busy.set_val(0);
+                                
+            // When we see a stop while inside an IWRI operation, we should finish
+            // up the write operation
+            if(i2cregs.i2c_inbound_writing_state.val== OP_IWRI_receiving) {
+                i2cregs.i2c_inbound_writing_state.val = OP_idle;            
+                // Go and interpret the data to see if it made sense
+                IWRI_interpret_write();
+            } 
+            
+            // Check if we have some pending actions on the bus becoming free
+            // Do this in an exclusive order -- cannot do multiple of these
+            // in a single cycle, that would be inconsistent 
+            if(i2cregs.i2c_write_led_state.val == OP_WLED_wait_for_free_bus ) {
+                // Try to start a new LED write op
+                WLED_try_to_grab_bus();
+                                
+            } else if(i2cregs.i2c_read_toggle_state.val == OP_RTOG_wait_for_free_bus) {
+                // Try to start a new toggle read operation
+                // Assigned lower priority than the writes, as this is considered
+                // more of a background operation 
+                RTOG_try_to_grab_bus();
+            }
+        }
+        
+        method addresses() -> (attr_value_t) {
+            local attr_value_t result;
+            result = SIM_make_attr_list(
+                    2, SIM_make_attr_uint64(i2c_address.val * 2),
+                    SIM_make_attr_uint64(i2c_address.val * 2 + 1));
+            return result;
+        }
+    }
+   
+}
+
+//----------------------------------------------------------------------
+//
+// PCI configuration bank - mandatory for PCI devices
+//
+//----------------------------------------------------------------------
+bank pci_config is (pci_config_type_0,
+                    defining_pcie_capability_root_ports_v3,
+                    providing_msix_interrupts,
+                    defining_pci_msix_capability                    
+                    ) {
+    param desc = "PCIe configuration register bank";
+    
+    // Our Vendor, Device ID, and other identification information
+    register vendor_id   { param init_val =   0x8086; }  // Intel
+    register device_id   { param init_val =   0x0D5F; }  // PCIe ID assigned to Simics 
+    register revision_id { param init_val =     0x01; }  // Revision number
+    register class_code  { param init_val = 0x040000; }  // "Display controller"
+    
+    register status {
+        field c { param init_val = 1; }  // mark that we have capabilities
+    }
+    // Base Address Registers (BARs)
+    // This parameter has to list all BARs for them to be found by the system
+    param base_address_registers = ["base_address_0",
+                                    "base_address_1",
+                                    "base_address_2",
+                                    "base_address_3"];
+                                    
+    //--------------------------------------------------------------------------
+    // The BARs, have to list the unused one as well and mark them as unused
+    //--------------------------------------------------------------------------
+    
+    //
+    // BAR #0: control registers for the device 
+    //
+    register base_address_0 @ 0x10 is (memory_base_address_32) {
+            param size_bits = 12;   // size of mapping -- 12 bits = 4kB 
+            param map_func  = 1;   // parameter function in regs matches this number                
+    }
+    
+    //      
+    // BAR #1: Map the PCI MSI-X table
+    //
+    register base_address_1 @ 0x14 is (memory_base_address_32) {
+        // map the msix_table bank
+        param size_bits = 8;   // big enough -
+                                  // actual size is log2(MSIX_VECTORS * 16)
+        param map_func  = 2;   // parameter function in 
+    }
+    
+    //
+    // BAR #2: Map the PCI MSI-X PBA
+    // 
+    register base_address_2 @ 0x18 is (memory_base_address_32) {
+        param size_bits = 8;   // big enough -
+                                   // actual size is log2(MSIX_VECTORS)
+        param map_func  = 3;   // parameter function in 
+    }
+
+    //
+    // BAR #3: On-device memory
+    //
+    register base_address_3 @ 0x1C is (memory_base_address_32) {
+        param size_bits = 24;   // size of mapping -- 24 bits = 16MB 
+        param map_func  = 4;   // needed to make Simics PCIe fit together
+        
+        method pci_mapping_object() -> (conf_object_t *) {
+            // Make the internal memory map of the training device
+            // available as BAR3. 
+            return local_memory.obj;
+        }
+   }
+    
+    // BAR #4 to 5 are not used    
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+    
+    // PCI and PCIe Capabilities - follows the main configuration registers in the pci configuration space
+    register capabilities_ptr { param init_val = msix_offset; }
+
+    // MSI-X capability
+    // - Software will write into the capability to configure where
+    //   to send interrupts. 
+    param msix_offset = 0x70;
+    param msix_next_ptr = 0x80;  // Point on to PCIe cap
+    param msix_vectors = MSIX_VECTORS;
+    // MSI-X interrupt tables 
+    // - PBA has an array of bits
+    // - Table contains a list of ()
+    param msix_table_bank = dev_msix_table;
+    param msix_pba_bank = dev_msix_pba;
+    // msix_table and msix_pba registers tell the software which BAR to use
+    register msix_table {
+        field to   { param init_val = 0x0; }
+        field tbir { param init_val = 0x1; }  // BAR #1
+    }
+    register msix_pba {
+        field po   { param init_val = 0x0; }
+        field pbir { param init_val = 0x2; }  // BAR #2
+    }    
+    
+    // PCIe capability;
+    param exp_offset = 0x80;
+    param exp_next_ptr = 0x0;  // end of list
+    
+    // A regular PCIe endpoint device has to define:
+    //  exp_capabilities   (PCIe capabilities)
+    //  exp_dev_cap        (Device capabilities)
+    //  exp_dev_status     (Device status, which we ignore)
+    //  exp_dev_control    (Device control, which we ignore)
+    //
+    //  exp_link_cap       (link registers set 1 needed for all 
+    //  exp_link_status     devices that are not root complex 
+    //  exp_link_control    integrated devices)
+    //
+    //  This device does not implement anything needing capabilities_2 regs
+    //   
+    register exp_capabilities {
+        field dpt { param init_val = 0x0; } // device port type endpoint
+    }                
+    register exp_dev_cap {
+        field el0al { param init_val = 0x01; } // 128 ns 
+        field el1al { param init_val = 0x01; } // 2 us 
+        field rber  { param init_val = 0x1; }  // must be 1 for PCIe, basically
+    }
+    
+    register exp_link_cap {
+        field mls    { param init_val = 0x0; }  // Link Speed
+        field mlw    { param init_val = 0x4; }  // Max Link Width
+    }
+    register exp_link_status {
+        field ls  { param init_val = 0x1; }
+        field nlw { param init_val = 0x4; }  // Link width, should be != 0
+    }
+}
+
+
+//----------------------------------------------------------------------
+//
+// MSI-X interrupts
+// - Driver software needs to configure how to send each interrupt in the table,
+//   configuring message data and message address
+// - This all just works automatically with the Linux general PCIe code
+//
+//----------------------------------------------------------------------
+bank dev_msix_table is (msix_table_bank, 
+                        function_mapped_bank)  {
+    param desc = "PCIe MSI-X Table";
+    param function       = 2;  // used to connect to the PCIe BARs    
+    param num_of_vectors = MSIX_VECTORS;
+}
+
+bank dev_msix_pba is (msix_pba_bank,
+                      function_mapped_bank ) {
+    param desc = "PCIe MSI-X Pending Bit Array";
+    param function       = 3;  // used to connect to the PCIe BARs
+    param num_of_vectors = MSIX_VECTORS;
+} 
+
+
+//----------------------------------------------------------------------
+//
+// Control register bank declaration 
+// - Just names and offsets, no functionality
+//
+//----------------------------------------------------------------------
+bank regs is (function_mapped_bank) {
+    param desc = "LED controller main control register bank";
+    param documentation = "Registers used to control the device operation." +
+                              " The main HW/SW interface of the device."; 
+    param function      = 1;  // used to connect to the PCIe BARs
+    
+    param register_size = 4;
+
+    //
+    // Registers controlling the device itself - or rather, the main processor
+    // 
+    register enable @ 0x0000 "Enable device operation";
+    register reset  @ 0x0004 "Reset the device";
+
+    //
+    // Registers controlling the display and display status
+    // 
+    register update_display_request            @ 0x0010 "Update of display requested";
+    register update_display_status             @ 0x0014 "Current status of display update operation";
+    register update_display_interrupt_control  @ 0x0018 "Interrupt control for display updates";
+    
+    //
+    // Framebuffer
+    // 
+    register framebuffer_base_address          @ 0x001c  "Base address of the framebuffer in local memory";
+    
+    //
+    // Advanced display functions that firmware would implement
+    // 
+    register color_all         @ 0x0020 "Write this register to change all pixels to a single color";
+    register dprog_base_addr   @ 0x0024 "Base address for programmed display update";
+    register dprog_status      @ 0x0028 "Programmed display status";
+    register dprog_control     @ 0x002c "Control register for programmed display";
+    
+    
+    //
+    // Buttons and toggles
+    //
+    register button_interrupt_control @ 0x200 "Button interrupt control";
+    register button_a_status          @ 0x204 "Status of button A";
+    register button_b_status          @ 0x208 "Status of button B";
+    register button_n_status [i < 14]     @ 0x20c + i*4 "Reserved for future buttons";
+    register toggle_status   [i < 16]     @ 0x244 + i*4 "Status of the toggles";
+            
+    //
+    // Registers used to configure the device I2C
+    //
+    // From offset 0x0800 and on
+    // 
+    // These are set up by driver software 
+    // Since the device firmware could be generic, with the driver setting up
+    // particulars - and allowing a user to customize their device theoretically
+    // 
+    register display_i2c_base            @ 0x0800  "I2C address of the first LED in the display"; 
+    register display_width               @ 0x0804  "Width of the LED display" ;
+    register display_height              @ 0x0808  "Height of the LED display" ;    
+    register button_a_i2c_address        @ 0x0810  "I2C address of button A";
+    register button_b_i2c_address        @ 0x0814  "I2C address of button B";
+    register button_n_i2c_address [i < 14]   @ 0x0818 + i*4 "Reserved for future buttons";
+    register toggle_i2c_address   [i < 16]   @ 0x0850 + i*4 "I2C addresses of the toggles";    
+}
+
+// Bank for the memory BAR - if needed at all
+bank memory_bar is (function_mapped_bank) {
+    param desc = "PCIe BAR memory bank pointing at the device-internal memory map";
+    param function      = 4;  // used to connect to the PCIe BARs
+}
+
+// Bank for i2c state tracking, never mapped to processor access
+// really could also be done as a set of registers, but it is more
+// readable in the register viewer this way
+bank i2cregs {
+    param desc = "Register bank holding I2C state (not software addressable)";
+    
+    param register_size = 1;
+  
+    register i2c_bus_state              @ 0x00 is (read_only) "i2c bus state";
+    
+    register i2c_bus_requested          @ 0x01 is (read_only) "i2c bus request tracking";
+    
+    // State tracking for writing to multicolor LEDs 
+    register i2c_inbound_writing_state  @ 0x02 is (read_only) "Inbound write, current state";
+    
+    // State tracking for writing to multicolor LEDs 
+    register i2c_write_led_state        @ 0x03 is (read_only) "Outbound LED write operation, current state";
+
+    // State tracking for reading state from toggles
+    register i2c_read_toggle_state      @ 0x04 is (read_only) "Outbound toggle read operation, current state";
+
+    // General reusable i2c data buffer
+    register i2c_data_ptr                          @ 0x10 is (read_only) "i2c transfer byte pointer";
+    register i2c_counter                           @ 0x11 is (read_only) "i2c internal counter"; 
+    register i2c_data_buffer [i < I2C_DATA_BUF_SIZE]   @ 0x12 + i           "Data buffer for i2c transfers";     
+
+}
+
+
+
+//----------------------------------------------------------------------
+//
+// Register bank implementation  
+// - Adding the functionality to the names and offsets declared above
+//
+//----------------------------------------------------------------------
+template bb_unimplemented {
+    // Things that the black box does not implement are documented
+    // as design limitations 
+    is design_limitation;
+}
+
+template i2c_address_7_reg {
+    // 32 bit register that holds a 7-bit address
+    // plus the rest is just reserved
+    field addr  @ [6:0] "7-bit i2c address";
+    field unused  @ [31:7] is (reserved) "unused";
+}
+
+//-----------------------
+// main control registers
+//-----------------------
+bank regs {
+    
+    //
+    // Control registers
+    // 
+    register enable {
+        // When written to 1, start periodic work
+        // When written to 0, stop periodic work
+        field E  @ [0] is write "Subsystem active"  {
+            method write(uint64 value) {
+                if(value!=this.val) {
+                    this.val = value; // Change current value of field
+                    // Check for change
+                    if(value==1) {
+                        // going active
+                        dev_enable();
+                    } else {
+                        // going inactive
+                        dev_disable();
+                    }
+                }
+            }
+        } 
+        field reserved  @ [31:1] is (reserved);
+    }
+    register reset is unimpl;
+    
+    //
+    // Display update registers
+    //
+    register update_display_request is write {
+        method write(uint64 value) {
+            // Any value becomes a one - totally ignore inbound value! 
+            // Register auto-clears once operation is complete, and then the
+            // status register is set.
+            if(this.val == 0) {
+                this.val = 1; 
+                WLED_update_display_start();
+            } else {
+                // Already an update in progress, log spec violation
+                log spec_viol, 1 : "Update requested but update already in progress, ignoring";
+            } 
+        }
+    }
+
+    register update_display_status {
+        field done  @ [0] is (write_1_clears) "Set when a draw operation has completed";
+        field reserved  @ [31:1] is (reserved);
+    }
+    
+    register update_display_interrupt_control {
+        field enable  @ [0] {
+            param init_val = 0;  // default to off
+        }
+        field reserved  @ [31:1] is (reserved);
+    }
+    
+    //
+    // Configuration registers
+    //
+    register framebuffer_base_address {
+        param init_val = 0x1000;
+    }
+
+    // 
+    // Advanced functions
+    // - The black-box model does not model these more complex
+    //   firmware functions
+    // 
+    register color_all                 is (bb_unimplemented); 
+    register dprog_base_addr           is (bb_unimplemented);
+    register dprog_status              is (bb_unimplemented);
+    register dprog_control             is (bb_unimplemented);
+    
+    // 
+    // Button and toggle registers
+    //
+    register button_interrupt_control  {
+        field enable  @ [0] {
+            param init_val = 0;  // default to off
+        }
+        field reserved  @ [31:1] is (reserved);
+    }
+    register button_a_status           is (write_1_clears);
+    register button_b_status           is (write_1_clears);
+    register button_n_status [i < 14]      is (reserved);
+    register toggle_status [i < 16]        is (read_only);
+    
+    //
+    // Configuration
+    //
+    register display_width {
+        param init_val = 0x04;
+    }
+    register display_height {
+        param init_val = 0x04;
+    }    
+    register display_i2c_base            is (i2c_address_7_reg); 
+    register button_a_i2c_address        is (i2c_address_7_reg);
+    register button_b_i2c_address        is (i2c_address_7_reg);
+    register button_n_i2c_address [i < 14]   is (i2c_address_7_reg);
+    register toggle_i2c_address [i < 16]     is (i2c_address_7_reg);    
+    
+}
+
+
+//----------------
+// i2c registers
+//----------------
+bank i2cregs {
+    
+    register i2c_bus_state {
+        field busy   @ [0]   {
+            param desc = "Is the I2C bus busy?";
+        }            
+        field rsv  @ [7:1] is (reserved);
+    }
+
+    register i2c_bus_requested {
+        field busy   @ [0]   {
+            param desc = "The device has started to request the bus";
+        }            
+        field rsv  @ [7:1] is (reserved);
+    }
+        
+    register i2c_inbound_writing_state {
+        is soft_reset_val;
+        param soft_reset_val = OP_idle;
+    }
+
+    register i2c_write_led_state {
+        is soft_reset_val;
+        param soft_reset_val = OP_idle;
+    }
+ 
+    register i2c_read_toggle_state {
+        is soft_reset_val;
+        param soft_reset_val = OP_idle;
+    }
+    
+    register i2c_data_ptr {
+        // call init transfer to reset the data pointer to zero
+        method init_transfer() {
+            this.val = 0;
+        }
+        // call increment to increment to next data buffer element
+        // with a wrap-around at 16. 
+        method increment() {
+            this.val = this.val + 1;
+            if(this.val >= I2C_DATA_BUF_SIZE) {
+                log spec_viol, 2, i2c_comms: "i2c data ptr wrapped around, too much data received";
+                this.val = 0;
+            }
+        }
+    }
+    
+    // store a data byte in the buffer and increment the pointer
+    // method sits at the bank level as it involves multiple different registers
+    method buffer_store_byte(uint8 byte) {
+        i2c_data_buffer[i2c_data_ptr.val].val=byte;
+        i2c_data_ptr.increment();
+    }
+
+}
+
+//---------------------------------------------------------------
+// 
+// Init
+//
+//---------------------------------------------------------------
+method init() {
+    // Initialize the local state of the object when created.
+    // In DML 1.4, attribute initial values can be set from the
+    // init method of the attributes, leaving device-level init
+    // to set up aspects that are not in attributes. 
+}
+
+
+
+//----------------------------------------------------------------------
+//
+// PCIe Interface, to support PCIe hotplug messages. 
+// - The presence of this interface is used by Simics to determine if
+//   the device is a PCIe device or a plain PCI device
+// - Not used in the training, but needed to satisfy interface requirements
+// - Simple implementation, stripped down to "unimpl"
+//
+//----------------------------------------------------------------------
+implement pci_express {
+    method send_message(conf_object_t *src, pcie_message_type_t type,
+                        byte_string_t payload) -> (int) {
+        local int h;
+        // Just log unimplemented, no point in wasting code on 
+        // implementing something that is not used                   
+        log unimpl: "PCI Express message: %d", type;
+        h = 0;
+        return h;
+    }
+}
+

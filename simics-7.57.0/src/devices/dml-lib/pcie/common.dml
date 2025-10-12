@@ -1,0 +1,2222 @@
+/*
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "simics/devs/pci.dml";
+import "simics/devs/ram.dml";
+import "simics/model-iface/transaction.dml";
+import "simics/simulator-api.dml";
+
+import "pcie/capabilities.dml";
+import "pcie/extended-capabilities.dml";
+import "pcie/bridge.dml";
+import "pcie/sriov-capabilities.dml";
+import "pcie/helpers.dml";
+
+loggroup PCIe_config;
+loggroup PCIe_DMA;
+loggroup PCIe_IRQ;
+
+param pcie_version default 5.0;
+
+param PCIe_Vendor_ID_PCI_SIG = 0x0001;
+
+/**
+   ## pcie_endpoint
+
+   Used by devices that simulate a single PCIe function with a Type 0
+   header. Implements the `pcie_device` interface, defines a `pcie_config` bank
+   of type `type_0_bank`, and an `upstream_target` connect.
+   Also defines a `phy` port that handles transactions related to
+   the PCIe physical layer.
+
+   Inherits templates: `pcie_phy`, `pcie_hreset`, `pcie_hot_reset`, `pcie_device`.
+
+*/
+template pcie_endpoint {
+    is pcie_phy;
+    is pcie_hreset;
+    is pcie_hot_reset;
+    is pcie_device;
+    bank pcie_config is type_0_bank;
+    connect upstream_target is upstream_target;
+}
+
+/**
+   ## pcie_multifunction_endpoint
+
+   Similar to `pcie_endpoint` but doesn't define a `pcie_config` bank. Can be
+   used by devices that simulate multiple functions. A device using this
+   template must define at least one bank that is an instance of the
+   `physical_config_bank` template. Also defines a `phy` port that handles
+    transactions related to the PCIe physical layer.
+
+   Inherits templates: `pcie_phy`, `pcie_hreset`, `pcie_hot_reset`, `pcie_device`.
+*/
+template pcie_multifunction_endpoint {
+    is pcie_phy;
+    is pcie_hreset;
+    is pcie_hot_reset;
+    is pcie_device;
+    connect upstream_target is upstream_target;
+}
+
+/**
+   ## pcie_device
+
+   Implements the `pcie_device` interface, with default methods for connect and
+   disconnect that finds all instances of `physical_config_bank` in this device
+   and lets them map/demap themselves and their resources in the upstream
+   target.
+
+   Assumes that there is a connect `upstream_target` which it sets/clears
+   when the device is connected/disconnected.
+*/
+template pcie_device {
+    param pcie_functions: sequence(config_bank);
+    param pcie_functions = each config_bank in (this);
+
+    implement pcie_device {
+        method hot_reset() default {
+            log info, 1: "Hot reset triggered on %s", this.qname;
+            soft_reset();
+        }
+
+        method connected(conf_object_t *upstream_obj,
+                         uint16 device_id) default {
+            if (upstream_target.obj && upstream_target.obj != upstream_obj) {
+                log error:
+                    "can't connect to '%s', currently connected to '%s'",
+                    SIM_object_name(upstream_obj),
+                    SIM_object_name(upstream_target.obj);
+                return;
+            }
+            upstream_target.set(upstream_obj);
+            foreach b in (each physical_config_bank in (this.parent)) {
+                b.update_function(device_id);
+                b.update_mappings(PCIE_Type_Cfg);
+                b.update_mappings(PCIE_Type_Mem);
+                b.update_mappings(PCIE_Type_IO);
+                b.update_mappings(PCIE_Type_Other);  // Expansion ROM
+            }
+        }
+
+        method disconnected(conf_object_t *upstream_obj,
+                            uint16 device_id) default {
+            if (upstream_target.obj != upstream_obj) {
+                log error:
+                    "can't disconnect from '%s', currently connected to '%s'",
+                    SIM_object_name(upstream_obj),
+                    SIM_object_name(upstream_target.obj);
+                return;
+            }
+            foreach b in (each physical_config_bank in (this.parent)) {
+                b.del_mappings(PCIE_Type_Cfg);
+                b.del_mappings(PCIE_Type_Mem);
+                b.del_mappings(PCIE_Type_IO);
+                b.del_mappings(PCIE_Type_Other);  // Expansion ROM
+                b.del_function();
+                foreach l in (b.each_exp_link) {
+                    l.set_link_attributes(PCIE_Link_Speed_Undefined,
+                                          PCIE_Link_Width_Undefined);
+                }
+            }
+            upstream_target.set(NULL);
+        }
+    }
+
+    method get_physical_function(uint16 function_number) ->
+        (physical_config_bank) throws {
+        foreach bank in (each physical_config_bank in (dev)) {
+            if (bank.function == function_number) {
+                return bank;
+            }
+        }
+        throw;
+}
+}
+
+/**
+   ## config_bank
+
+   Base template for register banks that implement a PCIe configuration
+   header. Defines the registers that are common to both Type 0 and Type 1
+   headers, as well as many utility methods. Typically not used
+   directly. Inherit one of the derived templates, e.g. `type_0_bank` or
+   `type_1_bank` instead.
+
+   Uses the following parameters
+   - `function`: The PCIe function number that this bank will use, default 0
+   - `is_physical`: Whether this bank is a physical function, default true
+*/
+template config_bank is (miss_pattern_bank, pcie_function_helpers) {
+    param is_physical: bool;
+    param is_physical default true;
+    param miss_pattern default 0;
+
+    implement pcie_function_info {
+        method get_device_id() -> (uint16) default {
+            return parent.get_device_id();
+        }
+
+        method get_upstream_target() -> (conf_object_t *) default {
+            return upstream_target.obj;
+        }
+
+        method is_virtual_function() -> (bool) default {
+            return !is_physical;
+        }
+
+        method get_bar_map_obj(uint8 bar_offset) -> (conf_object_t *) default {
+            foreach bar in (each pcie_base_address in (bank)) {
+                if (bar.offset == bar_offset)
+                    return bar.get_mapped_obj();
+            }
+            return NULL;
+        }
+    }
+
+    param function : uint8;
+    param function default 0;  // PCIe function-number
+
+    attribute function_number is uint64_attr {
+        param documentation = "PCIe function number of this bank";
+        param configuration = "pseudo";
+        param writable = false;
+        method get() -> (attr_value_t) {
+            return SIM_make_attr_uint64(function);
+        }
+    }
+
+    param is_type_1_header default false;
+    param use_standard_access_templates default true;
+    param use_standard_write_templates default true;
+
+    #if (dml_1_2) {
+        error "PCIe templates are only supported in DML 1.4";
+    }
+
+    register vendor_id        size 2 @ 0x00 is pcie_desc {
+        param pcie_desc = "Vendor ID";
+    }
+    register device_id        size 2 @ 0x02 is pcie_desc {
+        param pcie_desc = "Device ID";
+    }
+    register command          size 2 @ 0x04 is pcie_desc {
+        param pcie_desc = "Command";
+    }
+    register status           size 2 @ 0x06 is pcie_desc {
+        param pcie_desc = "Status";
+    }
+    register revision_id      size 1 @ 0x08 is pcie_desc {
+        param pcie_desc = "Revision ID";
+    }
+    register class_code       size 3 @ 0x09 is pcie_desc {
+        param pcie_desc = "Class Code";
+    }
+    register cache_line_size  size 1 @ 0x0c is pcie_desc {
+        param pcie_desc = "CacheLine Size";
+    }
+    register latency_timer    size 1 @ 0x0d is pcie_desc {
+        param pcie_desc = "Latency Timer";
+    }
+    register header_type      size 1 @ 0x0e is pcie_desc {
+        param pcie_desc = "Header Type";
+    }
+    register bist             size 1 @ 0x0f is pcie_desc {
+        param pcie_desc = "Build-in Self Test";
+    }
+    register capabilities_ptr size 1 @ 0x34 is pcie_desc {
+        param pcie_desc = "Capabilities Pointer";
+    }
+    register interrupt_line   size 1 @ 0x3c is pcie_desc {
+        param pcie_desc = "Interrupt Line";
+    }
+    register interrupt_pin    size 1 @ 0x3d is pcie_desc {
+        param pcie_desc = "Interrupt Pin";
+    }
+
+    register command {
+        field io  @ [0:0]   is pcie_desc {
+            param pcie_desc = "I/O Space Enable";
+        }
+        field mem @ [1:1]   is pcie_desc {
+            param pcie_desc = "Memory Space Enable";
+        }
+        field m   @ [2:2]   is pcie_desc {
+            param pcie_desc = "Bus Master Enable";
+        }
+        field sce @ [3:3]   is pcie_desc {
+            param pcie_desc = "Special Cycle Enable";
+        }
+        field mwi @ [4:4]   is pcie_desc {
+            param pcie_desc = "Memory Write and Invalidate";
+        }
+        field vga @ [5:5]   is pcie_desc {
+            param pcie_desc = "VGA Palette Snoop";
+        }
+        field per @ [6:6]   is pcie_desc {
+            param pcie_desc = "Parity Error Response";
+        }
+        field idsel @ [7]   is pcie_desc {
+            param pcie_desc = "Not relevant for PCIe, hardwired to zero";
+        }
+        field se  @ [8:8]   is pcie_desc {
+            param pcie_desc = "SERR# Enable";
+        }
+        field fbb @ [9]     is pcie_desc {
+            param pcie_desc = "Not relevant for PCIe, hardwired to zero";
+        }
+        field id  @ [10:10] is pcie_desc {
+            param pcie_desc = "Interrupt Disable";
+        }
+    }
+
+    register status {
+        field ir  @ [0:0]   is pcie_desc {
+            param pcie_desc = "Immediate Readiness";
+        }
+        field ins @ [3:3]   is pcie_desc {
+            param pcie_desc = "Interrupt Status";
+        }
+        field c   @ [4:4]   is pcie_desc {
+            param pcie_desc = "Capabilities List";
+        }
+        field f66mhz @ [5]   is pcie_desc {
+            param pcie_desc = "Not relevant for PCIe, hardwired to zero";
+        }
+        field fbb @ [7]     is pcie_desc {
+            param pcie_desc = "Not relevant for PCIe, hardwired to zero";
+        }
+        field pe  @ [8:8]   is pcie_desc {
+            param pcie_desc = "Master Data Parity Error";
+        }
+        field dst @ [10:9]  is pcie_desc {
+            param pcie_desc = "Not relevant for PCIe, hardwired to zero";
+        }
+        field sta @ [11:11] is pcie_desc {
+            param pcie_desc = "Signaled Target Abort";
+        }
+        field rta @ [12:12] is pcie_desc {
+            param pcie_desc = "Received Target Abort";
+        }
+        field rma @ [13:13] is pcie_desc {
+            param pcie_desc = "Received Master Abort";
+        }
+        field ssa @ [14:14] is pcie_desc {
+            param pcie_desc = "Signaled System Error";
+        }
+        field dpe @ [15:15] is pcie_desc {
+            param pcie_desc = "Detected Parity Error";
+        }
+    }
+
+    register class_code {
+        field programming_interface @ [7:0]   is pcie_desc {
+            param pcie_desc = "Programming Interface";
+        }
+        field sub_class_code        @ [15:8]  is pcie_desc {
+            param pcie_desc = "Sub-Class Code";
+        }
+        field base_class_code       @ [23:16] is pcie_desc {
+            param pcie_desc = "Base Class Code";
+        }
+    }
+
+    register header_type {
+        field type @ [6:0] is pcie_desc {
+            param pcie_desc = "Header Layout";
+        }
+        field mf   @ [7:7] is pcie_desc {
+            param pcie_desc = "Multi-Function Device";
+        }
+    }
+
+    register bist {
+        field cc @ [3:0] is pcie_desc {
+            param pcie_desc = "Completion Code";
+        }
+        field sb @ [6:6] is pcie_desc {
+            param pcie_desc = "Start BIST";
+        }
+        field bc @ [7:7] is pcie_desc {
+            param pcie_desc = "BIST Capable";
+        }
+    }
+
+    register interrupt_pin {
+        field pin @ [3:0] is pcie_desc {
+            param pcie_desc = "Legacy Interrupt Message";
+        }
+    }
+
+    register status {
+        field c {
+            param init_val default capabilities_ptr.init_val > 0 ? 1 : 0;
+        }
+    }
+
+    /**
+       ### Common methods
+    */
+
+    /**
+      #### `update_function(uint16 device_id)`
+
+      Updates the mapping of this function's configuration header in the
+      upstream target, using the parameter **device_id**.
+    */
+    saved bool is_mapped;
+    saved uint16 mapped_device_id;
+    shared method update_function(uint16 device_id);
+    method update_function(uint16 device_id) default {
+        del_function();
+        if (upstream_target.connected()) {
+            upstream_target.pcie_map.add_function(
+                bank.obj, device_id | bank.function);
+            is_mapped = true;
+            mapped_device_id = device_id | bank.function;
+        }
+    }
+
+    /**
+       #### `del_function()`
+
+       Deletes the function from the PCIe hierarchy. The configuration header
+       is no longer accessible over PCIe wire. Additional resources like BARs
+       are still mapped and must be unmapped separately by the user.
+    */
+    shared method del_function();
+    method del_function() default {
+        if (is_mapped && upstream_target.connected()) {
+            upstream_target.pcie_map.del_function(
+                bank.obj, mapped_device_id);
+            is_mapped = false;
+        }
+    }
+
+    /**
+       #### `disable_function()
+
+       Temporarily disables the function from the PCIe hierarchy.
+       The configuration header, BAR resources, expansion ROM
+       and downstream traffic are no longer accessible over PCIe wire.
+    */
+    shared method disable_function();
+    method disable_function() default {
+        if (upstream_target.connected()) {
+            upstream_target.pcie_map.disable_function(mapped_device_id);
+            del_mappings(PCIE_Type_Cfg);
+            del_mappings(PCIE_Type_Msg);
+            del_mappings(PCIE_Type_Mem);
+            del_mappings(PCIE_Type_IO);
+            del_mappings(PCIE_Type_Other);  // Expansion ROM
+        }
+    }
+
+    /**
+       #### `enable_function()
+
+       Enables the function into the PCIe hierarchy.
+       The configuration header, BAR resources, expansion ROM
+       and downstream traffic are now accessible over PCIe wire.
+
+       A function must be added to the PCIe hierarchy for the enablement
+       to take effect.
+    */
+    shared method enable_function();
+    method enable_function() default {
+        if (upstream_target.connected()) {
+            upstream_target.pcie_map.enable_function(mapped_device_id);
+            update_mappings(PCIE_Type_Cfg);
+            update_mappings(PCIE_Type_Msg);
+            update_mappings(PCIE_Type_Mem);
+            update_mappings(PCIE_Type_IO);
+            update_mappings(PCIE_Type_Other);  // Expansion ROM
+        }
+    }
+
+    /**
+       #### `get_device_id() -> (uint16)`
+
+       Returns the Device ID of this function, as known by the upstream target.
+       Uses the parameter **pcie_obj** which defaults to **obj**.
+    */
+    param pcie_obj default obj;  // used as ATOM_initiator and in get_device_id
+    shared method get_device_id() -> (uint16);
+    method get_device_id() -> (uint16) default {
+        if (upstream_target.connected())
+            return upstream_target.pcie_map.get_device_id(pcie_obj);
+        return 0;
+    }
+
+    method set_captured_segment_id(bool valid, uint8 value) default {
+        foreach d3 in (each dev3_capability in (this)) {
+            d3.set_captured_segment_id(valid, value);
+        }
+    }
+
+    method get_captured_segment_id() -> (bool, uint8) default {
+        foreach d3 in (each dev3_capability in (this)) {
+            return d3.get_captured_segment_id();
+        }
+        return (false, 0);
+    }
+
+    /**
+       #### `verify_pasid(pcie_pasid_info_t pasid) -> (bool)`
+
+       Verifies the function is correctly configured to support the contents of
+       the `pasid` argument. If the check fails it is considered a modelling error.
+       Returns true on success.
+    */
+    method verify_pasid(pcie_pasid_info_t pasid) -> (bool) {
+        foreach cap in (each pasid_capability in (this))
+            return cap.verify_pasid(pasid);
+        log error: "%s, PASID capability is missing!", this.qname;
+        return false;
+    }
+    /**
+       #### `verify_pasid_with_at(pcie_pasid_info_t pasid, pcie_at_t at) -> (bool)`
+
+       Verifies the function is correctly configured to support the contents of the `pasid`
+       argument and the type of argument `at`.
+       If the check fails it is considered a modelling error.
+       Returns true on success.
+    */
+    method verify_pasid_with_at(pcie_pasid_info_t pasid, pcie_at_t at) -> (bool) {
+        foreach cap in (each pasid_capability in (this))
+            return cap.verify_pasid_with_at(pasid, at);
+        log error: "%s, PASID capability is missing!", this.qname;
+        return false;
+    }
+
+    /**
+       #### `del_mappings(pcie_type_t type)`
+
+       Deletes all BAR mappings of type **type**, that this function has added.
+    */
+    shared method del_mappings(pcie_type_t type);
+    method del_mappings(pcie_type_t type) default {
+        foreach bar in (each abstract_base_address in (this)) {
+            if (bar.type == type)
+                bar.del_map();
+        }
+    }
+
+    /**
+       #### `update_mappings(pcie_type_t type)`
+
+       Updates all BAR mappings of type **type**, that this function has added.
+    */
+    shared method update_mappings(pcie_type_t type);
+    method update_mappings(pcie_type_t type) default {
+        foreach bar in (each abstract_base_address in (this)) {
+            if (bar.type == type)
+                bar.update_map();
+        }
+    }
+
+    /**
+       #### `lock_hwinit_registers()`
+
+       Locks all registers that use the template `hwinit`
+    */
+    method lock_hwinit_registers() {
+        foreach r in (each hwinit in (this))
+            r.is_writable = false;
+    }
+
+    /**
+       #### `unlock_hwinit_registers()`
+
+       Unlocks all registers that use the template `hwinit`
+    */
+    method unlock_hwinit_registers() {
+        foreach r in (each hwinit in (this))
+            r.is_writable = true;
+    }
+
+    /**
+       #### `raise_legacy_interrupt()`
+
+       Raises the PCIe Legacy Interrupt pin INTx, as configured in the
+       `interrupt_pin` register and if enabled in the `status.ins` register
+       field.
+    */
+    method raise_legacy_interrupt() default {
+        if (interrupt_pin.val > 0) {
+            status.ins.set(1);
+            if (command.id.val == 0)
+                set_legacy_interrupt(interrupt_pin.val, 1);
+        }
+    }
+
+    /**
+       #### `lower_legacy_interrupt()`
+
+       Lowers the PCIe Legacy Interrupt pin INTx, as configured in the
+       `interrupt_pin` register
+    */
+    method lower_legacy_interrupt() default {
+        if (interrupt_pin.val > 0) {
+            status.ins.set(0);
+            set_legacy_interrupt(interrupt_pin.val, 0);
+        }
+    }
+
+    method get_legacy_intx_code(pci_interrupt_pin_t pin,
+                                int level) -> (pcie_message_type_t) throws {
+        switch (pin) {
+        case PCI_INTERRUPT_INTA:
+            return level > 0 ? PCIE_Msg_Assert_INTA : PCIE_Msg_Deassert_INTA;
+        case PCI_INTERRUPT_INTB:
+            return level > 0 ? PCIE_Msg_Assert_INTB : PCIE_Msg_Deassert_INTB;
+        case PCI_INTERRUPT_INTC:
+            return level > 0 ? PCIE_Msg_Assert_INTC : PCIE_Msg_Deassert_INTC;
+        case PCI_INTERRUPT_INTD:
+            return level > 0 ? PCIE_Msg_Assert_INTD : PCIE_Msg_Deassert_INTD;
+        default:
+            log spec_viol, 1, PCIe_IRQ: "invalid legacy interrupt pin '%d'"
+                                      , pin;
+            throw;
+        }
+    }
+
+    method set_legacy_interrupt(pci_interrupt_pin_t pin, int level) default {
+        saved uint8 legacy_interrupt_state;
+
+        if (!upstream_target.connected())
+            return;
+
+        if (legacy_interrupt_state[pin] == level) {
+            log info, 2, PCIe_IRQ: "%s legacy interrupt pin %d is not required",
+                level == 0 ? "lowering" : "raising", pin;
+            return;
+        }
+
+        local pcie_message_type_t msg;
+        try {
+            msg = get_legacy_intx_code(pin, level);
+        } catch {
+            return;
+        }
+
+        local pcie_error_t err =
+            message.send(0, msg, PCIE_Msg_Route_Upstream);
+        if (err == PCIE_Error_No_Error)
+            legacy_interrupt_state[pin] = level;
+        else
+            log info, 2, PCIe_IRQ: "send legacy interrupt failed";
+    }
+
+    /**
+       #### `issue_transaction(transaction_t *t, uint64 addr) -> (pcie_error_t)`
+
+       Low-level method for issuing a transaction into some PCIe address space.
+       Prepends required PCIe atoms to a transaction before issuing it to
+       `upstream_target`.
+    */
+    method issue_transaction(transaction_t *t, uint64 addr) -> (pcie_error_t) {
+        local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+        if ((command.m.val != 1)
+            && ((type == PCIE_Type_Mem) || type == PCIE_Type_IO)) {
+            log spec_viol: "A PCIe function must not issue a %s Request"
+                + " when the Bus Master Enable bit is not set.",
+                pcie_type_name(type);
+            return PCIE_Error_Unsupported_Request;
+        }
+
+        local pcie_error_ret_t er;
+        local atom_t atoms[4] = {
+            ATOM_pcie_requester_id(get_device_id()),
+            ATOM_initiator(pcie_obj),
+            ATOM_pcie_error_ret(&er),
+            ATOM_list_end(0),
+        };
+        local transaction_t tt = { .atoms = atoms, .prev = t, ... };
+        local exception_type_t ex = upstream_target.issue(&tt, addr);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 1 then 2: "PCIe %s %s %d bytes @ 0x%x failed: %d (%s)",
+                pcie_type_name(ATOM_get_transaction_pcie_type(&tt)),
+                SIM_transaction_is_write(&tt) ? "Write" : "Read",
+                SIM_transaction_size(&tt), addr, er.val,
+                pcie_error_name(er.val);
+            if (er.val == PCIE_Error_Not_Set)
+                return PCIE_Error_Master_Abort;
+            return er.val;
+        }
+        return PCIE_Error_No_Error;
+    }
+
+    group memory {
+        /**
+           ### Memory methods
+
+           Utility methods for reading and writing PCIe Memory data. Reads or
+           writes PCIe Memory data in `upstream_target.map_target`.
+
+           #### `memory.read(uint64 addr, uint64 size) -> (pcie_error_t, uint64)`
+           #### `memory.read_bytes(uint64 addr, buffer_t buf) -> (pcie_error_t)`
+           #### `memory.read_custom(uint64 addr, buffer_t buf, atom_t *extra_atoms) -> (pcie_error_t)`
+           #### `memory.write(uint64 addr, uint64 value, uint64 size) -> (pcie_error_t)`
+           #### `memory.write_bytes(uint64 addr, bytes_t bytes) -> (pcie_error_t)`
+           #### `memory.write_custom(uint64 addr, bytes_t bytes, atom_t *extra_atoms) -> (pcie_error_t)`
+
+        */
+        method write(uint64 addr, uint64 value, uint64 size) -> (pcie_error_t) {
+            local bytes_t bytes = {
+                .data = cast(&value, uint8 *),
+                .len = size,
+            };
+            return write_custom(addr, bytes, NULL);
+        }
+
+        method write_bytes(uint64 addr, bytes_t bytes) -> (pcie_error_t) {
+            return write_custom(addr, bytes, NULL);
+        }
+
+        method write_custom(uint64 addr, bytes_t bytes, atom_t *extra_atoms) ->
+            (pcie_error_t) {
+            local int num_extra_atoms;
+            if (extra_atoms != NULL) {
+                local const atom_t *a;
+                for (a = extra_atoms; a->id != Sim_Atom_Id_list_end; a++)
+                    num_extra_atoms++;
+            }
+
+            local atom_t atoms[5 + num_extra_atoms];
+            local int j = 0;
+            atoms[j++] = ATOM_pcie_type(PCIE_Type_Mem);
+            atoms[j++] = ATOM_flags(Sim_Transaction_Write);
+            atoms[j++] = ATOM_data(cast(bytes.data, uint8 *));
+            atoms[j++] = ATOM_size(bytes.len);
+            for (local int i = 0; i < num_extra_atoms; i++)
+                atoms[j++] = extra_atoms[i];
+            atoms[j] = ATOM_list_end(0);
+
+            local transaction_t t = { .atoms = atoms, ... };
+            return issue_transaction(&t, addr);
+        }
+
+        method read(uint64 addr, uint64 size)
+            -> (pcie_error_t, uint64) {
+            local uint64 value;
+            local buffer_t buf = { .data = cast(&value, uint8 *), .len = size };
+            local pcie_error_t err = read_custom(addr, buf, NULL);
+            return (err, value);
+        }
+
+        method read_bytes(uint64 addr, buffer_t buf) -> (pcie_error_t) {
+            return read_custom(addr, buf, NULL);
+        }
+
+        method read_custom(uint64 addr, buffer_t buf, atom_t *extra_atoms) ->
+            (pcie_error_t) {
+            local int num_extra_atoms;
+            if (extra_atoms != NULL) {
+                local const atom_t *a;
+                for (a = extra_atoms; a->id != Sim_Atom_Id_list_end; a++)
+                    num_extra_atoms++;
+            }
+
+            local atom_t atoms[4 + num_extra_atoms];
+            local int j = 0;
+            atoms[j++] = ATOM_pcie_type(PCIE_Type_Mem);
+            atoms[j++] = ATOM_data(buf.data);
+            atoms[j++] = ATOM_size(buf.len);
+            for (local int i = 0; i < num_extra_atoms; i++)
+                atoms[j++] = extra_atoms[i];
+            atoms[j] = ATOM_list_end(0);
+
+            local transaction_t t = { .atoms = atoms, ... };
+            return issue_transaction(&t, addr);
+        }
+    }
+
+    group message "PCIe Message handling methods" {
+        /**
+           ### Message methods - receiving
+
+           The following methods handle receiving messages. Their default
+           implementations are meant to be overridden by devices that wish to
+           handle the particular type of message. Unless otherwise noted, the
+           default implementation logs an **unimpl** message and returns
+           `false`, which indicates a 'Completer Abort'.
+
+           #### `message.operation(transaction_t *t, uint64 addr) -> (bool)`
+
+           Main method for receiving messages. Inspects the message type and
+           redirects to the appropriate method for handling that specific
+           message.
+
+           #### `message.ats_invalidate(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.prs_request(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.prs_response(transaction_t *t, uint64 addr) -> (bool)`
+
+           These three methods redirect to their `*_received` counterparts in
+           the `ats_capability` group, if present.
+
+           #### `message.vendor_defined_type_1(transaction_t *t, uint64 addr) -> (bool)`
+
+           PCIe demands that Vendor Defined Type 1 messages are silently
+           ignored, if not implemented. This method logs **unimpl** on level 2
+           and returns `true`, by default.
+
+           #### `message.pm_active_state_nak(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.pm_turn_off(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.unlock(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.set_slot_power_limit(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.vendor_defined_type_0(transaction_t *t, uint64 addr) -> (bool)`
+           #### `message.hot_plug(transaction_t *t, uint64 addr) -> (bool)`
+
+           Hot Plug messages are obsolete, according to PCIe, but must be
+           silently ignored.  This method logs **unimpl** on level 2 and
+           returns 2, by default.
+
+           #### `message.unknown(transaction_t *t, uint64 addr, pcie_message_type_t code) -> (bool)`
+
+           This method handles message types that are unknown to
+           `message.operation`, and gets the message type as a parameter.
+
+           ### Message methods - sending
+
+           The following methods can be used to send PCIe messages.
+           The **addr** parameter contains the 8-byte address-field of the message.
+           As in a real world TLP, the Device ID is the upper bits (63 through 48) of
+           the address, while the lower bits may hold other message-specific
+           information. The **type** and **route** parameters indicate the
+           message type and the routing information.
+
+           For `message.send_bytes` the additional parameter **bytes** is used
+           for sending data in the message payload.
+
+           For `message.send_custom` the additional parameter **extra_atoms** is used
+           for devices to append additional required atoms that are not added automatically
+           by the library. These could be vendor specific atoms,
+           the destination segment atom (Sim_Atom_Id_pcie_destination_segment), etc.
+
+           #### `message.send(uint64 addr, pcie_message_type_t type, pcie_msg_route_t route) -> (pcie_error_t)`
+           #### `message.send_bytes(uint64 addr, pcie_message_type_t type, pcie_msg_route_t route, bytes_t bytes`
+           #### `message.send_custom(uint64 addr, pcie_message_type_t type, pcie_msg_route_t route, bytes_t bytes, atom_t extra_atoms[]`
+
+        */
+        method operation(transaction_t *t, uint64 addr) -> (bool) default {
+            local pcie_message_type_t code =
+                ATOM_get_transaction_pcie_msg_type(t);
+            log info, 3: "%s Received message %s", this.qname, pcie_message_type_name(code);
+
+            switch (code) {
+                /* This is the downstream channel, so only messages that can go
+                   in that direction have stub methods */
+            case PCIE_ATS_Invalidate:
+                return ats_invalidate(t, addr);
+            case PCIE_PRS_Response:
+                return prs_response(t, addr);
+            case PCIE_PM_Turn_Off:
+                return pm_turn_off(t, addr);
+            case PCIE_Unlock:
+                return unlock(t, addr);
+            case PCIE_Vendor_Defined_Type_0:
+                return vendor_defined_type_0(t, addr);
+            case PCIE_Vendor_Defined_Type_1:
+                return vendor_defined_type_1(t, addr);
+            default:
+                return unknown(t, addr, code);
+            }
+        }
+
+        method ats_invalidate(transaction_t *t, uint64 addr) -> (bool) default {
+            foreach ats in (each ats_capability in (this.parent)) {
+                return ats.invalidate_received(t, addr);
+            }
+            log unimpl: "ATS invalidate not implemented";
+            return false;
+        }
+
+        method prs_response(transaction_t *t, uint64 addr) -> (bool) default {
+            foreach prs in (each prs_capability in (this.parent)) {
+                return prs.page_response_received(t, addr);
+            }
+            log unimpl: "PRS response not implemented";
+            return false;
+        }
+
+        method pm_turn_off(transaction_t *t, uint64 addr) -> (bool) default {
+            log unimpl: "PM turn off not implemented";
+            return false;
+        }
+
+        method unlock(transaction_t *t, uint64 addr) -> (bool) default {
+            log unimpl: "Unlock not implemented";
+            return false;
+        }
+
+        method vendor_defined_type_0(transaction_t *t, uint64 addr)
+            -> (bool) default {
+            log unimpl: "VDM type 0 not implemented";
+            return false;
+        }
+
+        method vendor_defined_type_1(transaction_t *t, uint64 addr)
+            -> (bool) default {
+            // VDM1 must be silently discarded if not implemented
+            log unimpl, 2: "VDM type 1 not implemented";
+            return true;
+        }
+
+        method unknown(transaction_t *t,
+                       uint64 addr,
+                       pcie_message_type_t code) -> (bool) default {
+            log unimpl: "PCIe Msg '%s' (%d) not implemented",
+                pcie_message_type_name(code), code;
+            return false;
+        }
+
+        method send_bytes(uint64 addr,
+                          pcie_message_type_t type,
+                          pcie_msg_route_t route,
+                          bytes_t bytes) -> (pcie_error_t) {
+            return send_custom(addr, type, route, bytes, NULL);
+        }
+
+        method send(uint64 addr,
+                    pcie_message_type_t type,
+                    pcie_msg_route_t route) -> (pcie_error_t) {
+            local bytes_t bytes;  // zalloc'd
+            return send_bytes(addr, type, route, bytes);
+        }
+        method send_custom(uint64 addr,
+                          pcie_message_type_t type,
+                          pcie_msg_route_t route,
+                          bytes_t bytes,
+                          atom_t* extra_atoms) -> (pcie_error_t) {
+            local int num_extra_atoms;
+            if (extra_atoms != NULL) {
+                local const atom_t *a;
+                for (a = extra_atoms; a->id != Sim_Atom_Id_list_end; a++)
+                    num_extra_atoms++;
+            }
+            local atom_t atoms[7 + num_extra_atoms];
+            local int j = 0;
+
+            atoms[j++] = ATOM_pcie_type(PCIE_Type_Msg);
+            atoms[j++] = ATOM_pcie_msg_route(route);
+            atoms[j++] = ATOM_pcie_msg_type(type);
+            atoms[j++] = ATOM_flags(Sim_Transaction_Write);
+            atoms[j++] = ATOM_size(bytes.len);
+            atoms[j++] = ATOM_data(cast(bytes.data, uint8 *));
+            for (local int i = 0; i < num_extra_atoms; i++)
+                atoms[j++] = extra_atoms[i];
+
+            atoms[j] = ATOM_list_end(0);
+
+            local transaction_t t = { .atoms = atoms, ... };
+            return issue_transaction(&t, addr);
+        }
+    }
+
+    /**
+       #### `transaction_access(transaction_t *t, uint64 offset, void *aux) -> (exception_type_t)`
+
+       Entrypoint for access into the bank. Redirects to message or default
+       bank operation, depending on the type of the transaction. The pointer to
+       the transaction is passed as `aux` to the default operation, allowing
+       lower level methods to inspect and set atoms. Sets the `pcie_error_ret`
+       atom if present, and not set by lower level methods.
+    */
+    param use_io_memory = false;
+    method transaction_access(transaction_t *t, uint64 offset,
+                                void *aux) -> (exception_type_t) default {
+        local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+        local pcie_error_ret_t *err = ATOM_get_transaction_pcie_error_ret(t);
+
+        local bool access_ok;
+        if (type == PCIE_Type_Msg)
+            access_ok = message.operation(t, offset);
+        else {
+            if (type == PCIE_Type_Cfg) {
+                set_captured_segment_id(ATOM_transaction_pcie_destination_segment(t) != NULL,
+                                        ATOM_get_transaction_pcie_destination_segment(t));
+            }
+            access_ok = default(t, offset, t) == Sim_PE_No_Exception;
+        }
+
+        if (err) {
+            if (err->val == PCIE_Error_Not_Set) {
+                if (access_ok)
+                    err->val = PCIE_Error_No_Error;
+                else
+                    err->val = PCIE_Error_Completer_Abort;
+            } else {
+                access_ok = err->val == PCIE_Error_No_Error;
+            }
+        }
+        return access_ok ? Sim_PE_No_Exception : Sim_PE_IO_Error;
+    }
+
+#if (use_standard_access_templates) {
+    register vendor_id is hwinit;
+    register device_id is hwinit;
+    register command {
+        field sce is ignore_write;
+        field mwi is ignore_write;
+        field vga is ignore_write;
+        field idsel is ignore_write;
+        field fbb is ignore_write;
+    }
+    register status {
+        field ir  is ignore_write;
+        field ins is ignore_write;
+        field c   is ignore_write;
+        field f66mhz is ignore_write;
+        field fbb is ignore_write;
+        field dst is ignore_write;
+    }
+    register revision_id is hwinit;
+    register class_code is hwinit;
+
+    register bist {
+        field cc is ignore_write;
+        field bc is hwinit;
+    }
+    register interrupt_pin {
+        field pin is read_only;
+    }
+}
+#if (use_standard_write_templates) {
+    register vendor_id is pcie_sticky;
+    register device_id is pcie_sticky;
+    register revision_id is pcie_sticky;
+    register class_code is pcie_sticky;
+
+    register status {
+        field pe  is pcie_write_1_clears;
+        field sta is pcie_write_1_clears;
+        field rta is pcie_write_1_clears;
+        field rma is pcie_write_1_clears;
+        field ssa is pcie_write_1_clears;
+        field dpe is pcie_write_1_clears;
+    }
+}
+}
+
+/**
+   ## physical_config_bank
+
+   Base-template for physical functions, type 0 and 1.
+   Inherits **config_bank**.
+*/
+template physical_config_bank is (config_bank, soft_reset, hard_reset, pcie_after_reset) {
+    param each_exp_link: sequence(exp_link);
+    param each_exp_link = each exp_link in (this);
+
+    register command is pcie_after_reset {
+        field io {
+            method pcie_write(uint64 value) default {
+                if (this.val != value) {
+                    this.val = value;
+                    update_mappings(PCIE_Type_IO);
+                }
+            }
+        }
+        field mem {
+            method pcie_write(uint64 value) default {
+                if (this.val != value) {
+                    this.val = value;
+                    update_mappings(PCIE_Type_Mem);
+                }
+            }
+        }
+        field id {
+            method pcie_write(uint64 value) default {
+                if (this.get() != value) {
+                    this.set(value);
+                    if (value != 0)
+                        set_legacy_interrupt(interrupt_pin.val, 0);
+                }
+            }
+        }
+        method pcie_after_reset() {
+            del_mappings(PCIE_Type_Mem);
+            del_mappings(PCIE_Type_IO);
+            default();
+        }
+    }
+
+    register header_type {
+        field mf {
+            param init_val default
+                (each physical_config_bank in (bank.parent)).len > 1 ? 1 : 0;
+        }
+    }
+
+    register bist {
+        field sb {
+            method pcie_read() -> (uint64) default {
+                return bc.val == 1 ? this.val : 0;
+            }
+        }
+    }
+
+    method soft_reset() default {
+        default();
+        this.pcie_after_reset();
+    }
+    method hard_reset() default {
+        default();
+        this.pcie_after_reset();
+    }
+
+#if (use_standard_access_templates) {
+    register header_type is read_only;
+}
+#if (use_standard_write_templates) {
+    register command {
+        field io  is pcie_write;
+        field mem is pcie_write;
+        field id  is pcie_write;
+    }
+    register bist {
+        field sb is pcie_read;
+        field bc is pcie_sticky;
+    }
+}
+}
+
+
+/**
+   ## type_0_bank
+
+   Inherits **physical_config_bank** and adds Type 0 specific registers.
+*/
+template type_0_bank is (physical_config_bank, pcie_function_level_reset) {
+    register subsystem_vendor_id size 2 @ 0x2c is pcie_desc {
+        param pcie_desc = "Subsystem Vendor ID";
+    }
+    register subsystem_id        size 2 @ 0x2e is pcie_desc {
+        param pcie_desc = "Subsystem ID";
+    }
+
+    shared method get_sriov_capability() -> (sriov_capability) throws;
+    method get_sriov_capability() -> (sriov_capability) throws default {
+        foreach cap in (each sriov_capability in (bank)) {
+            return cap;
+        }
+        throw;
+    }
+
+    method pcie_function_level_reset() default {
+        default();
+        this.pcie_after_reset();
+    }
+
+    in each init_val {
+        is init_val_function_level_reset;
+    }
+#if (use_standard_access_templates) {
+    register subsystem_vendor_id is hwinit;
+    register subsystem_id        is hwinit;
+}
+#if (use_standard_write_templates) {
+    register subsystem_vendor_id is pcie_sticky;
+    register subsystem_id        is pcie_sticky;
+}
+}
+
+/**
+   ## pcie_no_function_level_reset
+
+   Applied directly to registers and fields that are not explicitly `sticky` or
+   `hwinit` in the specification but shall still according to specification
+   not be affected by an FLR (Function Level Reset) of the PCIe function.
+
+   Inherits template `pcie_function_level_reset` and blocks default
+   pcie_function_level_reset functionality
+   and prevent propagation of `pcie_function_level_reset` to DML child
+   objects underneath the DML object.
+*/
+template pcie_no_function_level_reset is (pcie_function_level_reset) {
+    shared method pcie_function_level_reset() default { }
+}
+/**
+   ## pcie_sticky
+   Applied directly to `registers` and `fields` that are explicitly `sticky`
+   in the specification. The template causes FLR and Hot-Reset to have no
+   effect on these `registers` and `fields`.
+
+   Inherits templates `soft_reset` and `pcie_no_function_level_reset`.
+   It blocks default soft_reset functionality by overriding method `soft_reset`,
+   and prevents propagation of `soft_reset` to DML child objects underneath
+   the DML object. The PCIe library models Hot Reset with the `soft_reset`
+   templates defined in DML utilities.
+*/
+template pcie_sticky is (soft_reset, pcie_no_function_level_reset) {
+    shared method soft_reset() default { }
+}
+
+
+/*
+   ## pcie_after_reset
+   Any reset logic that applies to all of: `warm`, `hot` and `FLR` and is
+   an object within the `pcie_config` bank shall inherit this template.
+   Method `pcie_function_level_reset()` will be invoked after resetting the
+   register values.
+
+   Can be applied to any DML object in the PCIe device in order to
+   add logic to be executed after a `hard`, `hot` or `FLR` reset.
+   Adds method `pcie_after_reset()` which by default call `pcie_after_reset`
+   on all DML child objects inheriting this template.
+*/
+template pcie_after_reset {
+    param pcie_after_reset_children : sequence(pcie_after_reset);
+    param pcie_after_reset_children = each pcie_after_reset in (this);
+    shared method pcie_after_reset() default {
+        foreach p in (pcie_after_reset_children) {
+            p.pcie_after_reset();
+        }
+    }
+}
+
+/**
+   ## hwinit
+
+   Implements the HwInit access restrictions, as described in the PCIe
+   specification. Inherits templates `init_val`, `write`,
+   `hard_reset`, `soft_reset` and `pcie_sticky`.
+
+   Uses the following parameters:
+   - `writable_after_hreset`: Is the register or field writable after hard reset, default false
+   - `writable_once_only`: Is the register or field writable once only, default true
+*/
+template hwinit is (init_val, write, pcie_sticky, hard_reset, soft_reset) {
+    param writable_after_hreset default false;
+    param writable_once_only default true;
+    saved bool is_writable = writable_after_hreset;
+
+    method write(uint64 val) default {
+        if (is_writable) {
+            default(val);
+            #if (writable_once_only) {
+                is_writable = false;
+            }
+        } else if (this.val != val) {
+            session int _level = 1;
+            log spec_viol, _level, Register_Write:
+            "Write to HwInit %s %s (value written = %#x, contents = %#x).",
+                this.is_register ? "register" : "field", qname,
+                val, this.val;
+            _level = 3;
+        }
+    }
+    method hard_reset() default {
+        default();
+        is_writable = writable_after_hreset;
+    }
+    method soft_reset() default {
+        if (writable_after_hreset)
+            this.init();
+        is_writable = writable_after_hreset;
+    }
+}
+
+/**
+    ## pcie_desc
+
+    Inherits the `desc` template"
+*/
+template pcie_desc is (desc) {
+    param pcie_desc : const char *;
+    param desc default pcie_desc;
+}
+
+/**
+    ## pcie_write
+
+    Inherits the `write` template and requires the `register` or `field` to
+    implement method `pcie_write(uint64 val)`. The method is invoked upon a
+    write access.
+*/
+template pcie_write is (write) {
+    shared method pcie_write(uint64 value);
+    method write(uint64 val) default {
+        pcie_write(val);
+    }
+}
+
+/**
+    ## pcie_read
+
+    Inherits the `read` template and requires the `register` or `field` to
+    implement method `pcie_read() -> (uint64)`. The method is invoked upon a
+    read access.
+*/
+template pcie_read is (read) {
+    shared method pcie_read() -> (uint64);
+    method read() -> (uint64) default {
+        return pcie_read();
+    }
+}
+
+/**
+    ## pcie_register_write_action
+
+    Inherits the `register` template and declares method `pcie_write_action(uint64 value)`
+    which is invoked after the field write dispatching has taken place.
+*/
+template pcie_register_write_action is (register) {
+    shared method pcie_write_action(uint64 value);
+    method write_register(uint64 value, uint64 enabled_bytes, void *aux) default {
+        default(value, enabled_bytes, aux);
+        pcie_write_action(value);
+    }
+}
+
+/**
+    ## pcie_register_read_action
+
+    Inherits the `register` template and declares method `pcie_read_action()`
+    which is invoked after the field read dispatching has taken place.
+*/
+template pcie_register_read_action is (register) {
+    shared method pcie_read_action();
+    method read_register(uint64 enabled_bytes, void *aux)-> (uint64) default {
+        local uint64 value = default(enabled_bytes, aux);
+        pcie_read_action();
+        return value;
+    }
+}
+
+/**
+    ## pcie_write_1_clears
+
+    Inherits the `write` template and clears the bits with 1´s written to.
+*/
+template pcie_write_1_clears is (write) {
+    method write(uint64 value) default {
+        this.val &= ~value;
+    }
+}
+/**
+    ## pcie_init
+
+    Inherits the `init_val` template and requires the `register` or `field` to
+    implement method `pcie_init()`. The method is invoked upon object creation
+    and device reset.
+*/
+template pcie_init is init_val {
+    method init() {
+        pcie_init();
+    }
+}
+
+/**
+   ## abstract_base_address
+
+   Can be used to implement an object that is similar to the Base Address
+   Registers in the PCIe configuration header.
+
+   The parameter **type** indicates in which upstream address space the resource
+   should be mapped. If the type is `PCIE_Type_Memory` or `PCIE_Type_IO` the
+   register will be called to update its resources when `command.mem` and
+   `command.io`, respectively, is written. If this is not desired, **type** can
+   be set to `PCIE_Type_Other` and the parameter **map_type** can be used to
+   indicate in which address space the resource should be mapped.
+
+   The parameter **map_obj** indicates which object will be mapped.
+
+   Users of this template must:
+   * Define the method `get_map_info() -> (map_info_t)`
+   * Define the method `enabled() -> (bool)`
+   * Assign the parameter map_type;
+   * Assign the parameter map_obj;
+
+*/
+template abstract_base_address {
+    param type : pcie_type_t;
+    param map_type default type;
+    param map_obj default undefined;
+
+    shared method get_map_info() -> (map_info_t);
+    shared method enabled() -> (bool);
+
+    saved bool is_mapped;
+    saved uint64 map_base;
+
+    shared method update_map();
+    method update_map() default {
+        del_map();
+        #if (defined map_obj) {
+            if (map_obj && enabled() && upstream_target.connected()) {
+                local map_info_t nfo = get_map_info();
+                upstream_target.pcie_map.add_map(map_obj, nfo, map_type);
+                is_mapped = true;
+                map_base = nfo.base;
+                log info, 4: "%s Mapped %s @ %s 0x%08X-0x%08X",
+                    this.qname,
+                    SIM_object_name(map_obj),
+                    pcie_type_name(map_type),
+                    nfo.base, nfo.base + nfo.length - 1;
+            }
+        }
+    }
+
+    shared method del_map();
+    method del_map() default {
+        #if (defined map_obj) {
+            if (is_mapped && upstream_target.connected()) {
+                upstream_target.pcie_map.del_map(map_obj, map_base, map_type);
+                is_mapped = false;
+                log info, 4: "%s Unmapped %s @ %s 0x%08X",
+                    this.qname,
+                    SIM_object_name(map_obj),
+                    pcie_type_name(map_type),
+                    map_base;
+            }
+        }
+    }
+
+    shared method get_mapped_obj() -> (conf_object_t *);
+    method get_mapped_obj() -> (conf_object_t *) default {
+        #if (defined map_obj) {
+            return map_obj;
+        } #else {
+            return NULL;
+        }
+    }
+}
+
+/**
+   ## pcie_base_address
+
+   Implements the common functionality for Memory and I/O Base Address Registers
+   as specified in PCIe. It has a single unsized field **address**.
+
+   The parameter **map_obj** indicates which object will be mapped.
+
+   The parameter **size_bits** defaults to 12 and defines the number of address
+   bits that this base address register uses. If a Resizable BAR
+   capability is present and indicates that it controls the size of this BAR the
+   size from the relevant RBAR Control register will be used instead.
+
+   Users of this template must:
+   - Define the bit-range for the field **address**
+   - Define the method `enabled() -> (bool)`
+   - Assign the parameters map_type and map_obj;
+   - Assign the parameter size_bits, if different from the default '12'.
+
+*/
+template pcie_base_address is (abstract_base_address, register, pcie_after_reset) {
+    param size_bits default 12;
+    param is_32bit default this.get()[2] == 0;
+    param bar_index default (offset - 0x10) / 4;
+
+    field address {
+        method pcie_read() -> (uint64) {
+            local uint64 mask = size_mask(cast(-1, uint64));
+            return this.val & (mask >> this.lsb);
+        }
+    }
+
+    method get_size_bits() -> (uint8) default {
+        foreach reg in (each rbar_control in (this.bank)) {
+            if (reg.get_id() == bar_index)
+                return reg.get_size_bits();
+        }
+        return size_bits;
+    }
+
+    method get_map_info() -> (map_info_t) default {
+        local map_info_t nfo;
+        local uint8 bits = get_size_bits();
+        assert bits <= 63;
+        nfo.length = 1 << bits;
+        nfo.base = this.val & ~(nfo.length - 1);
+        if (size == 8 && is_32bit)
+            nfo.base[63:32] = 0;
+        return nfo;
+    }
+
+    method size_mask(uint64 bytes) -> (uint64) {
+        /* Mask out unused address bits, so that SW can size the register */
+        if (size == 8 && is_32bit)
+            bytes[63:32] = 0;
+        local uint8 sz = get_size_bits();
+        if (sz > address.lsb)  // not all address bits are used
+            bytes[sz - 1:address.lsb] = 0;
+        return bytes;
+    }
+
+    method write_register(uint64 value, uint64 bytes, void *aux) default {
+        /* Allow writing all bits, even if some address bits are not used */
+        local uint64 field_bits = _field_bits();
+        default(value, bytes & field_bits, aux);
+        update_map();
+    }
+
+    method pcie_after_reset() default {
+        update_map();
+    }
+
+    method update_map() default {
+        default();
+        #if (type == PCIE_Type_Mem) {
+            if (enabled()) {
+                local map_info_t nfo = get_map_info();
+                foreach msix in (each msix_capability in (bank)) {
+                    msix.update_map(bar_index, nfo);
+                }
+            }
+        }
+    }
+
+    method del_map() default {
+        default();
+        #if (type == PCIE_Type_Mem) {
+            foreach msix in (each msix_capability in (bank)) {
+                msix.del_map(bar_index);
+            }
+        }
+    }
+
+#if (use_standard_write_templates) {
+    field address is pcie_read;
+}
+}
+
+/**
+   ## memory_base_address
+
+   Implements a Memory Base Address Register as specified in PCIe.
+
+   The parameter **map_obj** indicates which object will be mapped.
+
+   The parameter **size_bits** defaults to 12 and defines the number of address
+   bits that this base address register uses. If a Resizable BAR
+   capability is present and indicates that it controls the size of this BAR the
+   size from the relevant RBAR Control register will be used instead.
+
+   64-bit BARs are by default `prefetchable` and 32-bit BARs are by
+   default **not** `prefetchable`.
+
+   Users of this template must:
+   * Assign the parameter map_obj;
+   * Assign the parameter size_bits, if different from the default '12'.
+
+*/
+template memory_base_address is (pcie_base_address) {
+    param type = PCIE_Type_Mem;
+    field address      @ [size * 8 - 1:size_bits];
+    field prefetchable @ [3] {
+        /* Prefetchable should in general be set. Only legacy Endpoints
+         * are permitted to set the Prefetchable bit in 32-bit BARs.
+         */
+        param init_val default size == 8 ? 1 : 0;
+    }
+    field memory_type  @ [2:1] {
+        param init_val default size == 8 ? 0b10 : 0b00;
+    }
+    field space        @ [0];
+
+    method enabled() -> (bool) default {
+        return command.mem.val == 1;
+    }
+
+#if (use_standard_access_templates) {
+    field prefetchable is ignore_write;
+    field memory_type  is ignore_write;
+    field space        is ignore_write;
+}
+}
+
+/**
+    ## memory_base_address_32
+
+    Inherits the `memory_base_address` template. Used to model
+    32-bit BAR registers.
+*/
+template memory_base_address_32 is memory_base_address {
+    param size = 4;
+}
+
+/**
+    ## memory_base_address_64
+
+    Inherits the `memory_base_address` template. Used to model
+    64-bit BAR registers.
+*/
+template memory_base_address_64 is memory_base_address {
+    param size = 8;
+}
+
+/**
+   ## io_base_address
+
+   Implements an I/O Base Address Register as specified in PCIe.
+
+   The parameter **map_obj** indicates which object will be mapped.
+
+   The parameter **size_bits** defaults to 12 and defines the number of address
+   bits that this base address register uses. If a Resizable BAR
+   capability is present and indicates that it controls the size of this BAR the
+   size from the relevant RBAR Control register will be used instead.
+
+   Users of this template must:
+   * Assign the parameter map_obj;
+   * Assign the parameter size_bits, if different from the default '12'.
+
+*/
+template io_base_address is (pcie_base_address) {
+    param type = PCIE_Type_IO;
+    // I/O BARs are always 32-bit wide. However, this parameter was added
+    // after this template was created so it needs to be declared as default
+    // to avoid introducing overridden assignment errors in existing code.
+    param size default 4;
+    field address      @ [size * 8 - 1:size_bits];
+    field space        @ [0] {
+        param init_val default 1;
+    }
+
+    method enabled() -> (bool) default {
+        return command.io.val == 1;
+    }
+
+#if (use_standard_access_templates) {
+        field space is ignore_write;
+}
+}
+
+/**
+   ## defining_expansion_rom
+
+   Defines a register `expansion_rom_base`, as defined in PCIe. Additionally,
+   creates a group `expansion` which holds sub objects for a ROM and an image,
+   sized according to the parameter **size_bits**, which defaults to 11. The ROM
+   will be mapped in PCIe Memory Space, when enabled. Group `expansion` will inherit
+   the `rom_subobj` template. This template will set all necessary parameters for
+   group `expansion`.
+
+   Users of this template must:
+   * Assign the parameter size_bits, if different from the default '11'.
+
+*/
+template defining_expansion_rom {
+    register expansion_rom_base size 4 is pcie_desc {
+        param pcie_desc = "Expansion ROM Base Address";
+        is pcie_base_address;
+        param size_bits default 11;
+        param type = PCIE_Type_Mem;
+        param map_type = PCIE_Type_Mem;
+        param map_obj = expansion.rom.obj;
+        param offset = is_type_1_header #? 0x38 #: 0x30;
+
+        field address @ [31:11] is pcie_desc {
+            param pcie_desc = "Base Address";
+        }
+        field vd      @ [7:4]   is pcie_desc {
+            param pcie_desc = "Validation Details";
+        }
+        field vs      @ [3:1]   is pcie_desc {
+            param pcie_desc = "Validation Status";
+        }
+        field enable  @ [0]     is pcie_desc {
+            param pcie_desc = "Enable";
+        }
+
+        method enabled() -> (bool) default {
+            return this.enable.val == 1 && command.mem.val == 1;
+        }
+    }
+
+    group expansion is (rom_subobj) "Expansion" {
+        param size = 1 << expansion_rom_base.size_bits;
+    }
+
+    #if (use_standard_access_templates) {
+        register expansion_rom_base {
+            field vd is hwinit;
+            field vs is hwinit;
+        }
+    }
+    #if (use_standard_write_templates) {
+        register expansion_rom_base {
+            field vd is pcie_sticky;
+            field vs is pcie_sticky;
+        }
+    }
+}
+
+/**
+    ## rom_subobj
+    Defines two subobjects in order to create a ROM:
+    * `rom`
+    * `image`
+
+   Users of this template must:
+   * Assign the parameter `size`.
+*/
+template rom_subobj is init {
+    param size;
+
+    method init() default {
+        SIM_set_attribute_default(
+            image.obj, "size", SIM_make_attr_uint64(size));
+        SIM_set_attribute_default(
+            rom.obj, "image", image.get_attribute());
+    }
+
+    connect rom is (init_as_subobj) {
+        param desc default
+            (defined parent.desc #? parent.desc #: parent.name) + " ROM";
+        param classname = "rom";
+    }
+
+    connect image is (init_as_subobj) {
+        param desc default
+            (defined parent.desc #? parent.desc #: parent.name) + " image";
+        param classname = "image";
+    }
+}
+
+/**
+   ## upstream_target
+
+   Defines a pseudo-connect `upstream_target`, used by many other PCIe
+   templates.
+*/
+template upstream_target is map_target {
+    param configuration default "optional";
+    param mt = map_target;  // legacy alias
+    interface pcie_map;
+    session bool warned;
+
+    method set(conf_object_t *obj) {
+        default(obj);
+        warned = false;
+    }
+
+    method connected() -> (bool) default {
+        if (this.obj) {
+            return true;
+        } else {
+            if (!warned) {
+                log info, 2, PCIe_config: "'%s' required but not connected,"
+                    + " will not warn again", name;
+                warned = true;
+            }
+            return false;
+        }
+    }
+}
+
+/**
+   ## pcie_hreset
+
+   Inherits the `hreset` template from DML utilities.
+   Invokes `hard_reset()` on the object instantiating this template.
+   For instance if the object instantiating this template is a DML `subdevice`
+   the `soft_reset` will be isolated to only affect the `subdevice` and not the entire
+   DML device.
+*/
+template pcie_hreset {
+    is hreset;
+    port HRESET {
+        implement signal {
+            method signal_raise() default {
+                // this override can be removed when SIMICS-20588 is fixed
+                HRESET.parent.hard_reset();
+            }
+        }
+    }
+}
+
+/**
+    ## pcie_hot_reset
+
+    Inherits template `soft_reset` and applies the `soft_reset` template
+    to all registers and fields below the DML object. The `soft_reset`
+    template is used to model a `hot` reset in PCIe.
+*/
+template pcie_hot_reset {
+    is soft_reset;
+    in each init_val {
+        is _init_val_soft_reset;
+    }
+}
+
+/**
+   ## pcie_function_level_reset (Function Level Reset)
+
+   PCIe Type 0 config banks will inherit this template. An is FLR triggered
+   by invoking method `pcie_function_level_reset` on the PCIe config bank
+   resetting the state of all relevant registers for FLR.
+*/
+template pcie_function_level_reset {
+    param _each_flr : sequence(pcie_function_level_reset);
+    param _each_flr = each pcie_function_level_reset in (this);
+    shared method pcie_function_level_reset() default {
+        this._default_fl_reset();
+    }
+    shared method _default_fl_reset() default {
+        this.fl_reset_subobjs();
+    }
+    shared method fl_reset_subobjs() {
+        foreach o in (this._each_flr)
+            o.pcie_function_level_reset();
+    }
+}
+
+template init_val_function_level_reset is (init_val, pcie_function_level_reset) {
+    shared method _default_fl_reset() {
+        this.fl_reset_subobjs();
+        this.init();
+    }
+}
+
+/**
+    ## pcie_phy
+    Adds a port `phy` that implements the `transaction_interface_t`. Only applicable
+    for PCIe endpoints and switch upstream ports.
+    Port `phy` is used for low level PCIe physical link exchanges. The library
+    implements link training through this port. A root port or a switch downstream port
+    initiates a link training transaction that ends up in this port.
+
+    The `transaction_interface_t` method `issue(transaction_t *t, uint64 addr)
+    -> (exception_type_t)` in port `phy` can be overridden to extend the `phy`
+    with additional physical link exchanges. To add additional logic to the link
+    training that would for example handle custom atoms, override the
+    `handle_link_custom()` method. To modify existing logic, the individual link
+    training handler functions may be overridden.
+*/
+template pcie_phy {
+    shared method handle_link_custom(const transaction_t *t)
+        -> (exception_type_t) default {
+        return Sim_PE_No_Exception;
+    }
+
+    port phy {
+        implement transaction {
+            method issue(transaction_t *t, uint64 addr)
+                     -> (exception_type_t) default {
+                log info, 3: "Incoming PCIe Physical Layer transaction in %s",
+                    this.qname;
+
+                return handle_link_training(t);
+            }
+        }
+
+        /**
+            #### `handle_link_training(const transaction_t *t) -> (exception_type_t)`
+              Calls the individual link training handlers. The custom handler is
+              called last. If any handler encounters an error fails, remaining
+              handlers are skipped.
+        */
+        method handle_link_training(const transaction_t *t)
+            -> (exception_type_t) default {
+            local exception_type_t exc = handle_link_speed_width(t);
+            if (exc != Sim_PE_No_Exception) {
+                log info, 2: "Link training failed in handling of link"
+                    + " speed/width";
+                return exc;
+            }
+            exc = handle_link_flit_mode(t);
+            if (exc != Sim_PE_No_Exception) {
+                log info, 2: "Link training failed in handling of flit mode"
+                    + " negotiation";
+                return exc;
+            }
+            exc = handle_device_readiness_status();
+            if (exc != Sim_PE_No_Exception) {
+                log info, 2: "Link training failed in handling of device"
+                    + " readiness state handling";
+                return exc;
+            }
+            exc = handle_link_custom(t);
+            if (exc != Sim_PE_No_Exception) {
+                log info, 4: "Link training failed in handling of custom link"
+                    + " handling";
+                return exc;
+            }
+            return exc;
+        }
+
+        /**
+            #### `handle_device_readiness_status() -> (exception_type_t)`
+
+            Handles the Device Readiness Status (DRS) message. The DRS message
+            is sent to the Upstream component if the Downstream component
+            supports it. Read
+            [here](link-training.html#link-training-downstream-components) for
+            more details regarding what register fields are inspected and set in
+            the default implementation of this method.
+        */
+        method handle_device_readiness_status() -> (exception_type_t) default {
+            local physical_config_bank pf0;
+            local exp_link pf0_link;
+            try {
+                pf0 = get_physical_function(0);
+                pf0_link = pf0._find_exp_link();
+            } catch {
+                log info, 2: "Did not find link registers in function %s",
+                    pf0.name;
+                return Sim_PE_No_Exception;
+            }
+            if (pf0_link.drs_supported()) {
+                after: send_drs_msg(pf0_link);
+            }
+            return Sim_PE_No_Exception;
+        }
+
+        method send_drs_msg(exp_link link) {
+            link.send_drs_msg();
+        }
+
+        /**
+            #### `handle_link_flit_mode(const transaction_t *t) -> (exception_type_t)`
+
+            Handles the Flit Mode negotiation. The Flit Mode is negotiated
+            between the two link partners. The Flit Mode is enabled if both link
+            partners support it and the Downstream component does not disable
+            it. Read
+            [here](link-training.html#link-training-downstream-components) for
+            more details regarding what register fields are inspected and set in
+            the default implementation of this method.
+        */
+        method handle_link_flit_mode(const transaction_t *t)
+            -> (exception_type_t) default {
+            local pcie_link_flit_mode_t *fm = ATOM_get_transaction_pcie_link_flit_mode(t);
+            if (fm == NULL) {
+                log info, 3: "Transaction to %s missing"
+                            + " pcie_link_flit_mode atom. Skipping link flit"
+                            + " mode negotiation...", this.qname;
+                return Sim_PE_No_Exception;
+            }
+
+            local physical_config_bank pf0;
+            try {
+                pf0 = get_physical_function(0);
+            } catch {
+                log info, 2: "Did not find a function with function number 0 in"
+                    + " %s", dev.name;
+                return Sim_PE_No_Exception;
+            }
+
+            local exp_link pf0_link;
+            try {
+                pf0_link = pf0._find_exp_link();
+            } catch {
+                log info, 1: "Did not find the PCIe Link registers in function %s"
+                    , pf0.name;
+                // Physical function 0 should have link registers
+                return Sim_PE_IO_Not_Taken;
+            }
+
+            local bool flit_mode_supported = pf0_link.flit_mode_supported();
+            local bool flit_mode_disabled = pf0_link.flit_mode_disabled();
+            local bool drs_supported = pf0_link.drs_supported();
+            fm->enable_flit_mode = (flit_mode_supported
+                && !flit_mode_disabled && drs_supported);
+
+            if (fm->enable_flit_mode) {
+                log info, 2: "Link training resulted in enabling of Flit Mode"
+                    + " in %s", dev.name;
+            } else if (flit_mode_supported) {
+                log info, 2: "Link training resulted in no enabling of Flit"
+                    + " Mode in %s", dev.name;
+            } else {
+                log info, 3: "Link peer %s is indicating Flit Mode Support. %s"
+                    + " does not support Flit Mode. Flit Mode will not be"
+                    + " enabled", SIM_object_name(SIM_transaction_initiator(t)),
+                    dev.name;
+                return Sim_PE_No_Exception;
+            }
+
+            /* The PCIe spec does specify if the Flit Mode Status should be set
+               in all functions or only function 0. We do it in all functions
+               that have link registers and has the Flit Mode Supported field
+               set.*/
+            foreach bank in (pcie_functions) {
+                local exp_link f_link;
+                try {
+                    f_link = bank._find_exp_link();
+                } catch { continue; }
+                if (fm->enable_flit_mode) {
+                    if (f_link.flit_mode_supported()
+                        && f_link.drs_supported()) {
+                            f_link.set_flit_mode_status(true);
+                    }
+                } else {
+                    f_link.set_flit_mode_status(false);
+                }
+            }
+            return Sim_PE_No_Exception;
+        }
+
+        /**
+            #### `handle_link_speed_width(const transaction_t *t) -> (exception_type_t)`
+
+            Handles the Link Speed and Link Width negotiation. The Link Speed
+            and Link Width are negotiated between the two link partners. Read
+            [here](link-training.html#link-training-downstream-components) for
+            more details regarding what register fields are inspected and set in
+            the default implementation of this method.
+        */
+        method handle_link_speed_width(const transaction_t *t)
+            -> (exception_type_t) default {
+            local pcie_link_negotiation_t *lg = ATOM_get_transaction_pcie_link_negotiation(t);
+            if (lg == NULL) {
+                log info, 4: "Transaction to %s missing"
+                            + " pcie_link_negotiation atom. Skipping link"
+                            + " training...", this.qname;
+                return Sim_PE_No_Exception;
+            }
+
+            if (!link_attributes_sanity_check()) {
+                return Sim_PE_IO_Not_Taken;
+            }
+
+            handle_link_negotiation(lg);
+
+            if ((lg->negotiated_link_speed != PCIE_Link_Speed_Undefined)
+                && (lg->negotiated_link_width != PCIE_Link_Width_Undefined)) {
+                log info, 3: "Link training data from %s handled. Setting"
+                            + " link speed to %s and link width to %s",
+                            SIM_object_name(SIM_transaction_initiator(t)),
+                            pcie_link_speed_name(lg->negotiated_link_speed),
+                            pcie_link_width_name(lg->negotiated_link_width);
+            }
+
+            return Sim_PE_No_Exception;
+        }
+
+        // Verifies functions in the device that have link registers are able to
+        // do link training
+        method link_attributes_sanity_check() -> (bool) default {
+            try {
+                local physical_config_bank pf0 = get_physical_function(0);
+                local exp_link pf0_link = pf0._find_exp_link();
+                if (pf0_link.get_target_link_speed()
+                    == PCIE_Link_Speed_Undefined) {
+                    log info, 2: "Function 0 (%s) does not have a valid target"
+                        + " link speed. Skipping link training", pf0.name;
+                    return false;
+                }
+            } catch {
+                log info, 2: "Did not find a function with function number 0 in"
+                    + " %s that has link registers. Skipping link training",
+                    dev.name;
+                return false;
+            }
+
+            local pcie_link_speed_t prev_max_link_speed;
+            local pcie_link_width_t prev_max_link_width;
+            local uint7 prev_supported_link_speeds_vector;
+
+            local bool first_function = true;
+            foreach bank in (pcie_functions) {
+                local exp_link link;
+                try {
+                    link = bank._find_exp_link();
+                } catch { continue; }
+
+                local pcie_link_speed_t curr_max_link_speed;
+                local pcie_link_width_t curr_max_link_width;
+                local pcie_link_width_t curr_supported_link_speeds_vector;
+                curr_max_link_speed = link.get_max_link_speed();
+                curr_max_link_width = link.get_max_link_width();
+                curr_supported_link_speeds_vector = link.get_supported_link_speeds_vector();
+                local bool link_speeds_vector_ok = true;
+#if (pcie_version >= 3.0) {
+                link_speeds_vector_ok = curr_supported_link_speeds_vector != 0;
+}
+
+                if (((curr_max_link_width == PCIE_Link_Width_Undefined)
+                    || (curr_max_link_speed == PCIE_Link_Speed_Undefined))
+                    && link_speeds_vector_ok) {
+                        log info, 1 then 2: "Function %s received link training"
+                            + " transaction but does not have proper values"
+                            + " configured in its link registers", bank.name;
+                        return false;
+                }
+
+                if (!first_function) {
+                    if ((curr_max_link_width != prev_max_link_width)
+                        || (curr_max_link_speed != prev_max_link_speed)
+                        || (curr_supported_link_speeds_vector !=
+                            prev_supported_link_speeds_vector)) {
+                        log error: "All functions in device do not support the"
+                                 + " same link attributes.";
+                    return false;
+                    }
+                }
+                prev_max_link_speed = curr_max_link_speed;
+                prev_max_link_width = curr_max_link_width;
+                prev_supported_link_speeds_vector = curr_supported_link_speeds_vector;
+                first_function = false;
+            }
+            return true;
+        }
+
+        method handle_link_negotiation(pcie_link_negotiation_t *lg) default {
+            local exp_link pf0_link;
+            try {
+                local physical_config_bank pf0 = get_physical_function(0);
+                pf0_link = pf0._find_exp_link();
+            } catch { assert false; } // Already verified in sanity check
+
+            local pcie_link_speed_t max_link_speed = pf0_link.get_max_link_speed();
+            local pcie_link_width_t max_link_width = pf0_link.get_max_link_width();
+            negotiate_link(max_link_speed, max_link_width, lg);
+
+            foreach bank in (pcie_functions) {
+                local exp_link link;
+                try {
+                    link = bank._find_exp_link();
+                } catch {
+                    log info, 2: "Found no link registers in function %s,"
+                        + " skipping...", bank.name;
+                    continue;
+                }
+
+                link.set_link_attributes(lg->negotiated_link_speed,
+                    lg->negotiated_link_width);
+            }
+        }
+
+        method negotiate_link_speed(pcie_link_speed_t target_link_speed,
+                                    pcie_link_negotiation_t *negotiation_values) default {
+            negotiation_values->negotiated_link_speed = link_min(
+                target_link_speed, negotiation_values->maximum_link_speed);
+        }
+
+        method negotiate_link_width(pcie_link_width_t max_link_width,
+                                    pcie_link_negotiation_t *negotiation_values) default {
+            negotiation_values->negotiated_link_width = link_min(
+                max_link_width, negotiation_values->maximum_link_width);
+        }
+
+        method negotiate_link(pcie_link_speed_t supported_link_speeds,
+                              pcie_link_width_t max_link_width,
+                              pcie_link_negotiation_t *negotiation_values) default {
+            negotiate_link_speed(supported_link_speeds, negotiation_values);
+            negotiate_link_width(max_link_width, negotiation_values);
+        }
+    }
+
+    method link_min(uint64 a, uint64 b) -> (uint64) {
+        return a < b ? a : b;
+    }
+}
+
+method pcie_type_name(pcie_type_t t) -> (const char *) {
+    switch (t) {
+    case PCIE_Type_Not_Set: return "Not Set";
+    case PCIE_Type_Mem:     return "Memory";
+    case PCIE_Type_IO:      return "I/O";
+    case PCIE_Type_Cfg:     return "Config";
+    case PCIE_Type_Msg:     return "Message";
+    case PCIE_Type_Other:   return "Other";
+    default:                return "Unknown";
+    }
+}
+
+method pcie_error_name(pcie_error_t e) -> (const char *) {
+    switch (e) {
+    case PCIE_Error_Not_Set:             return "Not Set";
+    case PCIE_Error_Unsupported_Request: return "Unsupported Request";
+    case PCIE_Error_Completer_Abort:     return "Completer Abort";
+    case PCIE_Error_Master_Abort:        return "Master Abort";
+    case PCIE_Error_No_Error:            return "No Error";
+    default:                             return "Unknown";
+    }
+}
+
+method pcie_message_type_name(pcie_message_type_t mt) -> (const char *) {
+    /* Return the name as described in the PCIe Specification */
+    switch (mt) {
+    case PCIE_ATS_Invalidate:               return "ATS Invalidate Request";
+    case PCIE_ATS_Invalidate_Completion:    return "ATS Invalidate Completion";
+    case PCIE_PRS_Request:                  return "PRS Request";
+    case PCIE_PRS_Response:                 return "PRG Response";
+    case PCIE_Latency_Tolerance_Reporting:  return "Latency Tolerance Reporting";
+    case PCIE_Optimized_Buffer_Flush_Fill:  return "Optimized Buffer Flush Fill";
+    case PCIE_Msg_Assert_INTA:              return "Assert_INTA";
+    case PCIE_Msg_Assert_INTB:              return "Assert_INTB";
+    case PCIE_Msg_Assert_INTC:              return "Assert_INTC";
+    case PCIE_Msg_Assert_INTD:              return "Assert_INTD";
+    case PCIE_Msg_Deassert_INTA:            return "Deassert_INTA";
+    case PCIE_Msg_Deassert_INTB:            return "Deassert_INTB";
+    case PCIE_Msg_Deassert_INTC:            return "Deassert_INTC";
+    case PCIE_Msg_Deassert_INTD:            return "Deassert_INTD";
+    case PCIE_PM_Active_State_Nak:          return "PM_Active_State_Nak";
+    case PCIE_PM_PME:                       return "PM_PME";
+    case PCIE_PM_Turn_Off:                  return "PME_Turn_Off";
+    case PCIE_PM_PME_TO_Ack:                return "PME_TO_Ack";
+    case PCIE_ERR_COR:                      return "ERR_COR";
+    case PCIE_ERR_NONFATAL:                 return "ERR_NONFATAL";
+    case PCIE_ERR_FATAL:                    return "ERR_FATAL";
+    case PCIE_Unlock:                       return "Unlock";
+    case PCIE_Set_Slot_Power_Limit:         return "Set_Slot_Power_Limit";
+    case PCIE_Precision_Time_Measurement:   return "Precision Time Measurement";
+    case PCIE_HP_Power_Indicator_On:        return "Power Indicator On";
+    case PCIE_HP_Power_Indicator_Blink:     return "Power Indicator Blink";
+    case PCIE_HP_Power_Indicator_Off:       return "Power Indicator Off";
+    case PCIE_HP_Attention_Button_Pressed:  return "Attention Button Pressed";
+    case PCIE_HP_Attention_Indicator_On:    return "Attention Indicator On";
+    case PCIE_HP_Attention_Indicator_Blink: return "Attention Indicator Blink";
+    case PCIE_HP_Attention_Indicator_Off:   return "Attention Indicator Off";
+    case PCIE_Vendor_Defined_Type_0:        return "Vendor_Defined Type 0";
+    case PCIE_Vendor_Defined_Type_1:        return "Vendor_Defined Type 1";
+    default:                                return "Unknown";
+    }
+}
+method pcie_route_type_name(pcie_msg_route_t mr) -> (const char *) {
+    /* Return the name as described in the PCIe Specification */
+    switch (mr) {
+    case PCIE_Msg_Route_Not_Set:   return "Routing Rule Not set";
+    case PCIE_Msg_Route_Upstream:  return "Routed to Root Complex";
+    case PCIE_Msg_Route_Address:   return "Routed by Address";
+    case PCIE_Msg_Route_ID:        return "Routed by ID";
+    case PCIE_Msg_Route_Broadcast: return "Broadcast from Root Complex";
+    case PCIE_Msg_Route_Terminate: return "Local - Terminate at Receiver";
+    case PCIE_Msg_Route_Gather:    return "Gathered and routed to Root Complex";
+    default:                       return "Routing Unknown";
+    }
+}
+
+method pcie_link_speed_name(pcie_link_speed_t s) -> (const char *) {
+    switch (s) {
+    case PCIE_Link_Width_Undefined: return "Undefined";
+    case PCIE_Link_Speed_2_5:   return "2.5 GT/s";
+    case PCIE_Link_Speed_5:     return "5 GT/s";
+    case PCIE_Link_Speed_8:     return "8 GT/s";
+    case PCIE_Link_Speed_16:    return "16 GT/s";
+    case PCIE_Link_Speed_32:    return "32 GT/s";
+    case PCIE_Link_Speed_64:    return "64 GT/s";
+    default:                        return "Unknown";
+    }
+}
+
+method pcie_link_width_name(pcie_link_width_t w) -> (const char *) {
+    switch (w) {
+    case PCIE_Link_Width_Undefined: return "Undefined";
+    case PCIE_Link_Width_x1:        return "x1";
+    case PCIE_Link_Width_x2:        return "x2";
+    case PCIE_Link_Width_x4:        return "x4";
+    case PCIE_Link_Width_x8:        return "x8";
+    case PCIE_Link_Width_x16:       return "x16";
+    default:                        return "Unknown";
+    }
+}

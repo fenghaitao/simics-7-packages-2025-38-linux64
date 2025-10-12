@@ -1,0 +1,306 @@
+
+/*
+  nvme-admin-id.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "nvme-admin-log-page.dml";
+import "nvme-controller-or-namespace-structures.dml";
+
+// Controller or Namespace Structure Values
+param CNS_NAMESPACE = 0x00;
+param CNS_CONTROLLER = 0x01;
+param CNS_ACTIVE_NAMESPACES = 0x02;
+param CNS_NAMESPACE_DESCRIPTORS = 0x03;
+param CNS_IO_COMMAND_SET_NS = 0x05;
+param CNS_IO_COMMAND_SET_CTRL = 0x06;
+param CNS_ACTIVE_NAMESPACES_IO_SET = 0x07;
+param CNS_NAMESPACE_IO_INDEPENDENT = 0x08;
+
+// Command Set Identifiers
+group CSI {
+    param NVM = 0x00;
+    param KV = 0x01;
+    param ZNS = 0x02;
+}
+
+extern char *strncpy(char *dest, const char *src, size_t n);
+
+
+typedef bitfields 16 {
+    uint16 cntid @ [31:16];
+    uint8 cns @ [7:0];
+} cdw10_identify_t;
+
+typedef bitfields 32 {
+    uint8 csi @ [31:24];
+    uint16 cns_specific_identifier @ [15:0];
+} cdw11_identify_t;
+
+typedef bitfields 32 {
+    uint7 uuid_index @ [6:0];
+} cdw14_identify_t;
+
+template nvme_id {
+    param cns : uint8;
+    shared method handle_id(const common_command_format_t *cmd,
+                            common_completion_entry_t *rsp,
+                            error_information_log_entry_t *err);
+}
+
+template ids {
+    group controller is nvme_id {
+        param cns = CNS_CONTROLLER;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            local identify_01_t id;
+            id.vid = VENDOR_ID;
+            id.cntrltype = 0x1;
+            strcpy(cast(id.subnqn, char *),
+                    "nqn.2025-06.com.intel:nvme:nvm-subsystem-simics");
+            strncpy(cast(id.mn, char *), "Simics NVMe Controller",
+                    sizeof(id.mn));
+            strncpy(cast(id.fr, char *), "1.0", sizeof(id.fr));
+            strncpy(cast(id.sn, char *), SN.val,
+                    strnlen(SN.val, sizeof(id.sn)));
+
+            id.nn = MAX_N_NAMESPACES;
+            id.mdts = 0;    // Set to 1 to prevent prp lists
+
+            id.ver[31:16] = 2;
+            id.ver[15:8] = 0;
+            id.ver[7:0] = 0;
+
+            id.sqes[7:4] = 6;
+            id.sqes[3:0] = 6;
+            id.cqes[7:4] = 4;
+            id.cqes[3:0] = 4;
+
+            assert(N_ASYNC_EVENT_SLOTS > 0);
+            id.aerl = N_ASYNC_EVENT_SLOTS - 1;
+
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+
+    group active_namespaces is nvme_id {
+        param cns = CNS_ACTIVE_NAMESPACES;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            if (cmd->nsid == 0xFFFFFFFE || cmd->nsid == 0xFFFFFFFF) {
+                log spec_viol: "Invalid NSID for the active namespaces identify"
+                            +  " cmd";
+                set_error(STATUS_TYPE_GENERIC,
+                          STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0, rsp, err);
+                return;
+            }
+
+            local identify_02_t id;
+            for (local int i = cmd->nsid; i < MAX_N_NAMESPACES; i++) {
+                if (images[i].obj == NULL) {
+                    break;
+                }
+                id.nsid[i - cmd->nsid] = i + 1;
+            }
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+
+    group active_namespaces_io_set is nvme_id {
+        param cns = CNS_ACTIVE_NAMESPACES_IO_SET;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            if (cmd->nsid == 0xFFFFFFFE || cmd->nsid == 0xFFFFFFFF) {
+                log spec_viol: "Invalid NSID for the active namespaces identify"
+                             + " cmd";
+                set_error(STATUS_TYPE_GENERIC,
+                          STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0, rsp, err);
+                return;
+            }
+
+            local identify_02_t id;
+
+            for (local int i = cmd->nsid; i < MAX_N_NAMESPACES; i++) {
+                if (images[i].obj == NULL) {
+                    break;
+                }
+                id.nsid[i - cmd->nsid] = i + 1;
+            }
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+
+    group ns is nvme_id {
+        param cns = CNS_NAMESPACE;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            if (!ns_id_is_ok(cmd->nsid, rsp, err))
+                return;
+
+            if (cmd->nsid == 0xFFFFFFFF) {
+                log spec_viol: "NSID must not be 0xFFFFFFFF for the Identify"
+                            + " Namespace command when the Namespace Management"
+                            + " Capability is unsupported.";
+                set_error(STATUS_TYPE_GENERIC,
+                          STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0, rsp, err);
+                return;
+            }
+
+            local identify_00_t id;
+
+            if (images[cmd->nsid - 1].obj != NULL) {
+                id.nsze = namespace_sizes.val[cmd->nsid - 1] / 512;
+                id.ncap = id.nsze;
+                id.nuse = id.ncap;
+                id.lbaf[0].lbads = 9;
+            }
+
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+
+    group namespace_descriptors is nvme_id {
+        param cns = CNS_NAMESPACE_DESCRIPTORS;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            if (!ns_id_is_ok(cmd->nsid, rsp, err)) {
+                return;
+            }
+
+            if (images[cmd->nsid - 1].obj == NULL) {
+                log info, 3: "Inactive NSID in identify namespace command";
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 4, 0, rsp,
+                          err);
+                return;
+            }
+
+            if (cmd->nsid == 0xFFFFFFFF) {
+                log error, 3: "Inactive namespace identifier specified";
+                set_error(STATUS_TYPE_GENERIC,
+                        STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0, rsp, err);
+                return;
+            }
+
+            local identify_03_t id;
+            id.nidt = 0x3;
+            id.nidl = sizeoftype(uuid_t);
+
+            gen_uuid_v4_from_nsid(cmd->nsid, &id.nid);
+
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+
+    group io_command_set_ns is nvme_id {
+        param cns = CNS_IO_COMMAND_SET_NS;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            local cdw11_identify_t cdw11 = cmd->cdw11;
+            if (cdw11.csi != CSI.NVM) {
+                log error, 4: "Invalid CSI specified in identify command";
+                set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_FIELD, 47, 0, rsp,
+                          err);
+                return;
+            }
+
+            if (!ns_id_is_ok(cmd->nsid, rsp, err)) {
+                return;
+            }
+
+            if (cmd->nsid == 0xFFFFFFFF) {
+                log error, 4: "Invalid NSID specified in identify command";
+                set_error(STATUS_TYPE_GENERIC,
+                          STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0, rsp, err);
+                return;
+            }
+
+            local identify_05_t id;
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+
+    group io_command_set_ctrl is nvme_id {
+        param cns = CNS_IO_COMMAND_SET_CTRL;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            local cdw11_identify_t cdw11 = cmd->cdw11;
+            if (cdw11.csi == CSI.NVM) {
+                local identify_06_nvm_t id;
+                // No optional bits are set
+                transport_write(cmd->dptr_prp1, sizeof(id), &id);
+            } else {
+                // Unsupported command set
+                log info, 4: "Unsupported command (CSI: %d) set specified in"
+                            + " identify command", cdw11.csi;
+                local uint8 id[4096];
+                transport_write(cmd->dptr_prp1, sizeof(id), &id);
+            }
+        }
+    }
+
+    group namespace_io_independent is nvme_id {
+        param cns = CNS_NAMESPACE_IO_INDEPENDENT;
+        method handle_id(const common_command_format_t *cmd,
+                         common_completion_entry_t *rsp,
+                         error_information_log_entry_t *err) {
+            if (!ns_id_is_ok(cmd->nsid, rsp, err)) {
+                return;
+            }
+
+            if (cmd->nsid == 0xFFFFFFFF) {
+                log error, 4: "Invalid NSID specified in identify command";
+                set_error(STATUS_TYPE_GENERIC,
+                          STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0, rsp, err);
+                return;
+            }
+
+            local identify_08_t id;
+            if (images[cmd->nsid - 1].obj != NULL) {
+                id.nstat.nrdy = 1;
+            }
+            transport_write(cmd->dptr_prp1, sizeof(id), &id);
+        }
+    }
+}
+
+method ns_id_is_ok(uint32 nsid, common_completion_entry_t *rsp,
+                      error_information_log_entry_t *err) -> (bool) {
+    if (nsid == 0 || nsid > MAX_N_NAMESPACES) {
+        log spec_viol: "Invalid NSID in identify namespace command";
+        set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_NAMESPACE_OR_FORMAT, 4, 0,
+                  rsp, err);
+        return false;
+    }
+    return true;
+}
+
+method gen_uuid_v4_from_nsid(uint32 nsid, uuid_t *uuid) {
+    memset(uuid, 0, sizeoftype(uuid_t));
+
+    // As per rfc4122 section 4.4
+    uuid->clock_seq_hi_and_reserved[7:6] = 0b11;
+    uuid->time_hi_and_version[15:12] = 0b0100;
+
+    // Remaining bytes in UUID v4 are randomly (pseudo is ok) generated
+    // We will just set the first 4 bytes to the NSID
+    uuid->time_low = nsid;
+}

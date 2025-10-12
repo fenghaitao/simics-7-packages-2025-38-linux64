@@ -1,0 +1,172 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device x58_dmi_legacy;
+parameter classname = "x58-dmi-legacy";
+
+parameter desc = "model of X58 DMI unit";
+parameter documentation = "DMI unit in the Intel® X58 Express Chipset. - legacy variant, using old PCIe libraries";
+loggroup common;
+
+import "pci/common.dml";
+import "x58-pcie-header.dml";
+import "simics/devs/signal.dml";
+
+is pcie_device;
+
+port corerst {
+    implement signal {
+        method signal_raise() {
+            $pci_bus.pci_bus.bus_reset();
+        }
+        method signal_lower() {
+        }
+    }
+}
+
+bank pci_config {
+    register command {
+        /* Workaround for a (likely) generic problem in pci/common.dml */
+        field m { parameter hard_reset_value = 1; }
+    }
+    register device_id { parameter hard_reset_value = 0x3400; }
+    register status {
+        field c { parameter hard_reset_value = 1; }
+    }
+    register class_code { parameter hard_reset_value = 0x080000; }
+
+    register base_address_0 @ 0x10 is (no_base_address_32);
+    register base_address_1 @ 0x14 is (no_base_address_32);
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1c is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+
+    register subsystem_vendor_id { parameter hard_reset_value = 0x8086; }
+    register interrupt_pin { parameter hard_reset_value = 0x0; }
+}
+
+// fake bridge support to set this device as host-pci bridge
+implement pci_bridge {
+    method system_error() {
+        log "unimplemented", 1, common: "pci_bridge system_error, not implemented";
+    }
+    method raise_interrupt(conf_object_t *irq_obj, int device, int pin) {
+        log "unimplemented", 1, common: "pci_bridge raise_interrupt, not implemented";
+    }
+    method lower_interrupt(conf_object_t *irq_obj, int device, int pin) {
+        log "unimplemented", 1, common: "pci_bridge lower_interrupt, not implemented";
+    }
+}
+
+implement pci_express {
+    method send_message(conf_object_t *src, pcie_message_type_t type,
+                        byte_string_t payload) -> (int h) default {
+        // send message to implement
+        h = 0;
+    }
+}
+
+bank io_regs {
+    parameter function = 0;
+    parameter register_size = 4;
+    parameter byte_order = "little-endian";
+    parameter partial = true;
+
+    register config_address @ 0xCF8 "PCI Configuration Address";
+    register config_data @ 0xCFC "PCI Configuration Data";
+
+    register config_address {
+        field enabled [31:31];
+        field rsrvd_30_24 [30:24] is (ignore);
+        field bus [23:16];
+        field device [15:11];
+        field function [10:8];
+        field dword [7:2];
+        field rsrvd_1_0 [1:0] is (ignore);
+    }
+
+    register config_data {
+        method read_access(generic_transaction_t *memop, msb1, lsb) -> (value) {
+            if (!$io_regs.config_address.enabled)
+                return;
+            local uint8 offset =
+                SIM_get_mem_op_physical_address(memop) - $offset;
+            if (SIM_get_mem_op_inquiry(memop)) {
+                // We don't call pci_value_from_memory here for inquiry accesses
+                // as this triggers breakpoints. It might be better to just pass
+                // inquiry flag to pci_value_from_memory but it doesn't accept
+                // it. So we return cached value hoping that it is enough.
+                value = ($this >> (offset * 8))
+                    & ((1 << (SIM_get_mem_op_size(memop) * 8)) - 1);
+                log "info", 4, common:
+                    "Return cached value 0x%x (offset %d, size %d, value 0x%x)",
+                    value, offset, SIM_get_mem_op_size(memop), $this;
+                return;
+            }
+            // compute address in PCIE configuration space
+            local exception_type_t ex;
+            local uint64 pcie_address = (($config_address.bus << 20)
+                                         | ($config_address.device << 15)
+                                         | ($config_address.function << 12)
+                                         | ($config_address.dword << 2));
+
+            call $pci_value_from_memory(
+                Sim_Addr_Space_Conf,
+                pcie_address + offset,
+                SIM_get_mem_op_size(memop)) -> (value, ex);
+            if (ex == Sim_PE_IO_Not_Taken)
+                value = -1;
+            log "info", 2, common:
+                "PCI read 0x%x from bus %d, device %d, function %d, register %d (0x%x, %d bytes), PCIE address = 0x%llx",
+                (value & ((1 << (SIM_get_mem_op_size(memop) * 8)) - 1)),
+                $io_regs.config_address.bus,
+                $io_regs.config_address.device,
+                $io_regs.config_address.function,
+                ($io_regs.config_address.dword << 2) + offset,
+                ($io_regs.config_address.dword << 2) + offset,
+                SIM_get_mem_op_size(memop), pcie_address;
+
+            $this = value;
+        }
+        method write_access(generic_transaction_t *memop, msb1, lsb, value) {
+            local exception_type_t ex;
+            if (!$io_regs.config_address.enabled)
+                return;
+            // compute address in PCIE configuration space
+            local uint8 offset =
+                SIM_get_mem_op_physical_address(memop) - 0xCFC;
+            local uint64 pcie_address = (($config_address.bus << 20)
+                                         | ($config_address.device << 15)
+                                         | ($config_address.function << 12)
+                                         | ($config_address.dword << 2));
+
+            log "info", 2, common:
+                "PCI write 0x%x to bus %d, device %d, function %d, register %d (0x%x, %d bytes), PCIE address = 0x%llx",
+                SIM_get_mem_op_value_le(memop),
+                $io_regs.config_address.bus,
+                $io_regs.config_address.device,
+                $io_regs.config_address.function,
+                ($io_regs.config_address.dword << 2) + offset,
+                ($io_regs.config_address.dword << 2) + offset,
+                SIM_get_mem_op_size(memop), pcie_address;
+            call $pci_value_to_memory(Sim_Addr_Space_Conf,
+                                      value,
+                                      pcie_address + offset,
+                                      SIM_get_mem_op_size(memop)) -> (ex);
+            $this = value;
+        }
+    }
+}

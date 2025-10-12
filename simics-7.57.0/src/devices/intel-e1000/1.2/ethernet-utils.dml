@@ -1,0 +1,380 @@
+/*
+  ethernet-utils.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "crc.dml";
+
+/*
+ * Ethernet constants
+ */
+
+constant ETH_CRC_POLY  = 0x04c11db7;
+constant ETH_BRCT_MAC  = 0xFFFFFFFFFFFF;
+constant ETH_MULTI_MSK = 0x010000000000;
+
+constant ETH_TYPE_VLAN          = 0x8100;
+constant ETH_TYPE_IPv4          = 0x0800;
+constant ETH_TYPE_IPv6          = 0x86DD;
+constant ETH_TYPE_ARP           = 0x0806;
+constant ETH_TYPE_MACSEC        = 0x88E5;
+constant ETH_TYPE_PTP           = 0x88F7; //precision time protocol
+constant UDP_EVENT_PORT_PTP     = 319; //precision time protocol
+constant UDP_GENERAL_PORT_PTP   = 320; //precision time protocol
+
+constant ETH_PROT_IGMP = 0x2; // IPv4
+constant ETH_PROT_MLD  = 0x3a;// IPv6
+constant ETH_PROT_TCP  = 0x06;
+constant ETH_PROT_UDP  = 0x11;
+constant ETH_PROT_IPV6_ENCAP = 0x29;// IPv6 encapsulated
+
+constant IPv6_NH_HOPBYHOP = 0x00;
+constant IPv6_NH_DEST_OPT = 0x3C;
+constant IPv6_NH_ROUTING  = 0x2B;
+
+constant PAUSE_FRAME_DA  = 0x0180C2000001;
+
+constant MACSEC_128B_AES_GCM_KEY_LEN  = 16;
+constant MACSEC_128B_AES_GCM_ICV_LEN  = 16;
+constant MACSEC_128B_AES_GCM_IV_LEN   = 12;
+constant MACSEC_128B_AES_GCM_MIN_DATA_LEN  = 48; // Minimal data block length
+
+constant PTP_V1_SYNC_MESSAGE       = 0;
+constant PTP_V1_DELAY_REQ_MESSAGE  = 1;
+constant PTP_V1_FOLLOWUP_MESSAGE   = 2;
+constant PTP_V1_DELAY_RESP_MESSAGE = 3;
+constant PTP_V1_MANAGEMENT_MESSAGE = 4;
+
+constant PTP_V2_SYNC_MESSAGE                = 0;
+constant PTP_V2_DELAY_REQ_MESSAGE           = 1;
+constant PTP_V2_PATH_DELAY_REQ_MESSAGE      = 2;
+constant PTP_V2_PATH_DELAY_RESP_MESSAGE     = 2;
+constant PTP_V2_FOLLOWUP_MESSAGE            = 8;
+constant PTP_V2_DELAY_RESP_MESSAGE          = 9;
+constant PTP_V2_PATH_DELAY_FOLLOWUP_MESSAGE = 0xA;
+constant PTP_V2_ANNOUNCE_MESSAGE            = 0xB;
+constant PTP_V2_SIGNALLING_MESSAGE          = 0xC;
+constant PTP_V2_MANAGEMENT_MESSAGE          = 0xD;
+
+/*
+ * structures for ethernet frame
+ */
+
+typedef layout "big-endian" {
+    uint48 da;
+    uint48 sa;
+    uint16 type;
+} ethernet_header_t;
+
+typedef layout "big-endian" {
+    uint16 TagVal;
+    bitfields 16 {
+        uint3  pri    @ [15:13];
+        uint1  cfi    @ [12:12];
+        uint12 vid    @ [11:0];
+    } vlan;
+} ieee_802_1q_tag_t;
+
+typedef layout "big-endian" {
+    uint48 da;
+    uint48 sa;
+    ieee_802_1q_tag_t vtag;
+    uint16 type;
+} eth_tagged_header_t;
+
+typedef layout "big-endian" {
+    uint48  sma;    // Source MAC Address
+    uint16  pi;     // Port Identifier
+} ieee_802_1ae_sci_t;
+
+typedef layout "big-endian" {
+    uint16  eth_type;   // MACsec Ethertype
+    bitfields 8 {
+        uint1     v@[7:7];  // Version number
+        uint1    es@[6:6];  // End Station
+        uint1    sc@[5:5];  // Secure Channel
+        uint1   scp@[4:4];  // Single Copy
+        uint1     e@[3:3];  // Encryption
+        uint1     c@[2:2];  // Changed Text
+        uint2    an@[1:0];  // Association Number
+    } tci_an;
+    uint8   sl;         // Short Length
+    uint32  pn;         // Packet Number
+    ieee_802_1ae_sci_t sci; // Secure Channel Identifier
+} ieee_802_1ae_tag_t;
+
+typedef layout "big-endian" {
+    uint48  da;         // Destination Address
+    uint48  sa;         // Source Address
+    ieee_802_1ae_tag_t mst;  // MAC Security Tag
+} eth_802_1ae_tagged_header_t;
+
+typedef layout "big-endian" {
+    bitfields 8 {
+        uint4 version @ [7:4];
+        uint4 length  @ [3:0];
+    } header;
+    uint8  tos;
+    uint16 len;
+    uint16 id;
+    bitfields 16 {
+        uint3  flags    @ [15:13];
+        uint13 frag_ofs @ [12:0];
+    } fragment;
+    uint8  ttl;
+    uint8  protocol;
+    uint16 checksum;
+    uint32 src;
+    uint32 dst;
+} ipv4_header_t;
+
+// TCP/UDP 12-byte IPv4 pseudo header
+typedef layout "big-endian" {
+    uint32  src;
+    uint32  dst;
+    uint8   rsv;
+    uint8   protocol;
+    uint16  len;
+} tup_pseudo_ipv4_header_t;
+
+// TCP/UDP 40-byte IPv6 pseudo header
+typedef layout "big-endian" {
+    uint8   src[16];
+    uint8   dst[16];
+    uint32  len;
+    uint8   rsv[3];
+    uint8   next;
+} tup_pseudo_ipv6_header_t;
+
+typedef layout "big-endian" {
+    bitfields 32 {
+        uint4  version       @ [31:28];
+        uint8  traffic_class @ [27:20];
+        uint20 flow_label    @ [19:0];
+    } header;
+    uint16 len;
+    uint8  next;
+    uint8  hlim;
+    uint8  src[16];
+    uint8  dst[16];
+} ipv6_header_t;
+
+typedef layout "big-endian" {
+    uint8 next;
+    uint8 ext_hlen;
+} ipv6_ext_header_t;
+
+typedef layout "big-endian" {
+    uint16 src_port;
+    uint16 dst_port;
+    uint32 seq_number;
+    uint32 ack_number;
+    bitfields 16 {
+        uint4 offset @ [15:12];
+        uint1 urg    @ [5:5];
+        uint1 ack    @ [4:4];
+        uint1 psh    @ [3:3];
+        uint1 rst    @ [2:2];
+        uint1 syn    @ [1:1];
+        uint1 fin    @ [0:0];
+    } control;
+    uint16 window;
+    uint16 checksum;
+    uint16 urgt_pointer;
+    //options
+} tcp_header_t;
+
+typedef layout "big-endian" {
+    uint16 src_port;
+    uint16 dst_port;
+    uint16 length;
+    uint16 checksum;
+} udp_header_t;
+
+typedef layout "big-endian" {
+    uint16      ver_ptp;
+    uint16      ver_net;
+    uint8       sub_domain[16];
+    uint8       msg_type;
+    uint8       sct; // Source Communication Technology
+    uint8       src_uuid[6];
+    uint16      src_pid;
+    uint16      seq_id;
+    uint8       control;
+    uint8       rsvd;
+    uint16      flags;
+} ptp_v1_message_header_t;
+
+typedef layout "big-endian" {
+    uint8       msg_id;
+    uint8       ver_ptp;
+    uint16      vessage_len;
+    uint8       subdomain_num;
+    uint8       rsvd1;
+    uint16      flags;
+    uint8       correction_ns[6];
+    uint8       correction_sub_ns[2];
+    uint8       rsvd2[5];
+    uint8       sct;
+    uint8       src_uuid[6];
+    uint16      src_pid; // Source Port ID
+    uint16      seq_id;  // Sequence ID
+    uint8       control;
+    uint8       log_msg_period;
+    uint8       rsvd3[2];
+} ptp_v2_message_header_t;
+
+method calc_crc32(const uint8 *frame, int length) -> (uint32 crc) {
+    local bytes_t data;
+
+    data.len = length;
+    data.data = frame;
+
+    call $do_crc(ETH_CRC_POLY, 32, 0xFFFFFFFF,
+                 false, true, true, true, true, data) -> (crc);
+}
+
+method checksum_to_16bit(uint64 calc, uint16 delta) -> (uint16 chksum) {
+    // delta is checksum value from packet
+    // RFC793(TCP) RFC768(UDP)
+    calc -= delta;
+
+    while ((calc >> 16) != 0)
+        calc = (calc >> 16) + (calc & 0xFFFF);
+
+    chksum = (~calc) & 0xFFFF;
+}
+
+method calc_checksum_value(const uint8 *data, int length) -> (uint64 sum) {
+    local int i = 0;
+
+    while ((i + 1) < length) {
+        sum += UNALIGNED_LOAD_BE16(cast(data + i, void*));
+        i += 2;
+    }
+
+    if ((i + 1) == length)
+        sum += (data[i] << 8); // Patch a '0' byte when the length is odd
+}
+
+method calc_ipv4_checksum(const uint8 *ipv4) -> (uint16 chksum) {
+    local ipv4_header_t *header = cast(ipv4, void*);
+    local uint64 calc;
+
+    call $calc_checksum_value(ipv4, header->header.length * 4) -> (calc);
+
+    calc -= header->checksum;
+    call $checksum_to_16bit(calc, 0) -> (chksum);
+}
+
+method calc_tup_checksum_v4(const uint8 *tup,   // TCP/UDP payload
+                            uint8 prot,         // ETH_PROT_UDP or ETH_PROT_TCP
+                            uint32 src,         // Source IPv4 address
+                            uint32 dst,         // Descriptor IPv4 address
+                            uint16 length       // Length of TCP/UDP payload
+                           ) -> (uint16 chksum) {
+
+    local uint64 calc;
+    local tcp_header_t *th = cast(tup, void *);
+    local udp_header_t *uh = cast(tup, void *);
+
+    call $calc_checksum_value(tup, length) -> (calc);
+
+    calc += length;
+    calc += prot;
+    calc += src;
+    calc += dst;
+    if (prot == ETH_PROT_TCP)
+        calc -= th->checksum;
+    else if (prot == ETH_PROT_UDP)
+        calc -= uh->checksum;
+
+    call $checksum_to_16bit(calc, 0) -> (chksum);
+    if (prot == ETH_PROT_UDP && chksum == 0)
+        chksum = 0xFFFF;
+
+}
+
+method calc_tup_checksum_v6(const uint8 *tup,
+                            uint8 prot,     // ETH_PROT_UDP or ETH_PROT_TCP
+                            uint8 *src,     // 16-byte source IPv6 address
+                            uint8 *dst,     // 16-byte destination IPv6 address
+                            uint8  next_hdr,// Next header in IPv6 header
+                            uint16 len      // Length of TCP/UDP payload
+                           ) -> (uint16 chksum) {
+    local int           i;
+    local uint64        calc = 0;
+    local uint16        csum_delata = 0;  // checksum value from frame
+    local uint16_be_t   *src_ipv6 = cast(src, uint16_be_t*);
+    local uint16_be_t   *dst_ipv6 = cast(dst, uint16_be_t*);
+    local udp_header_t  *uh = cast(tup, void *);
+    local tcp_header_t  *th = cast(tup, void *);
+
+    if (prot == ETH_PROT_TCP)
+        csum_delata = th->checksum;
+    else if (prot == ETH_PROT_UDP)
+        csum_delata = uh->checksum;
+
+    call $calc_checksum_value(tup, len) -> (calc);
+
+    calc += len;
+    calc += next_hdr;
+    for (i = 0; i < 8; i++) {
+        calc += src_ipv6[i];
+        calc += dst_ipv6[i];
+    }
+
+    call $checksum_to_16bit(calc, csum_delata) -> (chksum);
+    if (prot == ETH_PROT_UDP && chksum == 0)
+        chksum = 0xFFFF;
+}
+
+method dbuffer_checksum(const dbuffer_t *dbuf, int offset, size_t len)
+                                                            -> (uint16 sum16) {
+    local int           db_len;
+    local uint64        sum64;
+    local const uint8   *ptr;
+
+    db_len = dbuffer_len(dbuf);
+    ptr = dbuffer_read(cast(dbuf, dbuffer_t*), offset, len);
+    call $calc_checksum_value(ptr, db_len) -> (sum64);
+    call $checksum_to_16bit(sum64, 0) -> (sum16);
+}
+
+method dbuffer_to_attr(dbuffer_t *db) -> (attr_value_t val) {
+    if (db)
+        val = SIM_make_attr_data(dbuffer_len(db),
+                                 dbuffer_read_all(db));
+    else
+        val = SIM_make_attr_data(0, NULL);
+}
+
+method attr_to_dbuffer(attr_value_t val) -> (dbuffer_t *db) {
+    local int len;
+
+    if (!SIM_attr_is_data(val)) {
+        log "info", 4: "attr value is not a raw data";
+        return;
+    }
+    len = SIM_attr_data_size(val);
+    if (len == 0) {
+        log "info", 4: "the length of raw data attr value is 0";
+        db = NULL;
+        return;
+    }
+
+    db = new_dbuffer();
+    memcpy(dbuffer_append(db, len), SIM_attr_data(val), len);
+}

@@ -1,0 +1,982 @@
+/*
+  pcie-downstream-port-legacy.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "pcie-downstream-port.dml";
+import "simics/devs/io-memory.dml";
+
+typedef struct {
+    conf_object_t *obj;
+    const pci_device_interface_t *ldi;
+    uint16 devid;
+    bool transparent;
+} legacy_device_t;
+typedef legacy_device_t vect legacy_device_list_t;
+
+extern bool VCONTAINSP(...);
+
+attribute pci_devices is (post_init, destroy) {
+    param documentation = "((<i>id</i>, <i>function</i>, <i>object</i>)*)."
+        + " <i>id</i> is the PCI device id. <i>function</i> is the PCI device"
+        + " logical function. <i>object</i> is the PCI device itself, which"
+        + " must implement the <iface>pci_device</iface> interface. The object"
+        + " can also optionally implement either or both of: the"
+        + " <iface>pci_express</iface> interface, a port-object named"
+        + " 'port.pcie_message'  implementing the <iface>transaction</iface>"
+        + " interface. The tuple may also contain an additional integer that"
+        + " tells if the PCI device is enabled or not. As default the PCI"
+        + " device is enabled.";
+    param type = "[[iio]|[iioi]*]";
+    session legacy_device_list_t val;
+    session legacy_device_list_t old_val;
+
+    method set(attr_value_t value) throws {
+        local legacy_device_list_t new_val;
+        for (local int i = 0; i < SIM_attr_list_size(value); i++) {
+            local attr_value_t it = SIM_attr_list_item(value, i);
+
+            local legacy_device_t ldev;
+            ldev.obj = SIM_attr_object(SIM_attr_list_item(it, 2));
+
+            local uint64 f = SIM_attr_integer(SIM_attr_list_item(it, 1));
+            local uint64 d = SIM_attr_integer(SIM_attr_list_item(it, 0));
+            if (d > 31 || f > 7) {
+                SIM_c_attribute_error(
+                    "invalid dev,fun pair %lld.%lld for object '%s'",
+                    d, f, SIM_object_name(ldev.obj));
+                VFREE(new_val);
+                throw;
+            }
+            ldev.devid = d << 3 | f;
+
+            local bool enabled = true;
+            if (SIM_attr_list_size(it) == 4)
+                enabled = SIM_attr_integer(SIM_attr_list_item(it, 3)) == 1;
+            if (enabled)
+                disabled.del(ldev.devid);
+            else
+                disabled.add(ldev.devid);
+
+            ldev.ldi = SIM_get_interface(ldev.obj, "pci_device");
+            if (!ldev.ldi) {
+                local sim_exception_t _ret = SIM_clear_exception();
+                SIM_attribute_error(SIM_last_error());
+                VFREE(new_val);
+                throw;
+            }
+
+            // A legacy device is considered 'transparent' if it implements
+            // pci_multi_function_device and has DeviceID 0, since then it can
+            // theoretically claim any device/function pair.
+            local const void *mfi =
+                SIM_c_get_interface(ldev.obj, "pci_multi_function_device");
+            if (mfi && ldev.devid == 0)
+                ldev.transparent = true;
+
+            assert_no_duplicates(new_val, ldev);
+
+            VADD(new_val, ldev);
+        }
+
+        VFREE(old_val);
+        old_val = this.val;
+        this.val = new_val;
+        if (SIM_object_is_configured(obj)) {
+            inform_devices();
+            // We check against added functions here to ensure that we will not
+            // report adapter not present in the case of new devices being
+            // present. This must be done after `inform_devices()` is called
+            if (VLEN(functions.val) > 0)
+                handle_hotplug_pd(PCIE_HP_PD_Adapter_Present);
+            else
+                handle_hotplug_pd(PCIE_HP_PD_Adapter_Not_Present);
+        }
+    }
+
+    method inform_devices() {
+        for (local int i = 0; i < VLEN(old_val); ++i) {
+            local legacy_device_t old = old_val[i];
+            local legacy_device_t *newd = lvfind(this.val, old.obj);
+            if (!newd || newd->devid != old.devid) {
+                functions.del_legacy(old.obj, old.devid);
+            }
+        }
+        for (local int i = 0; i < VLEN(this.val); ++i) {
+            local legacy_device_t newd = this.val[i];
+            local legacy_device_t *old = lvfind(old_val, newd.obj);
+            if (!old || old->devid != newd.devid) {
+                /* we need to delete first then add because if we're loading a
+                   checkpoint the memory-space will have checkpointed our
+                   mappings */
+                functions.del_legacy(newd.obj, newd.devid);
+                functions.add_legacy(newd.obj, newd.devid);
+            }
+        }
+        VFREE(old_val);
+    }
+
+    method post_init() {
+        inform_devices();
+    }
+
+    method get() -> (attr_value_t) {
+        local attr_value_t value = SIM_alloc_attr_list(VLEN(this.val));
+        for (local int i = 0; i < VLEN(this.val); ++i) {
+            local attr_value_t d = SIM_make_attr_uint64(this.val[i].devid[7:3]);
+            local attr_value_t f = SIM_make_attr_uint64(this.val[i].devid[2:0]);
+            local attr_value_t o = SIM_make_attr_object(this.val[i].obj);
+            local uint64 enabled = disabled.contains(this.val[i].devid) ? 0 : 1;
+            local attr_value_t e = SIM_make_attr_uint64(enabled);
+            local attr_value_t it = SIM_make_attr_list(4, d, f, o, e);
+            SIM_attr_list_set_item(&value, i, it);
+        }
+        return value;
+    }
+
+    method hot_reset() {
+        for (local int i = 0; i < VLEN(this.val); i++)
+            this.val[i].ldi->bus_reset(this.val[i].obj);
+    }
+
+    method destroy() {
+        VFREE(this.val);
+    }
+}
+
+// This isn't particularly pretty, but there's no good way to detect if an
+// object is old or new PCIe. Most of them implement pci_device interface, but
+// some might also implement pci_multi_function_device interface and use that
+// to delegate responsibility to other objects, which only need to be proper
+// map targets, just like new PCIe. For lack of a better way, we simply declare
+// that old PCIe are objects that are added via pci_devices attribute. To avoid
+// tainting pcie-downstream-port.dml with legacy code we keep a session-list
+// here with all the objects we've seen when processing pci_devices, so that we
+// can detect and map/unmap legacy devices properly.
+session conf_object_t * vect legacy_objects;
+session conf_object_t * vect legacy_mf_objects;
+
+is destroy;
+method destroy() {
+    VFREE(legacy_objects);
+    VFREE(legacy_mf_objects);
+}
+
+attribute functions {
+    param LEGACY_ADD = true;
+    param LEGACY_DEL = false;
+    method _add_or_del_legacy_dev(conf_object_t *mobj,
+                                  uint16 devid, bool adding, bool mf) {
+        VADD_NODUPLICATE(legacy_objects, mobj);
+        if (mf)
+            VADD_NODUPLICATE(legacy_mf_objects, mobj);
+        if (adding)
+            add(mobj, devid);
+        else
+            del(mobj, devid);
+    }
+
+    method handle_legacy_dev(conf_object_t *mobj, uint16 devid, bool adding) {
+        local const pci_multi_function_device_interface_t *mfi =
+            SIM_c_get_interface(mobj, "pci_multi_function_device");
+        if (!mfi) {
+            _add_or_del_legacy_dev(mobj, devid, adding, false);
+            return;
+        }
+
+        if (devid[2:0] != 0) {
+            log error: "illegal function number (%d) for multi function"
+                + " device '%s', must be 0",
+                devid[2:0], SIM_object_name(mobj);
+            return;
+        }
+
+        local attr_value_t list = mfi->supported_functions(mobj);
+        for (local int j = 0; j < SIM_attr_list_size(list); j++) {
+            local attr_value_t elem = SIM_attr_list_item(list, j);
+            local uint64 mf_fun =
+                SIM_attr_integer(SIM_attr_list_item(elem, 0));
+            if (mf_fun > 256) {
+                log error: "illegal function number (%d) given by"
+                    + " multi function device '%s'",
+                    mf_fun, SIM_object_name(mobj);
+                SIM_attr_free(&list);
+                return;
+            }
+            if (mf_fun[7:3] != 0 && devid[7:3] != 0) {
+                log error: "illegal device:function number combination"
+                    + " (%d:%d) given by multi function device '%s'",
+                    devid[7:3], mf_fun, SIM_object_name(mobj);
+                SIM_attr_free(&list);
+                return;
+            }
+            local conf_object_t *mf_obj;
+            local const char *mf_port;
+            local uint16 mf_devid = devid | mf_fun[7:0];
+            local attr_value_t e1 = SIM_attr_list_item(elem, 1);
+            if (SIM_attr_is_string(e1)) {
+                mf_obj = mobj;
+                mf_port = SIM_attr_string(e1);
+            } else {
+                mf_obj = SIM_attr_object(e1);
+                if (SIM_attr_list_size(elem) == 3)
+                    mf_port = SIM_attr_string(SIM_attr_list_item(elem, 2));
+            }
+            if (mf_port) {
+                // We don't support port interfaces, but if we can find a bank
+                // port object with the same name as the port interface, we use
+                // that.
+                local strbuf_t sbuf;
+                sb_init(&sbuf);
+                sb_addfmt(&sbuf, "bank.%s", mf_port);
+                mf_obj = SIM_object_descendant(mf_obj, sb_str(&sbuf));
+                sb_free(&sbuf);
+                if (!mf_obj) {
+                    log unimpl: "%s is using port interfaces, which is not"
+                        + " supported. Please convert to port objects",
+                        SIM_object_name(mobj);
+                    SIM_attr_free(&list);
+                    return;
+                }
+            }
+            _add_or_del_legacy_dev(mf_obj, mf_devid, adding, true);
+        }
+        SIM_attr_free(&list);
+    }
+
+    method add_legacy(conf_object_t *mobj, uint16 devid) {
+        handle_legacy_dev(mobj, devid, true);
+    }
+
+    method del_legacy(conf_object_t *mobj, uint16 devid) {
+        handle_legacy_dev(mobj, devid, false);
+    }
+
+    method map(conf_object_t *obj, uint16 devid) {
+        if (VCONTAINSP(legacy_objects, obj))
+            map_legacy(obj, devid);
+        else
+            default(obj, devid);
+    }
+
+    method map_legacy(conf_object_t *mobj, uint16 devid) {
+        if (disabled.contains(devid))
+            return;
+        /* Check for legacy transaction-based PCIe message port, otherwise add
+           legacy pci_express adapter */
+        local conf_object_t *msg_obj =
+            SIM_object_descendant(mobj, "port.pcie_message");
+        if (!msg_obj && VCONTAINSP(legacy_mf_objects, mobj)
+            && (SIM_c_get_interface(mobj, "transaction") != NULL)) {
+            msg_obj = mobj;
+        }
+        local map_info_t msg_nfo;
+        msg_nfo.base = devid << 48;
+        msg_nfo.length = 1 << 48;
+        if (!msg_obj) {
+            msg_obj = impl.transaction_to_pci_express.obj;
+            msg_nfo.start = msg_nfo.base;
+        }
+        pcie_map.add_map(msg_obj, msg_nfo, PCIE_Type_Msg);
+
+        local map_info_t cfg_nfo;
+        /* DeviceID is in address-bits 31:16 for configs */
+        cfg_nfo.base = devid << 16;
+        cfg_nfo.start = 0;
+        cfg_nfo.length = 1 << 16;
+        cfg_nfo.function = 255;
+        pcie_map.add_map(mobj, cfg_nfo, PCIE_Type_Cfg);
+    }
+
+    method unmap(conf_object_t *obj, uint16 devid) {
+        if (VCONTAINSP(legacy_objects, obj))
+            unmap_legacy(obj, devid);
+        else
+            default(obj, devid);
+    }
+
+    method unmap_legacy(conf_object_t *obj, uint16 devid) {
+        /* unmap config space */
+        pcie_map.del_map(obj, devid << 16, PCIE_Type_Cfg);
+
+        /* unmap msg space */
+        local conf_object_t *msg_obj =
+            SIM_object_descendant(obj, "port.pcie_message");
+        if (!msg_obj && VCONTAINSP(legacy_mf_objects, obj)
+            && (SIM_c_get_interface(obj, "transaction") != NULL)) {
+            msg_obj = obj;
+        }
+        if (!msg_obj)
+            msg_obj = impl.transaction_to_pci_express.obj;
+        pcie_map.del_map(msg_obj, devid << 48, PCIE_Type_Msg);
+    }
+}
+
+implement pcie_port_control {
+    method hot_reset() {
+        default();
+        pci_devices.hot_reset();
+    }
+}
+
+implement pcie_map {
+    method get_device_id(conf_object_t *dev_obj) -> (uint16) {
+        local legacy_device_t *pdev = lvfind(pci_devices.val, dev_obj);
+        if (pdev && SIM_c_get_interface(dev_obj, "pci_multi_function_device") != NULL) {
+            if (pdev->devid[15:8] != 0)
+                return pdev->devid;
+            else
+                return (sec_bus_num.val << 8) | pdev->devid;
+        } else {
+            return default(dev_obj);
+        }
+    }
+}
+
+implement pci_bus {
+    method raise_interrupt(conf_object_t *pcie_dev, int pin) {
+        local byte_string_t payload;
+        pci_express.send_message(pcie_dev, PCIE_Msg_Assert_INTA + pin, payload);
+    }
+
+    method lower_interrupt(conf_object_t *pcie_dev, int pin) {
+        local byte_string_t payload;
+        pci_express.send_message(
+            pcie_dev, PCIE_Msg_Deassert_INTA + pin, payload);
+    }
+
+    method add_map(conf_object_t *pcie_dev, addr_space_t space,
+                   conf_object_t *target, map_info_t nfo) -> (int) {
+        if (space == Sim_Addr_Space_Conf) {
+            /* Map to conf_space, all access to cfg_space will be translated by
+               the cfg_to_conf translator before forwarded to conf_space. */
+            return conf_space.map_demap.add_map(pcie_dev, target, nfo);
+        } else if (space == Sim_Addr_Space_IO) {
+            return dev.io_space.map_demap.add_map(pcie_dev, target, nfo);
+        } else if (space == Sim_Addr_Space_Memory) {
+            return dev.mem_space.map_demap.add_map(pcie_dev, target, nfo);
+        } else {
+            return 0;
+        }
+    }
+
+    method remove_map(conf_object_t *pcie_dev, addr_space_t space,
+                      int function) -> (int) {
+        if (space == Sim_Addr_Space_Conf)
+            return dev.conf_space.map_demap.remove_map(pcie_dev, function);
+        else if (space == Sim_Addr_Space_IO)
+            return dev.io_space.map_demap.remove_map(pcie_dev, function);
+        else if (space == Sim_Addr_Space_Memory)
+            return dev.mem_space.map_demap.remove_map(pcie_dev, function);
+        else
+            return 0;
+    }
+
+    method get_bus_address(conf_object_t *pcie_dev) -> (int) {
+        /* old-style PCIe bus has device_id on bits [27:12] */
+        return pcie_map.get_device_id(pcie_dev) << 12;
+    }
+
+    method set_device_status(int dev, int function, int enabled) {
+        local uint16 devid = (dev[4:0] << 3) | function[2:0];
+        if (enabled == 1)
+            disabled.del(devid);
+        else
+            disabled.add(devid);
+    }
+
+    method configuration_space() -> (conf_object_t *) {
+        /* return the legacy-translator, which mimics a memory-space to some
+           extent, but shifts device_id bits from 27:12 to 31:16 */
+        return dev.conf_space.obj;
+    }
+
+    method io_space() -> (conf_object_t *) {
+        return dev.io_space.obj;
+    }
+
+    method memory_space() -> (conf_object_t *) {
+        return dev.mem_space.obj;
+    }
+
+    /* methods that EP's shouldn't use, not supported */
+    method set_bus_number(int bus_id) {
+        log unimpl: "%s.set_bus_number is not supported", name;
+    }
+
+    method set_sub_bus_number(int bus_id) {
+        log unimpl: "%s.set_sub_bus_number is not supported", name;
+    }
+
+    method bus_reset() {
+        log unimpl: "%s.bus_reset is not supported", name;
+    }
+
+    method system_error() {
+        log unimpl: "%s.system_error is not supported", name;
+    }
+
+    /* deprecated methods */
+    method memory_access(generic_transaction_t *mem_op) -> (exception_type_t) {
+        log unimpl: "%s.memory_access is deprecated", name;
+        return Sim_PE_IO_Error;
+    }
+
+    method interrupt_acknowledge() -> (int) {
+        log unimpl: "%s.interrupt_acknowledge is deprecated", name;
+        return 0;
+    }
+
+    method special_cycle(uint32 value) {
+        log unimpl: "%s.special_cycle is deprecated", name;
+    }
+
+    method add_default(conf_object_t *pcie_dev, addr_space_t space,
+                       conf_object_t *target, map_info_t info) {
+        log unimpl: "%s.add_default is deprecated", name;
+    }
+
+    method remove_default(addr_space_t space) {
+        log unimpl: "%s.remove_default is deprecated", name;
+    }
+}
+
+method pmop_rid(generic_transaction_t *mop) {
+    if (SIM_get_mem_op_ini_type(mop) != Sim_Initiator_PCI_Device)
+        return;
+
+    local pci_memory_transaction_t *pmop = SIM_pci_mem_trans_from_generic(mop);
+    if (pmop->_internal_bus_address != 0) {
+        local int rid = pmop->_internal_bus_address >> 12;
+        pmop->_internal_bus_number = (rid >> 8) & ((1 << 8) - 1);
+        pmop->_internal_device_number = (rid >> 3) & ((1 << 5) - 1);
+        pmop->_internal_function_number = rid & ((1 << 3) - 1);
+    } else {
+        local conf_object_t *dev = SIM_get_mem_op_initiator(mop);
+        local uint16 rid = pcie_map.get_device_id(dev);
+        pmop->_internal_bus_address = rid << 12;
+        pmop->_internal_bus_number = (rid >> 8) & ((1 << 8) - 1);
+        pmop->_internal_device_number = (rid >> 3) & ((1 << 5) - 1);
+        pmop->_internal_function_number = rid & ((1 << 3) - 1);
+    }
+}
+
+implement pci_downstream {
+    method operation(generic_transaction_t *mop, addr_space_t space)
+        -> (exception_type_t) {
+        switch (space) {
+        case Sim_Addr_Space_Conf:
+            return pcie_memop_issue(impl.conf_to_cfg.down, mop, PCIE_Type_Cfg);
+        case Sim_Addr_Space_IO:
+            return pcie_memop_issue(dev.io.map_target, mop, PCIE_Type_IO);
+        case Sim_Addr_Space_Memory:
+            return pcie_memop_issue(dev.mem.map_target, mop, PCIE_Type_Mem);
+        default:
+            log error: "pci_downstream.operation: invalid space '%d'", space;
+            return Sim_PE_IO_Not_Taken;
+        }
+    }
+}
+
+implement pci_upstream {
+    method operation(generic_transaction_t *mop, addr_space_t space)
+        -> (exception_type_t) {
+        if (!upstream_target.map_target)
+            return Sim_PE_IO_Not_Taken;
+
+        pmop_rid(mop);
+
+        local pcie_type_t type = addr_space_to_pcie_type(space);
+        if (type == PCIE_Type_Other) {
+            log error: "%s: invalid space '%d'", name, space;
+            return Sim_PE_IO_Error;
+        }
+        if (type == PCIE_Type_Cfg)
+            return pcie_memop_issue(impl.conf_to_cfg.up, mop, type);
+        else
+            return pcie_memop_issue(upstream_target.map_target, mop, type);
+    }
+}
+
+implement io_memory {
+    method operation(generic_transaction_t *mop,
+                     map_info_t nfo) -> (exception_type_t) {
+        /* Simics prefers this interface over the 'translator' interface on the
+           non-legacy part of the pcie-downstream-port. Because of this we
+           can't be 100% compatible with both new PCIe and old. If a device is
+           connected to a legacy-port and wants to do direct-memory-lookup in
+           the upstream direction it is only possible by first using the
+           'translator' interface to obtain a map-target, which can be used
+           with VT_map_target_dm_lookup. On a non-legacy port, the device can
+           use the pcie-downstream-port as a map-target directly, without first
+           using the 'translator' interface.
+
+           It also means that we may receive new-style PCIe transactions here,
+           so we must check for that and handle them correctly.
+        */
+        local pcie_type_t ptype = PCIE_Type_Not_Set;
+        if (mop->transaction)
+            ptype = ATOM_get_transaction_pcie_type(mop->transaction);
+        if (ptype != PCIE_Type_Not_Set) {
+            local uint64 addr =
+                SIM_get_mem_op_physical_address(mop) - nfo.base + nfo.start;
+            return upstream.transaction.issue(mop->transaction, addr);
+        }
+        return pci_upstream.operation(mop, nfo.function);
+    }
+}
+
+implement pci_upstream_operation {
+    method read(conf_object_t *initiator,
+                uint16 rid,
+                addr_space_t space,
+                physical_address_t address,
+                buffer_t buffer) -> (exception_type_t) {
+        local pci_memory_transaction_t trans = legacy_transaction(rid);
+        local generic_transaction_t *mop = &trans._internal_s;
+        SIM_set_mem_op_initiator(mop, Sim_Initiator_PCI_Device, initiator);
+        SIM_set_mem_op_physical_address(mop, address);
+        SIM_set_mem_op_type(mop, Sim_Trans_Load);
+        mop->block_STC = 1;
+        mop->size = buffer.len;
+        mop->real_address = buffer.data;
+
+        return pci_upstream.operation(mop, space);
+    }
+
+    method write(conf_object_t *initiator,
+                 uint16 rid,
+                 addr_space_t space,
+                 physical_address_t address,
+                 bytes_t bytes) -> (exception_type_t) {
+        local pci_memory_transaction_t trans = legacy_transaction(rid);
+        local generic_transaction_t *mop = &trans._internal_s;
+        SIM_set_mem_op_initiator(mop, Sim_Initiator_PCI_Device, initiator);
+        SIM_set_mem_op_physical_address(mop, address);
+        SIM_set_mem_op_type(mop, Sim_Trans_Store);
+        mop->block_STC = 1;
+        mop->size = bytes.len;
+        mop->real_address = cast(bytes.data, uint8*);
+
+        return pci_upstream.operation(mop, space);
+    }
+}
+
+method legacy_transaction(uint16 rid) -> (pci_memory_transaction_t) {
+    local pci_memory_transaction_t trans;
+    trans._internal_bus_address = rid << 12;
+    trans._internal_bus_number = (rid >> 8) & ((1 << 8) - 1);
+    trans._internal_device_number = (rid >> 3) & ((1 << 5) - 1);
+    trans._internal_function_number = rid & ((1 << 3) - 1);
+    return trans;
+}
+
+typedef struct {
+    transaction_t t;
+    atom_t atoms[10];
+} legacy_pcie_transaction_t;
+
+method init_transaction(legacy_pcie_transaction_t *pt,
+                        transaction_flags_t flags, buffer_t buffer,
+                        conf_object_t *initiator, pcie_type_t type,
+                        uint16 rid) {
+    pt->t.atoms = pt->atoms;
+    pt->atoms[0] = ATOM_completion(NULL);
+    pt->atoms[1] = ATOM_flags(flags);
+    pt->atoms[2] = ATOM_pcie_type(type);
+    pt->atoms[3] = ATOM_size(buffer.len);
+    pt->atoms[4] = ATOM_data(buffer.data);
+    pt->atoms[5] = ATOM_pcie_requester_id(rid);
+    pt->atoms[6] = ATOM_initiator(initiator);
+    pt->atoms[7] = ATOM_list_end(0);
+    pt->atoms[8] = ATOM_list_end(0);
+    pt->atoms[9] = ATOM_list_end(0);
+}
+
+implement pci_express {
+    // This interface is used by legacy devices to send PCIe messages upstream
+    // and downstream. Legacy pcie-bus sends a message downstream if the
+    // initiator is equal to its 'bridge' attribute. For us, this roughly
+    // corresponds to our 'upstream_target'. We also convert them to
+    // transaction_t based messages before issuing them upstream/downstream.
+    method send_message(conf_object_t *src, pcie_message_type_t mtype,
+                        byte_string_t payload) -> (int) {
+        local buffer_t buf = { .len = payload.len, .data = payload.str };
+        local transaction_flags_t flags = Sim_Transaction_Write;
+
+        local map_target_t *mt;
+        local pcie_msg_route_t mroute;
+        local uint16 requester_id;
+        if (src == upstream_target.obj) {
+            mt = downstream.map_target;
+            mroute = PCIE_Msg_Route_Broadcast;
+            requester_id = 0;
+        } else {
+            mt = upstream.map_target;
+            mroute = PCIE_Msg_Route_Upstream;
+            requester_id = pcie_map.get_device_id(src);
+        }
+
+        local legacy_pcie_transaction_t lpt;
+        init_transaction(&lpt, flags, buf, src, PCIE_Type_Msg, requester_id);
+        assert lpt.atoms[7].id == Sim_Atom_Id_list_end;
+        lpt.atoms[7] = ATOM_pcie_msg_type(mtype);
+        lpt.atoms[8] = ATOM_pcie_msg_route(mroute);
+
+        local exception_type_t exc = SIM_issue_transaction(mt, &lpt.t, 0);
+        exc = SIM_transaction_wait(&lpt.t, exc);
+        if (exc != Sim_PE_No_Exception)
+            log info, 2: "send_message: unexpected exception %d", exc;
+
+        /* It's unclear what the return code means, pcie-bus returns 0 almost
+           no matter what happens */
+        return 0;
+    }
+}
+
+method pcie_memop_issue(map_target_t *mt,
+                        generic_transaction_t *mop,
+                        pcie_type_t type) -> (exception_type_t) {
+        local physical_address_t addr = SIM_get_mem_op_physical_address(mop);
+        if (mop->transaction) {
+            log info, 2: "generic_transaction_t already has a transaction_t"
+                + " attached, forwarding unmodified";
+            return SIM_issue_transaction(mt, mop->transaction, addr);
+        }
+
+        local uint32 pasid;
+        local uint16 rid;
+        if (SIM_get_mem_op_ini_type(mop) == Sim_Initiator_PCI_Device) {
+            local pci_memory_transaction_t *pmop =
+                SIM_pci_mem_trans_from_generic(mop);
+            /* we can't be sure that the tlp prefix is a pasid but it's our
+               best guess */
+            pasid = pmop->_internal_tlp_prefix;
+            /* old-style PCIe bus has device_id on bits [27:12] */
+            rid = pmop->_internal_bus_address[27:12];
+        }
+
+        local conf_object_t *initiator = SIM_get_mem_op_initiator(mop);
+        if (rid == 0 && initiator)
+            rid = pcie_map.get_device_id(initiator);
+
+        /* mem_op members without accessors */
+        local bool non_coherent = mop->non_coherent;
+        if (mop->inverse_endian) {
+            log unimpl: "%s: inverse endian not implemented", name;
+            return Sim_PE_IO_Error;
+        }
+
+        local transaction_flags_t flags = 0
+            | (SIM_mem_op_is_instruction(mop) ? Sim_Transaction_Fetch : 0)
+            | (SIM_mem_op_is_write(mop) ? Sim_Transaction_Write : 0)
+            | (SIM_mem_op_is_control(mop) ? Sim_Transaction_Control : 0)
+            | (SIM_get_mem_op_inquiry(mop) ? Sim_Transaction_Inquiry : 0)
+            | (SIM_mem_op_is_atomic(mop) ? Sim_Transaction_Atomic : 0)
+            | (non_coherent ? Sim_Transaction_Incoherent : 0);
+
+        local buffer_t buffer;
+        buffer.len = SIM_get_mem_op_size(mop);
+        buffer.data = mop->real_address;
+
+        local legacy_pcie_transaction_t lpt;
+        init_transaction(&lpt, flags, buffer, initiator, type, rid);
+        assert lpt.atoms[7].id == Sim_Atom_Id_list_end;
+        lpt.atoms[7] = ATOM_memop(mop);
+        if (pasid > 0)
+            lpt.atoms[8] = ATOM_pcie_pasid(pasid);
+        mop->transaction = &lpt.t;
+        local exception_type_t exc = SIM_issue_transaction(mt, &lpt.t, addr);
+        exc = SIM_transaction_wait(&lpt.t, exc);
+        mop->transaction = NULL;
+        return exc;
+}
+
+attribute memory_space "Legacy Memory space" {
+    param type = "o";
+    param configuration = "pseudo";
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_object(mem_space.obj);
+    }
+    method set(attr_value_t v) throws { /* ignore */ }
+}
+
+connect conf_space is (init_as_subobj, post_init) "legacy Config space" {
+    // Legacy PCIe puts device-id on bits [27:12] while new PCIe puts device-id
+    // on [31:16]. We monitor this memory-space for map-changes and create
+    // matching map entries in cfg_space.
+
+    param classname = "memory-space";
+    interface map_demap;
+    method post_init() {
+        local map_info_t nfo;
+        map_demap.map_bridge(
+            impl.conf_to_cfg.obj, NULL, cfg_space.obj, NULL, nfo);
+        SIM_add_notifier(
+            this.obj, Sim_Notify_Map_Change, dev.obj, &callback, NULL);
+        map_changed();  // capture mappings done during init
+    }
+    method callback(conf_object_t *notif, void *cbdata) {
+        map_changed();
+    }
+    method map_changed() {
+        // clear old maps
+        cfg_space.map_demap.unmap(impl.cfg_to_conf.obj, NULL);
+
+        // add a map in cfg_space for each entry in legacy conf_space
+        local attr_value_t map = SIM_get_attribute(this.obj, "map");
+        for (local int i = 0; i < SIM_attr_list_size(map); i++) {
+            local attr_value_t me = SIM_attr_list_item(map, i);
+            local uint64 base = SIM_attr_integer(SIM_attr_list_item(me, 0));
+            local uint64 size = SIM_attr_integer(SIM_attr_list_item(me, 4));
+            local int16 priority = SIM_attr_integer(SIM_attr_list_item(me, 6));
+
+            local map_info_t nfo;
+            nfo.base[31:16] = base[27:12];
+            nfo.base[11:0] = base[11:0];
+            nfo.length = size << 4;
+            nfo.start = nfo.base;
+            nfo.priority = priority;
+            cfg_space.map_demap.map_bridge(
+                impl.cfg_to_conf.obj, NULL, this.obj, NULL, nfo);
+        }
+        SIM_attr_free(&map);
+    }
+}
+
+port broadcast {
+    implement transaction {
+        method issue(transaction_t *t, uint64 addr) -> (exception_type_t)  {
+                log info, 2: "Message broadcast";
+                local attr_value_t map = SIM_get_attribute(msg_space.obj, "map");
+
+                for (local int i = 0; i < SIM_attr_list_size(map); ++i) {
+                    local attr_value_t v = SIM_attr_list_item(map, i);
+                    local conf_object_t* mobj;
+                    local const char* port = NULL;
+                    if (SIM_attr_is_object(SIM_attr_list_item(v, 1))) {
+                        mobj = SIM_attr_object(
+                            SIM_attr_list_item(v, 1));
+                        if (mobj == msg_space.obj)
+                            continue;
+                    } else if (SIM_attr_is_list(SIM_attr_list_item(v, 1))) {
+                        mobj = SIM_attr_object(
+                            SIM_attr_list_item(SIM_attr_list_item(v, 1), 0));
+                        port = SIM_attr_string(
+                            SIM_attr_list_item(SIM_attr_list_item(v, 1), 1));
+                    }
+
+                    local map_target_t *msg_mt = SIM_new_map_target(
+                        mobj, port, NULL);
+                    if (mobj == impl.transaction_to_pci_express.obj) {
+                        // For legacy objects with no pcie_message port, the
+                        // address will not be maintained during broadcast
+                        // SIMICS-22637
+                        SIM_issue_transaction(
+                            msg_mt, t, SIM_attr_integer(
+                                SIM_attr_list_item(v, 0)));
+                    } else {
+                        SIM_issue_transaction(msg_mt, t, addr);
+                    }
+                    SIM_free_map_target(msg_mt);
+                }
+                SIM_attr_free(&map);
+                return Sim_PE_No_Exception;
+        }
+    }
+}
+
+group impl {
+    subdevice cfg_to_conf "translates to legacy conf space" {
+        implement translator {
+            // Shift ID-bits from 31:16 to 27:12, bits in 15:12 are lost */
+            method translate(physical_address_t addr, access_t acc,
+                             const map_target_t *dt) -> (translation_t) {
+                local translation_t txl;
+                if (addr[63:32] == 0) {
+                    txl.base[31:12] = addr[31:12];
+                    txl.start[27:12] = addr[31:16];
+                    txl.size = 1 << 12;
+                    txl.target = dt;
+                } else {
+                    log error: "can't translate config address 0x%x", addr;
+                    txl.base = 0x100000000;
+                    txl.size = 0xffffffff00000000;
+                }
+                return txl;
+            }
+        }
+    }
+
+    subdevice conf_to_cfg is (post_init, destroy) "translates from legacy conf space" {
+        session map_target_t *up;
+        session map_target_t *down;
+
+        method post_init() {
+            up = SIM_new_map_target(this.obj, NULL, upstream_target.map_target);
+            down = SIM_new_map_target(this.obj, NULL, cfg.map_target);
+        }
+
+        method destroy() {
+            if (up != NULL)
+                SIM_free_map_target(up);
+            if (down != NULL)
+                SIM_free_map_target(down);
+        }
+
+        implement translator {
+            // Shift ID-bits from 27:12 to 31:16 */
+            method translate(physical_address_t addr, access_t acc,
+                             const map_target_t *dt) -> (translation_t) {
+                local translation_t txl;
+                if (addr[63:28] == 0) {
+                    txl.base[27:12] = addr[27:12];
+                    txl.start[31:16] = addr[27:12];
+                    txl.size = 1 << 12;
+                    txl.target = dt;
+                } else {
+                    log error: "can't translate config address 0x%x", addr;
+                    txl.base = 0x10000000;
+                    txl.size = 0xfffffffff0000000;
+                }
+                return txl;
+            }
+        }
+    }
+
+    subdevice transaction_to_pci_express {
+        param desc =  "translates from transaction to legacy pci_express";
+        // This subdevice is mapped in msg_space for each legacy device that
+        // can't handle transaction_t based messages. This way it's possible to
+        // send transaction_t based PCIe messages downstream, even to legacy
+        // endpoints.
+        implement transaction {
+            method issue(transaction_t *t, uint64 addr) -> (exception_type_t) {
+                local uint16 devid = addr[63:48];
+                for (local int i = 0; i < VLEN(functions.val); ++i) {
+                    if (functions.val[i].devid == devid)
+                        return translate_message(t, functions.val[i].obj);
+                }
+                // Should never happen, because this subdevice should only be
+                // mapped where there is a claimed function
+                log error: "failed to find legacy device with id %x:%x.%d",
+                    devid[15:8], devid[7:3], devid[2:0];
+                return Sim_PE_IO_Not_Taken;
+            }
+        }
+
+        method translate_message(transaction_t *t,
+                                 conf_object_t *lobj) -> (exception_type_t) {
+            // Legacy PCIe library uses pci_express.send_message to send PCIe
+            // messages, but it is very limited. For example, it does not
+            // support the different routing modes or address field. This
+            // function translates what's possible from a transaction_t based
+            // PCIe message and calls pci_express.send_message in 'ldev' with
+            // the result.
+            local pcie_message_type_t mtype =
+                ATOM_get_transaction_pcie_msg_type(t);
+            local const pci_express_interface_t *pei =
+                SIM_c_get_interface(lobj, "pci_express");
+            if (!pei) {
+                log warning: "Can't deliver PCIe message of type %d to legacy"
+                    + " device '%s', missing interface 'pci_express'",
+                    mtype, SIM_object_name(lobj);
+                return Sim_PE_IO_Not_Taken;
+            }
+            send_message(lobj, t, pei, mtype);
+            return Sim_PE_No_Exception;
+        }
+        method send_message(conf_object_t *lobj,
+                            transaction_t *t,
+                            const pci_express_interface_t *pei,
+                            pcie_message_type_t mtype) default {
+            local uint64 len = SIM_transaction_size(t);
+            local uint8 data[len];
+            local buffer_t buf = { .len=len, .data=data };
+            SIM_get_transaction_bytes(t, buf);
+
+            local byte_string_t payload = { .len=len, .str=data };
+            pei->send_message(lobj,
+                              SIM_transaction_initiator(t),
+                              mtype,
+                              payload);
+        }
+    }
+}
+
+port upstream is (init, destroy) {
+    /* legacy gap-filler to support ATS/PRS messaging */
+    session map_target_t *map_target;
+    method init() {
+        map_target = SIM_new_map_target(this.obj, NULL, NULL);
+    }
+    method destroy() {
+        if (map_target != NULL)
+            SIM_free_map_target(map_target);
+    }
+    implement transaction {
+        method issue(transaction_t *t, uint64 addr) -> (exception_type_t) {
+            if (transparent.target.map_target) {
+                return transparent.target.issue(t, addr);
+            } else if (upstream_target.map_target) {
+                return upstream_target.issue(t, addr);
+            } else {
+                return Sim_PE_IO_Not_Taken;
+            }
+        }
+    }
+}
+
+method addr_space_to_pcie_type(addr_space_t space) -> (pcie_type_t) {
+    switch (space) {
+    case Sim_Addr_Space_Conf: return PCIE_Type_Cfg;
+    case Sim_Addr_Space_IO: return PCIE_Type_IO;
+    case Sim_Addr_Space_Memory: return PCIE_Type_Mem;
+    default: return PCIE_Type_Other;
+    }
+}
+
+method lvfind(legacy_device_list_t lst,
+              conf_object_t *obj) -> (legacy_device_t *) {
+    for (local int i = 0; i < VLEN(lst); ++i) {
+        if (lst[i].obj == obj)
+            return &lst[i];
+    }
+    return NULL;
+}
+
+attribute bridge is read_only_attr {
+    param documentation =
+        "Pseudo-attribute to make this look like a legacy pcie-bus";
+    param type = "o|[os]|n";
+    method get() -> (attr_value_t) {
+        return dev.upstream_target.get_attribute();
+    }
+}
+
+attribute bus_number is (uint64_attr, pseudo_attr) "Secondary bus number" {
+    /* There's lots of legacy code that use the 'bus_number' attribute on the
+       pcie-bus to get/set the secondary bus number. This is not how it was
+       meant to be done, even in old pcie, you're supposed to use the pci_bus
+       interface. Even so, we expose it as a pseudo-attribute here to help the
+       transition to new PCIe. */
+    method get() -> (attr_value_t) {
+        return dev.sec_bus_num.get_attribute();
+    }
+    method set(attr_value_t val) throws {
+        dev.downstream.pcie_port_control.set_secondary_bus_number(
+            SIM_attr_integer(val));
+    }
+}

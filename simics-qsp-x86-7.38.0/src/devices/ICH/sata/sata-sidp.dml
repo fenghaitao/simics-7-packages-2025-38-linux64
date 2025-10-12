@@ -1,0 +1,89 @@
+/*
+  sata-sidp.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+bank sidp {
+    parameter desc = "serial ATA index/data pair registers";
+
+    parameter function = 1;
+    parameter byte_order = "little-endian";
+    parameter register_size = 4;
+
+    parameter valid_port_index_values default undefined;
+
+    register sindex @ 0x0 "Serial ATA Index" {
+        field pidx [15:8] "Port Index" {
+            method write(value) {
+                select idx in ($valid_port_index_values)
+                    where (value == idx)
+                    {
+                        $this = value;
+                    } else {
+                        log "spec_violation", 2:
+                            "%s: invalid written value (%d)",
+                            $qname, value;
+                    }
+            }
+        }
+        field ridx [ 7:0] "Register Index" {
+            method write(value) {
+                if (value < 3)
+                    $this = value;
+                else
+                    log "spec_violation", 2:
+                        "%s: invalid written value (%d)",
+                        $qname, value;
+            }
+        }
+    }
+    register sdata  @ 0x4 "Serial ATA DATA" {
+        method read_access(memop, msb1, lsb) -> (value) {
+            if (defined msb1) {
+                log "error":
+                    "partial read from %s%s",
+                    $qname, defined $desc ? " (" + $desc + ")" : "";
+                throw;
+            } else {
+                // forward access to target bank
+                inline $read_sata_register(memop,
+                    $sindex.pidx, $sindex.ridx) -> (value);
+            }
+        }
+        method write_access(memop, msb1, lsb, value) {
+            if (defined msb1) {
+                log "error":
+                    "partial write to %s%s",
+                    $qname, defined $desc ? " (" + $desc + ")" : "";
+                throw;
+            } else {
+                // forward access to target bank
+                inline $write_sata_register(memop, value,
+                    $sindex.pidx, $sindex.ridx);
+            }
+        }
+        method read_sata_register(memop, pidx, ridx) -> (value) default {
+            error;
+        }
+        method write_sata_register(memop, value, pidx, ridx) default {
+            error;
+        }
+    }
+
+    // Software-write operations to the reserved locations will
+    // have no effect while software-read operations to the reserved
+    // locations will return 0.
+    register Reserved[2] @ (0x8 + $i * 4) is (ignore);
+}

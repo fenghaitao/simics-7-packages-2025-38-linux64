@@ -1,0 +1,80 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+// NOTE: v21 template aliases, put here to avoid cluttering the main file
+
+// TODO(ah): deprecate this template
+template defining_pcie_capability_v21 {
+    is defining_pcie_capability_root_ports_v21;
+}
+
+template defining_pcie_capability_links_2_v21 {
+    is defining_pcie_capability_links_2_v2;
+}
+template defining_pcie_capability_links_v21 {
+    is defining_pcie_capability_devices_v21;
+    is defining_pcie_capability_links_v2;
+}
+template defining_pcie_capability_slots_2_v21 {
+    is defining_pcie_capability_slots_2_v2;
+}
+template defining_pcie_capability_slots_v21 {
+    is defining_pcie_capability_links_v21;
+    is defining_pcie_capability_slots_v2;
+}
+template defining_pcie_capability_root_ports_v21 {
+    is defining_pcie_capability_slots_v21;
+    is defining_pcie_capability_root_ports_v2;
+}
+
+template defining_pcie_vc_capability_v21 {
+    is defining_pcie_vc_capability_v2;
+}
+
+template defining_pcie_dsn_capability_v21 {
+    is defining_pcie_dsn_capability_v2;
+}
+
+template defining_pcie_rcld_capability_v21 {
+    is defining_pcie_rcld_capability_v2;
+}
+
+template defining_pcie_rcilc_capability_v21 {
+    is defining_pcie_rcilc_capability_v2;
+}
+
+template defining_pcie_dpb_capability_v21 {
+    is defining_pcie_dpb_capability_v2;
+}
+
+template defining_pcie_acs_capability_v21 {
+    is defining_pcie_acs_capability_v2;
+}
+
+template defining_pcie_rcecea_capability_v21 {
+    is defining_pcie_rcecea_capability_v2;
+} 
+
+template defining_pcie_mfvc_capability_v21 {
+    is defining_pcie_mfvc_capability_v2;
+}
+
+template defining_pcie_vsec_capability_v21 {
+    is defining_pcie_vsec_capability_v2;
+}
+
+template defining_pcie_rcrb_capability_v21 {
+    is defining_pcie_rcrb_capability_v2;
+}

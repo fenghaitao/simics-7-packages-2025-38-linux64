@@ -1,0 +1,283 @@
+/*
+  i82583V-mac.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "simics/devs/mii.dml";
+import "simics/devs/ieee_802_3.dml";
+
+import "ethernet-utils.dml";
+
+import "e1000-mac.dml";
+import "e1000-mac-intr.dml";
+import "e1000-mac-management.dml";
+import "i82583V-mac-rx.dml";
+import "i82583V-mac-tx.dml";
+import "i82583V-mac-intr.dml";
+import "i82583V-mac-pcie.dml";
+
+/* --------------------------------------------------------------
+   IO-MEMORY MAPPED REGISTERS
+   -------------------------------------------------------------- */
+bank csr {
+    parameter documentation = "i82583V Ethernet Controller Registers";
+
+    data uint32 nvmaddr;
+    data uint32 nvmcnt;
+
+    /* --------------------------------------------------------------
+       GENERAL REGISTERS
+       -------------------------------------------------------------- */
+    register fcal        @ 0x00028 "Flow Control Address Low";
+    register fcah        @ 0x0002c "Flow Control Address High";
+    register fct         @ 0x00030 "Flow Control Type";
+    register lpic        @ 0x000fc "Low Power IDLE control";
+    register fcttv       @ 0x00170 "Flow Control Transmit Timer Value";
+    register fcrtv       @ 0x05F40 "Flow Control Refresh Threshold Value";
+    register ledctl      @ 0x00e00 "LED Control";
+    register extcnf_ctrl @ 0x00f00 "Extended Configuration Control";
+    register extcnf_size @ 0x00f08 "Extended Configuration Size";
+    register pba         @ 0x01000 "Packet Buffer Allocation";
+    register eectl       @ 0x01010 "EEPROM Control Register";
+    register eedata      @ 0x01014 "EEPROM Read/Write Data";
+    register flctl       @ 0x01018 "Flash Control Register";
+    register fldata      @ 0x0101C "Flash Read Data";
+    register flcnt       @ 0x01020 "Flash Read Counter";
+    register flasht      @ 0x01028 "Flash Timer Register";
+    register eewr        @ 0x0102C "EEPROM Write Register";
+    register flswctl     @ 0x01030 "SW Flash Burst Control Register";
+    register flswdata    @ 0x01034 "SW Flash Burst Data Register";
+    register flswcnt     @ 0x01038 "SW Flash Burst Access Register";
+    register flop        @ 0x0103C "Flash Opcode Register";
+    register flol        @ 0x01050 "Feep Auto Load";
+
+    register ctrl {
+        field fd[0] is (read_write) "Full-Duplex" {
+            parameter hard_reset_value = 1;
+        }
+        field md[2] is (read_write) "Master Disable";
+        field asde[5] is (read_write) "Auto-Speed Detection Enable" {
+            method write(value) {
+                if (value == 1)
+                    log "spec_violation", 1: "this bit must be set to 0b";
+            }
+        }
+        field slu[6] is (read_write) "Set Link Up";
+        field speed[9:8] is (read_write) "Speed Selection" {
+            parameter hard_reset_value = 0b10;
+        }
+        field frcspd[11] is (read_write) "Force Speed";
+        field frcdplx[12] is (read_write) "Force Duplex";
+        field advd3wuc[20] is (read_write) "D3Cold Wakeup Capability";
+        field swrst[26] is (read_write) "Host Software Reset";
+        field rfce[27] is (unimplemented) "Receive Flow Control Enable";
+        field tfce[28] is (unimplemented) "Transmit Flow Control Enable";
+        field vme[30] is (read_write) "VLAN Mode Enable";
+        field phy_rst[31] is (unimplemented) "PHY Reset";
+
+        method after_write(memop) {
+            if ($swrst == 1) {
+                call $dev.soft_reset();
+
+                /* copy the MAC address to the RAL/RAH registers */
+                memcpy(&$csr.ra[0].low, &$mac_address, 4);
+                $csr.ra[0].high.rah = ($mac_address >> 32) & 0xFFFF;
+                $csr.ra[0].high.asel = $RAH_ASEL_DESTINATION_ADDRESS;
+                $csr.ra[0].high.av = 1;
+            }
+
+            if ($frcspd == 1)
+                $status.speed = $speed;
+            if ($frcdplx == 1)
+                $status.fd = $fd;
+        }
+    }
+
+    register status {
+        field fd[0] is (read_only) "Full Duplex" {
+            parameter hard_reset_value = 1;
+        }
+        field lu[1] is (read_only) "Link Up" {
+            parameter hard_reset_value = 1;
+        }
+        field txoff[4] is (read_only) "Transmit Paused";
+        field speed[7:6] is (read_only) "Link Speed Setting";
+        field asdv[9:8] is (read_only) "Auto Speed Detection Value";
+        field phyra[10] is (read_only) "PHY Reset Asserted";
+        field mes[19] is (read_only) "Master Enable Status";
+    }
+
+    register ctrl_ext {
+        field asdchk[12] is (unimplemented) "ASD Check";
+        field ee_rst[13] is (read_zero) "EEPROM Reset";
+        field spd_byps[15] is (unimplemented) "Speed Select Bypass";
+        field ro_dis[17] is (unimplemented) "Relaxed Ordering Disable";
+        field dma_dge[19] is (unimplemented) "Dynamic Clock Gating Enable";
+        field phy_pde[20] is (unimplemented) "PHY Power Down Enable";
+        field tx_ls_flow[22] is (unimplemented) "TX Large Send Flow";
+        field tx_ls[23] is (unimplemented) "TX Large Send";
+        field eiame[24] "Extended Interrupt Auto Mask Enable" {
+            method write(val) {
+		$this = val;
+                log "info", 2:
+                    "%s %s bit %s",
+			$qname, $desc,
+			(val == 1) ? "enabled" : "disabled";
+	    }
+	}
+        field iame[27] "Interrupt Acknowledge Auto Mask Enable" {
+            method write(val) {
+		$this = val;
+                log "info", 2:
+                    "%s %s bit %s",
+			$qname, $desc,
+			(val == 1) ? "enabled" : "disabled";
+	    }
+	}
+        field drv_load[28] is (unimplemented) "Driver Loaded";
+        field itcen[29] is (unimplemented) "Interrupt Timers Clean Enable";
+        field pba_sup[31] is (unimplemented) "PBA Support";
+    }
+
+    register fla is (unimplemented);
+
+    register mdic {
+        field data[15:0] is (read_write) "MDIO Data";
+        field rega[20:16] is (read_write) "PHY Register Address";
+        field phya[25:21] is (read_write) "PHY Address";
+        field op[27:26] is (read_write) "Opcode";
+        field r[28] is (read_write) "Ready" {
+	    parameter hard_reset_value = 1;
+	}
+        field ie[29] is (read_write) "Interrupt Enable";
+        field e[30] is (read_write) "Error";
+
+        method after_write(memop) {
+            if ($r == 1) {
+                log "info", 2:
+                    "MDIC ready bit must be 0 to read/write PHY registers";
+                return;
+            }
+
+            if ($op == 0b01) {
+                $mii.mii_management.write_register($phya, $rega, $data);
+            } else if ($op == 0b10) {
+                $data = $mii.mii_management.read_register($phya, $rega);
+            } else {
+                log "spec_violation", 1:
+                    "write register %s with reserved opcode %d", $name, $op;
+                $e = 1;
+            }
+
+            $r = 1;
+            if ($ie == 1)
+                call $raise_interrupt(INTR_MDAC);
+        }
+    }
+
+    register fcal is (unimplemented);
+    register fcah is (unimplemented);
+    register fct is (unimplemented);
+    register fcttv is (unimplemented);
+    register fcrtv is (unimplemented);
+    register ledctl is (unimplemented);
+    register extcnf_ctrl is (unimplemented);
+    register extcnf_size is (unimplemented);
+    register lpic is (reserved);
+
+    register pba {
+        field rxa[15:0] is (unimplemented) "Receive Packet Buffer Allocation" {
+            parameter hard_reset_value = 0x0014;
+        }
+        field txa[31:16] is (unimplemented) "Transmit Packet Buffer Allocation" {
+            parameter hard_reset_value = 0x0014;
+        }
+    }
+
+    register eectl is (unimplemented);
+    register eedata is (unimplemented);
+    register flctl is (unimplemented);
+    register fldata is (unimplemented);
+    register flcnt is (unimplemented);
+    register flasht is (unimplemented);
+    register eewr is (read_write) {
+        field start[0];
+        field done[1] {
+            method read() -> (val) {
+                val = 1;
+            }
+        }
+        field address[15:2];
+        field data[31:16] {
+            method write(val) {
+                if ($address < $EEPROM_SIZE) {
+                    $eeprom[$address] = val;
+                } else {
+                    log "info", 2: "address %d out of nvm range", $address;
+                }
+            }
+        }
+    }
+        
+    register flswctl {
+        field addr[23:0] is (read_write) "Address";
+        field cmd[25:24] is (read_write) {
+            method write(val) {
+                if (val != 0x01)
+                    log "spec_violation", 1: "reserved command";
+                $this = val;
+            }
+        }
+        field cmdv[26] is (read_write) "Command Valid" {
+            method write(val) {
+                if ((val == 1) && ($cmd == 1)) {
+                    $nvmaddr = $addr;
+                    $eeprom[$nvmaddr++] = $flswdata.nvdata;
+                    $nvmcnt = $flswcnt.nvcnt - 1;
+                }
+            }
+        }
+        field fludone[29] is (read_write) "Flash Update Done";
+        field done[30] is (read_only) {
+            method read() -> (val) {
+                val = 1;
+            }
+        }
+        field wrdone[31] is (read_only) "Global Done" {
+            method read() -> (val) {
+                if ($nvmcnt == 0)
+                    val = 1;
+                else
+                    val = 0;
+            }
+        }
+    }
+    register flswdata is (read_write) {
+        field nvdata[31:0] {
+            method write(val) {
+                if (($flswctl.cmd == 1) && ($flswctl.cmdv == 1)) {
+                    $eeprom[$nvmaddr++] = val;
+                    $nvmcnt--;
+                }
+            }
+        }
+    }
+    register flswcnt is (read_write) {
+        field abort[31];
+        field nvcnt[24:0];
+    }
+    register flop is (unimplemented);
+    register flol is (unimplemented);
+}

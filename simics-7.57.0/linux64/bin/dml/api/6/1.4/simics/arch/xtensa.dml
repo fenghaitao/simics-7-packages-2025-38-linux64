@@ -1,0 +1,48 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/arch/xtensa.h>
+%}
+
+import "simics/base/memory-transaction.dml";
+import "simics/pywrap.dml";
+
+extern typedef int xtensa_wwdt_faultinfo_t;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Derr_Inj_Dis;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Tfv_Err;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Err_Inj;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Oor_Exp;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Oor_Kick;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Ill_Kick;
+extern xtensa_wwdt_faultinfo_t Wwdt_Info_Cnt_Exp;
+extern xtensa_wwdt_faultinfo_t Wwdt_Fault_Asserted;
+extern typedef struct { generic_transaction_t s; } xtensa_memory_transaction_t;
+extern typedef struct { void (*data)(conf_object_t *obj, uint32 out_width, uint32 const *out_data, uint32 in_width, uint32 *in_data); } xtensa_tie_lookup_interface_t;
+extern typedef struct { void (*data)(conf_object_t *obj, uint32 bit_width, uint32 const *out_data); } xtensa_tie_export_state_interface_t;
+extern typedef struct { bool (*full)(conf_object_t *obj); void (*data)(conf_object_t *obj, uint32 bit_width, bool reserve_only, uint32 const *out_data); } xtensa_tie_output_queue_interface_t;
+extern typedef struct { bool (*empty)(conf_object_t *obj); void (*data)(conf_object_t *obj, uint32 bit_width, bool is_peek, uint32 *in_data); } xtensa_tie_input_queue_interface_t;
+extern typedef struct { void (*data)(conf_object_t *obj, uint32 bit_width, uint32 *in_data); } xtensa_tie_import_wire_interface_t;
+extern typedef struct { bool (*has_wwdt)(conf_object_t *obj); uint32 (*reset_val)(conf_object_t *obj); uint32 (*hb_reset_val)(conf_object_t *obj); uint32 (*ikey)(conf_object_t *obj); uint32 (*bkey)(conf_object_t *obj); uint32 (*rkey)(conf_object_t *obj); uint32 (*kkey)(conf_object_t *obj); uint32 (*ekey)(conf_object_t *obj); uint32 (*c1key)(conf_object_t *obj); uint32 (*c2key)(conf_object_t *obj); uint32 (*t1key)(conf_object_t *obj); uint32 (*t2key)(conf_object_t *obj); } xtensa_wwdt_config_interface_t;
+extern typedef struct { uint8 (*status)(conf_object_t *obj); } xtensa_wwdt_faultinfo_interface_t;
+extern typedef struct { attr_value_t (*iram_mappings)(conf_object_t *obj); attr_value_t (*irom_mappings)(conf_object_t *obj); attr_value_t (*dram_mappings)(conf_object_t *obj); attr_value_t (*drom_mappings)(conf_object_t *obj); } xtensa_internal_memories_interface_t;
+extern typedef struct { bool background; uint16 region; uint32 start; uint32 end; bool sr; bool sw; bool sx; bool ur; bool uw; bool ux; } xtensa_mpu_lookup_t;
+extern typedef struct { xtensa_mpu_lookup_t (*mpu_region)(conf_object_t *obj, uint32 address); } xtensa_mpu_lookup_interface_t;
+extern typedef struct { bool (*set_reset_prid)(conf_object_t *obj, uint16 prid_value); bool (*set_alternative_reset_vector)(conf_object_t *obj, uint32 vector_address); } xtensa_reset_configure_interface_t;
+extern typedef struct { void (*register_lookup)(conf_object_t *obj, lang_void *user_object, lang_void *lookup_func); } xtensa_lookup_interface_t;
+extern typedef struct { void (*register_export_state)(conf_object_t *obj, lang_void *user_object, lang_void *export_state_func); } xtensa_export_state_interface_t;
+extern typedef struct { void (*register_output_queue)(conf_object_t *obj, lang_void *user_object, lang_void *full_callback, lang_void *data_callback); } xtensa_output_queue_interface_t;
+extern typedef struct { void (*register_input_queue)(conf_object_t *obj, lang_void *user_object, lang_void *empty_callback, lang_void *data_callback); } xtensa_input_queue_interface_t;
+extern typedef struct { void (*register_import_wire)(conf_object_t *obj, lang_void *user_object, lang_void *import_wire_func); } xtensa_import_wire_interface_t;

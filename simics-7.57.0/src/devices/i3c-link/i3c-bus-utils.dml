@@ -1,0 +1,155 @@
+/*
+  © 2017 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#define FOR_I3C_STATUS(op)                          \
+        op(Idle, "Idle"),                           \
+        op(Wait_Start, "Wait Start"),               \
+        op(Wait_IBI_Ack, "Wait IBI acknowledge"),   \
+        op(I3C_DAA_Addr, "I3C DAA Addr"),           \
+        op(I3C_Command, "I3C Command"),             \
+        op(I3C_Write, "I3C Write"),                 \
+        op(I3C_Read, "I3C Read"),                   \
+        op(I2C_Read, "I2C Read"),                   \
+        op(I2C_Write, "I2C Write"),                 \
+        op(Wait_Start_Ack, "Wait Start Ack"),       \
+        op(Wait_I2C_Response, "Wait_I2C Response"), \
+        op(Wait_I2C_Ack, "Wait I2C Ack"),           \
+        op(Wait_I3C_Response, "Wait I3C Response"), \
+        op(Wait_DAA_Data, "Wait DAA Data"),         \
+        op(Wait_DAA_Ack, "Wait DAA Ack"),           \
+        op(Wait_IBI_Start, "Wait IBI Start"),       \
+        op(Wait_IBI_Address, "Wait IBI Address"),   \
+        op(Wait_IBI_Data, "Wait IBI Data")
+
+#define I3C_STATUS_GET_NUM(name, desc) St_ ## name
+#define I3C_STATUS_GET_DESC(name, desc) desc
+enum {
+        FOR_I3C_STATUS(I3C_STATUS_GET_NUM),
+        St_Invalid
+};
+
+static const char* status_names[St_Invalid] = {
+        FOR_I3C_STATUS(I3C_STATUS_GET_DESC)
+};
+
+#undef I3C_STATUS_GET_NUM
+#undef I3C_STATUS_GET_DESC
+
+static const char* ccc_names[256] = {
+        [0x00] = "broadcast Enable Events",
+        [0x01] = "broadcast Disable Events",
+        [0x02] = "broadcast Enter Active State 0",
+        [0x03] = "broadcast Enter Active State 1",
+        [0x04] = "broadcast Enter Active State 2",
+        [0x05] = "broadcast Enter Active State 3",
+        [0x06] = "broadcast Reset DAA",
+        [0x07] = "broadcast Enter DAA",
+        [0x08] = "broadcast Define List of Slaves",
+        [0x09] = "broadcast Set Max Write Length",
+        [0x0a] = "broadcast Set Max Read Length",
+        [0x0b] = "broadcast Enter Test Mode",
+        [0x20] = "broadcast Enter HDR Mode 0",
+        [0x21] = "broadcast Enter HDR Mode 1",
+        [0x22] = "broadcast Enter HDR Mode 2",
+        [0x23] = "broadcast Enter HDR Mode 3",
+        [0x24] = "broadcast Enter HDR Mode 4",
+        [0x25] = "broadcast Enter HDR Mode 5",
+        [0x26] = "broadcast Enter HDR Mode 6",
+        [0x27] = "broadcast Enter HDR Mode 7",
+        [0x28] = "broadcast Set Exchange Timing",
+        [0x80] = "direct Enable Events",
+        [0x81] = "direct Disable Events",
+        [0x82] = "direct Enter Active State 0",
+        [0x83] = "direct Enter Active State 1",
+        [0x84] = "direct Enter Active State 2",
+        [0x85] = "direct Enter Active State 3",
+        [0x86] = "direct Reset DAA",
+        [0x87] = "direct Set Dynamic Address from Static Address",
+        [0x88] = "direct Set New Dynamic Address",
+        [0x89] = "direct Set Max Write Length",
+        [0x8a] = "direct Set Max Read Length",
+        [0x8b] = "direct Get Max Write Length",
+        [0x8c] = "direct Get Max Read Length",
+        [0x8d] = "direct Get Provisional ID",
+        [0x8e] = "direct Get BCR Register",
+        [0x8f] = "direct Get DCR Register",
+        [0x90] = "direct Get Device Status",
+        [0x91] = "direct Get Accept Mastership",
+        [0x93] = "direct Set Bridge Targets",
+        [0x94] = "direct Get Max Data Speed",
+        [0x96] = "direct Get HDR Capability",
+        [0x98] = "direct Set Exchange Timing",
+        [0x99] = "direct Get Exchange Timing",
+        [0xff] = "invalid (0xff)",
+};
+
+static const char*
+i3c_ack_name(i3c_ack_t ack)
+{
+        return ack == I3C_ack ? "ACK": "NACK";
+}
+
+static bool
+i3c_bus_allow_repeated_start(int status) 
+{
+        return (   status == St_Wait_Start
+                || status == St_I2C_Read    || status == St_I2C_Write
+                || status == St_I3C_Command || status == St_I3C_Read
+                || status == St_I3C_Write   || status == St_I3C_DAA_Addr);
+}
+
+static const char*
+i3c_bus_status_name(int status)
+{
+        return (status < St_Invalid ? status_names[status] : "invalid");
+}
+
+static const char*
+i3c_ccc_command_name(uint8 cmd)
+{
+        if (ccc_names[cmd])
+            return ccc_names[cmd];
+        else if (cmd < 0x80)
+            return "unknown broadcast command";
+        else
+            return "unknown direct command";
+}
+%}
+
+extern int St_Idle;
+extern int St_Wait_Start;
+extern int St_Wait_IBI_Ack;
+extern int St_Wait_DAA_Data;
+extern int St_I3C_DAA_Addr;
+extern int St_Wait_Start_Ack;
+extern int St_I2C_Read;
+extern int St_I2C_Write;
+extern int St_Wait_I2C_Response;
+extern int St_Wait_I2C_Ack;
+extern int St_I3C_Command;
+extern int St_I3C_Write;
+extern int St_I3C_Read;
+extern int St_Wait_I3C_Response;
+extern int St_Wait_DAA_Ack;
+extern int St_Wait_IBI_Data;
+extern int St_Wait_IBI_Address;
+extern int St_Wait_IBI_Start;
+extern int St_Invalid;
+
+extern const char* i3c_ack_name(i3c_ack_t ack);
+extern bool i3c_bus_allow_repeated_start(int status);
+extern const char *i3c_bus_status_name(uint8 status);
+extern const char *i3c_ccc_command_name(uint8 cmd);

@@ -1,0 +1,86 @@
+disable-multithreading
+
+set-min-latency count = 3 unit = "s"
+
+set-time-quantum count = 1 unit = "cycles"
+
+#load-module generic-message-sample-comp
+
+$pwd = (pwd)
+cd (`os.environ['SANDBOX']`)
+
+create-gml-dev-comp dev1 address = 1 dest_address = 2
+create-gml-dev-comp dev2 address = 2 dest_address = 1
+create-gml-dev-comp dev3 address = 3 dest_address = 1
+create-gml-dev-comp dev4 address = 2 dest_address = 5
+create-gml-dev-comp dev5 address = 6 dest_address = 6
+
+load-module gml-link
+create-gml-link l0
+
+connect l0.device0 dev1.connector_link
+connect l0.device1 dev2.connector_link
+connect l0.device2 dev3.connector_link
+connect l0.device3 dev4.connector_link
+connect l0.device4 dev5.connector_link
+
+instantiate-components
+
+#
+# 1 (dev1) -> 2 (dev2 and dev4), disconnected at cycle 20
+# every 2:nd cycle, arrive after 3(link) + 1(extra) cycles
+# result: 6, 8, 10, ..., 22 (18 last send)
+#
+dev1.dev->length = [1, 1]
+dev1.dev->delay = [2, 2]
+dev1.dev->frame_delay = [0, 0]
+dev1.dev->save_logs = 1
+
+#
+# 2 (dev2) -> 1 (dev1)
+# every 8:th cycle, arrive after 3(link) + 1(extra) + 1(frame_delay) cycles
+# result: 5, 13 (21 should have arrived if not dev1 disconnected at 20)
+#
+dev2.dev->length = [4, 4]
+dev2.dev->delay = [8, 8]
+# 16 ns delay will result in 1 cycle
+dev2.dev->frame_delay = [16, 16]
+dev2.dev->save_logs = 1
+
+#
+# 3 (dev3) -> 1 (dev1)
+# every cycle, arrive after 3(link) + 1(extra) + 4(frame_delay) cycles
+# result: 8, 9, 10, ..., 19, 20 (21 should have arrived if not dev1 disconnected at 20)
+#
+dev3.dev->length = [6, 6]
+dev3.dev->delay = [1, 1]
+dev3.dev->frame_delay = [4000000000, 4000000000]
+dev3.dev->save_logs = 1
+
+#
+# 4 (dev4) -> 5 (not connected)
+#
+dev4.dev->length = [2, 2]
+dev4.dev->delay = [2, 2]
+dev4.dev->frame_delay = [0, 0]
+dev4.dev->save_logs = 1
+
+#
+# 6 (dev5) -> 6 (send to itself)
+#
+dev5.dev->length = [7, 7]
+dev5.dev->delay = [2, 2]
+dev5.dev->frame_delay = [0, 0]
+dev5.dev->save_logs = 1
+
+log-setup -time-stamp
+log-level 4
+bp.cycle.break 20
+c
+
+disconnect l0.device0 dev1.connector_link
+
+bp.cycle.break 10
+c
+
+cd $pwd

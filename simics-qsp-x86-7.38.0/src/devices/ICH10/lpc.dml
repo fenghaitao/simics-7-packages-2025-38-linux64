@@ -1,0 +1,80 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device ich10_lpc;
+
+parameter desc = "model of Intel® ICH10 LPC bridge";
+parameter documentation =
+    "LPC bridge contains interrupt controllers, timers, RTC, "
+    + " Serial ports and Firmware hub for Intel® ICH10.";
+
+parameter lpc_has_hpet_bdf = true;
+
+import "ich-lpc.dml";
+
+attribute ich10_corporate {
+    parameter documentation =
+        "ICH10 Corporate family chipset, true for ICH10D or ICH10DO";
+    parameter configuration = "optional";
+    parameter allocate_type = "bool";
+}
+
+//ICH9 doesn't support LPC memory cycles
+connect lpc_memory {
+    parameter documentation = "Memory space of LPC bus";
+    parameter configuration = "optional";
+    interface memory_space;
+}
+
+bank pci_config {
+    register device_id { parameter hard_reset_value = 0x3a16; }
+    register revision_id { parameter hard_reset_value = 0x00; }
+
+
+    register lgmr  size 4 @ 0x98 "LPC Generic Memory Range" {                  
+        field ma[31:16] is (read_write) "Memory Address";
+        field en[0]     is (read_write) "LPC Memory Range Decode Enable";       
+        method write_access_main(memop, msb1, lsb, uint32 value) {              
+            if (!$ich10_corporate) {
+                static int level = 4; 
+                log "spec_violation", level:
+                    "write to %s (value written %#x, contents %#x), %s %s",     
+                    $qname, value, ($ma << 16) | $en,                           
+                    "LPC memory cycles decoding",
+                    "is only supported by ICH10 Corporate family chipset.";     
+                level = 1;                                                      
+                return;                                                         
+            }
+            inline default(memop, msb1, lsb, value);
+        }
+        method before_write(memop, msb1, lsb, value) {                          
+            if ($ich10_corporate && $en && $lpc_memory.obj)
+                call $remove_lpc_mapping($lpc_memory.obj,
+                                         $base_memory_function,
+                                         Sim_Addr_Space_Memory);
+        }
+        method after_write(memop) { 
+            if ($ich10_corporate && $ma != 0 && $en != 0 && $lpc_memory.obj)
+                call $add_lpc_mapping(
+                    $lpc_memory.obj, $pci_config.lgmr.ma << 16, 0,
+                    0x10000, $base_memory_function, Sim_Addr_Space_Memory);
+        }
+    } 
+}
+
+method init() {
+    //default false for ICH10 Consumer family
+    $ich10_corporate = false;
+}

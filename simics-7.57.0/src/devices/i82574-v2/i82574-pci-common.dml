@@ -1,0 +1,163 @@
+/*
+* i82574.dml
+
+  © 2012 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+template defining_i82574_msi_extended_capability {
+    parameter ext_offset default undefined;
+    parameter ext_next_ptr default undefined;
+
+    register ext_capability_id size 1 @ ($ext_offset + 0x00) "Capability ID";
+    register ext_next_ptr_r    size 1 @ ($ext_offset + 0x01) "Next PTR";
+    register ext_msg_control   size 2 @ ($ext_offset + 0x02) "Message Control";
+    register ext_tbl_offset    size 4 @ ($ext_offset + 0x04) "Table Offset";
+    register ext_pba_offset    size 4 @ ($ext_offset + 0x08) "PBA Offset";
+
+    register ext_capability_id is (constant) {
+        parameter value = 0x11;
+    }
+    register ext_next_ptr_r is (constant) {
+        parameter value = $ext_next_ptr;
+    }
+    register ext_msg_control {
+        field ts         [10:0] is (read_only) "Table Size" {
+            parameter hard_reset_value = 0x01;
+        }
+        field fm        [14:14] is (read_write) "Function Mask";
+        field en        [15:15] is (read_write) "MSI-X Enable" {
+            method write(value) {
+                log "unimplemented", 1, Register_Write: "%s only supports MSI", $qname;
+            }
+        }
+    }
+    register ext_tbl_offset {
+        field tbl_offset [31:3] is (read_only);
+        field tbl_bir     [2:0] is (read_only) {
+            parameter hard_reset_value = 0b11;
+        }
+    }
+    register ext_pba_offset {
+        field pba_offset [31:3] is (read_only) {
+            parameter hard_reset_value = 0b010000000000;
+        }
+        field pba_bir     [2:0] is (read_only) {
+            parameter hard_reset_value = 0b11;
+        }
+    }
+}
+
+template defining_i82574_pci_express_capability {
+    parameter exp_offset default undefined;
+    parameter exp_next_ptr default undefined;
+    parameter exp_version = 1;
+
+    register exp_capability_id size 1 @ ($exp_offset + 0x00) "Capability ID";
+    register exp_next_ptr_r    size 1 @ ($exp_offset + 0x01) "Next PTR";
+    register exp_capabilities  size 2 @ ($exp_offset + 0x02)  "MSI Capabilities";
+    register exp_dev_cap    size 4 @ ($exp_offset + 0x04) "Device Capabilities";
+    register exp_dev_control   size 2 @ ($exp_offset + 0x08)  "Device Control";
+    register exp_dev_status    size 2 @ ($exp_offset + 0x0A) "Device Status";
+    register exp_link_cap     size 4 @ ($exp_offset + 0x0C) "Link Capabilities";
+    register exp_link_control  size 2 @ ($exp_offset + 0x10) "Link Control";
+    register exp_link_status   size 2 @ ($exp_offset + 0x12) "Link Status";
+
+    register exp_capability_id is (constant) {
+        parameter value = 0x10;
+    }
+    register exp_next_ptr_r is (constant) {
+        parameter value = $exp_next_ptr;
+    }
+    register exp_capabilities {
+        field version  [3:0]  is (read_only) "Capability Version" {
+            parameter hard_reset_value = $exp_version;
+        }
+        field type     [7:4]  is (read_only) "Device/Port Type";
+        field slot     [8:8]  is (read_only) "Slot Implemented";
+        field imn     [13:9]  is (read_only) "Interrupt Message Number";
+    }
+    register exp_dev_cap {
+        field max_payload  [2:0]  is (read_only) "Max Payload Supported"
+        { parameter hard_reset_value = 0b001; }
+        field phantom      [4:3]  is (read_only) "Phantom Functions Supported";
+        field ext_tag      [5:5]  is (read_only) "Extended Tag Field Supported";
+        field el0_al       [8:6]  is (read_only) "Endpoint L0 Acceptable Latency"
+        { parameter hard_reset_value = 0b011; }
+        field el1_al      [11:9]  is (read_only) "Endpoint L1 Acceptable Latency"
+        { parameter hard_reset_value = 0b110; }
+        field abp         [12:12] is (read_only) "Attention Button Present";
+        field aip         [13:13] is (read_only) "Attention Indicator Present";
+        field pip         [14:14] is (read_only) "Power Indicator Present";
+        field rber        [15:15] is (read_only) "Role Based Error Reporting"
+        { parameter hard_reset_value = 0b1; }
+        field csplv       [25:18] is (read_only) "Captured Slot Power Limit Value";
+        field cspls       [27:26] is (read_only) "Captured Slot Power Limit Scale";
+    }
+    register exp_dev_control {
+        field cere  [0:0]  is (read_write) "Correctable Error Reporting Enable";
+        field nere  [1:1]  is (read_write) "Non-Fatal Error Reporting Enable";
+        field fere  [2:2]  is (read_write) "Fatal Error Reporting Enable";
+        field urre  [3:3]  is (read_write) "Unsupported Request Reporting Enable";
+        field ero   [4:4]  is (read_write) "Enabled Relaxed Ordering"
+        { parameter hard_reset_value = 0b1; }
+        field mps   [7:5]  is (read_write) "Max Payload Size";
+        field etfe  [8:8]  is (read_write) "Extended Tag Field Enable";
+        field pfe   [9:9]  is (read_write) "Phantom Functions Enable";
+        field ape  [10:10] is (read_write) "AUX Power PM Enable";
+        field ens  [11:11] is (read_write) "Enabled No Snoop"
+        { parameter hard_reset_value = 0b1; }
+        field mrrs [14:12] is (read_write) "Max Read Request Size"
+        { parameter hard_reset_value = 0b010; }
+    }
+    register exp_dev_status {
+        field ced   [0:0]  is (write_1_clears) "Correctable Error Detected";
+        field ned   [1:1]  is (write_1_clears) "Non-Fatal Error Detected";
+        field fed   [2:2]  is (write_1_clears) "Fatal Error Detected";
+        field urd   [3:3]  is (write_1_clears) "Unsupported Request Detected";
+        field apd   [4:4]  is (read_only) "AUX Power Detected";
+        field tp    [5:5]  is (read_only) "Transactions Pending";
+    }
+    register exp_link_cap {
+        field mls     [3:0]  is (read_only) "Max Link Speed"
+        { parameter hard_reset_value = 0b0001; }
+        field mlw     [9:4]  is (read_only) "Max Link Width"
+        { parameter hard_reset_value = 0x1; }
+        field aspm   [11:10] is (read_only) "Active State Power Management  Support";
+        field l0el   [14:12] is (read_only) "L0 Exit Latency"
+        { parameter hard_reset_value = 0b001; }
+        field l1el   [17:15] is (read_only) "L1 Exit Latency"
+        { parameter hard_reset_value = 0b110; }
+        field sder   [19:19] is (read_only) "Surprise Down Error Reporting Capable";
+        field dlllar [20:20] is (read_only) "Data Link Layer Link Active Reporting Capable";
+        field pn     [31:24] is (read_only) "Port Number";
+    }
+    register exp_link_control {
+        field aspm  [1:0]  is (read_write) "ASPM Control";
+        field rcb   [3:3]  is (read_write) "Read Completion Boundary";
+        field ldis  [4:4]  is (read_only)  "Link Disable";
+        field rlnk  [5:5]  is (read_only)  "Retrain Link";
+        field ccc   [6:6]  is (read_write) "Common Clock Configuration";
+        field es    [7:7]  is (read_write) "Extended Synch";
+    }
+    register exp_link_status {
+        field ls    [3:0]  is (read_only) "Link Speed"
+        { parameter hard_reset_value = 0b0001; }
+        field nlw   [9:4]  is (read_only) "Negotiated Link Width"
+        { parameter hard_reset_value = 0b000001; }
+        field te   [10:10] is (read_only) "Training Error";
+        field lt   [11:11] is (read_only) "Link Training";
+        field scc  [12:12] is (read_only) "Slot Clock Configuration"
+        { parameter hard_reset_value = 0b1; }
+    }
+}

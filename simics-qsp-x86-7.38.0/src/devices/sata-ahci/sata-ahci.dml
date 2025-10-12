@@ -1,0 +1,1806 @@
+/*
+  sata-ahci.dml - This implements common AHCI feature for sata controller
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+parameter ahci_limits = ("FIS-based Switching is not implemented."
+                         + " Port Multipliers are not implemented."
+                         + " Multiple MSI based messages are not implemented."
+                         + " Enclosure Management is not implemented."
+                         + " Command Completion Coalescing is not implemented."
+                         + " Device Sleep is not implemented.");
+
+parameter default_cap default undefined;
+parameter ahci_ver default undefined;
+parameter default_em_loc default undefined;
+parameter default_em_ctrl default undefined;
+parameter ccc_int default undefined;
+
+import "ahci-util.dml";
+import "sata-ahci-ports.dml";
+
+attribute fis_seq {
+    parameter documentation
+        = "Writing a FIS sequence to this attribute will cause it to "
+        + "immediately be executed by the HBA. It can be used in debug purpose."
+        + " The data should include FIS data and it will only send to port 0.";
+
+    parameter configuration = "pseudo";
+    parameter type = "d";
+
+    method set(attr_value_t value) {
+        local bytes_t fis;
+        fis.len = SIM_attr_data_size(value);
+        fis.data = SIM_attr_data(value);
+        call $ahci.p0pcr.receive_fis(fis);
+    }
+
+    method get() -> (attr_value_t value) {
+        value = SIM_make_attr_data(0, NULL);
+    }
+}
+
+connect sata_device[32] {
+    parameter documentation = "SATA interface of sata device";
+    parameter configuration = "optional";
+    interface sata;
+
+    method send_fis(bytes_t fis) -> (bool success) {
+        success = false;
+        if (!$this.obj) {
+            log "error": "unable to send FIS when SATA device is not attached";
+            return;
+        }
+
+        call $mask_some_unsupported_commands(fis);
+
+        log "info", 3: 
+            "HBA[port%d] sending FIS to device(%s), size=%zd, type=%s",
+            $i, SIM_object_name($this.obj), fis.len, 
+            sata_fis_type_name(fis.data[0]);
+        $sata.receive_fis(fis);
+        success = true;
+    }
+    method send_com_init() {
+        local bytes_t fis;
+        local uint8 fisdata[4];
+        if ($this.obj != NULL) {
+            fis.data = fisdata;
+            fisdata[0] = FIS_COMINIT;
+            fis.len = 1;
+            $sata.receive_fis(fis);
+        }
+    }
+}
+
+method mask_some_unsupported_commands(bytes_t fis) default {
+    /*
+      The SATA disk module doesn't support some commands, such as Feature Set
+      (Enable/Disable advanced power management). But some customers wants to
+      send such commands to the SATA disk. When the SATA disk gets the
+      unsupported commands, it sets the feedback status to Error. Then the AHCI
+      gets the Error information, err_fatal(true) will be called and the AHCI
+      port state will be changed to ERR_WAIT_FOR_CLEAR. This causes the
+      customer's software enters a dead loop.
+
+      WR wants to override two methods: mask_some_unsupported_commands() and
+      reg_fis() to make the software think the SATA disk can handle such
+      commands. So all the unsupported commands should also be sent to the SATA
+      disk. Then the feedback error information is removed in the overridden
+      reg_fis().
+    */
+}
+
+bank pci_config {
+    parameter busmaster = true;
+}
+
+bank aidp {
+    parameter desc = "model of AHCI index/data pair registers";
+    parameter mappable = false;
+    parameter byte_order = "little-endian";
+    parameter register_size = 4;
+
+    register  air  size 4 @ 0x0 "AHCI Index Register" {
+        field idx [10:2] is (read_write) "Index";
+    }
+    register  aidr size 4 @ 0x4 "AHCI Index Data Register" {
+        parameter allocate = false;
+        parameter configuration = "pseudo";
+        method read_access(memop, msb1, lsb) -> (value) {
+            // forward access to target bank
+            inline $ahci.read(memop, $air.idx << 2, 4) -> (value);
+        }
+        method write_access(memop, msb1, lsb, value) {
+            // forward access to target bank
+            inline $ahci.write(memop, $air.idx << 2, 4, value);
+        }
+        method get -> (value) {
+            value = 0;
+        }
+        method set(value) {
+            // simply ignored
+        }
+    }
+}
+
+bank ahci {
+    parameter desc = "model of AHCI generic host control registers";
+    parameter function = 2;
+    parameter byte_order = "little-endian";
+    parameter register_size = 4;
+    parameter overlapping = true;
+    parameter partial = true;
+
+    register cap       @ 0x0 "Host Capabilities";
+    register ghc       @ 0x4 "Global Host Control";
+    register isr       @ 0x8 "Interrupt Status";
+    register pi        @ 0xC "Ports Implemented";
+    register vs        @ 0x10 "AHCI Version";
+    register ccc_ctl   @ 0x14 "Command Completion Coalescing Control";
+    register ccc_ports @ 0x18 "Command Completion Coalescing Ports";
+    register em_loc    @ 0x1C "Enclosure Management Location";
+    register em_ctrl   @ 0x20 "Enclosure Management Control";
+    register cap2      @ 0x24 "Host Capabilities Extended";
+    register bohc      @ 0x28 "BIOS/OS Handoff Control and Status";
+
+    if (($default_cap & 0x40) != 0) {
+        register em_msg[$default_em_loc & 0xffff] @ ((($default_em_loc >> 16) * 4) + 0x4 * $i) "Enclosure Management Buffer";
+    }
+    register h_ccc_timer @ undefined "CCC timer value";
+    register h_ccc_complete @ undefined "Command completion count";
+
+}
+
+bank ahci {
+    register cap {
+        parameter hard_reset_value = $default_cap;
+        field s64a  [31:31] is (read_only);
+        field sncq  [30:30] is (read_only);
+        field ssntf [29:29] is (read_only);
+        field smps  [28:28] is (write_once);
+        field sss   [27:27] is (write_once);
+        field salp  [26:26] is (read_only);
+        field sal   [25:25] is (read_only);
+        field sclo  [24:24] is (read_only);
+        field iss   [23:20] is (read_only);
+        field sam   [18:18] is (read_only);
+        field spm   [17:17] is (read_only);
+        field fbss  [16:16] is (read_only);
+        field pmd   [15:15] is (read_only);
+        field ssc   [14:14] is (read_only);
+        field psc   [13:13] is (read_only);
+        field ncs   [12: 8] is (read_only);
+        field cccs  [ 7: 7] is (read_only);
+        field ems   [ 6: 6] is (read_only);
+        field sxs   [ 5: 5] is (read_only);
+        field np    [ 4: 0] is (read_only);
+    }
+    register ghc {
+        data bool do_reset;
+        field ae    [31:31] {
+            parameter hard_reset_value = $default_cap[18,le];
+            method write(value) {
+                if ($cap.sam == 1) {
+                    log "spec_violation", 1: "write to read-only field %s",
+                        $qname;
+                    return;
+                }
+                if ($this != value) {
+                    $this = value;
+                    if (value == 1)
+                        log "info", 2: "AHCI enabled";
+                    else
+                        log "info", 2: "AHCI disabled";
+                }
+            }
+        }
+        field mrsm  [ 2: 2] is (read_only);
+        field ie    [ 1: 1] is (read_write);
+        field hr    [ 0: 0] {
+            method write(value) {
+                $this = 0;
+                if (value != 0) {
+                    // GHC.HR shall only be set to ‘1’ by software 
+                    // when GHC.AE is set to ‘1’.
+                    if ($ae != 1)
+                        log "spec_violation", 1:
+                            "%s is set to 1 when GHC.AE is 0", $qname;
+                    log "info", 2: "HBA Reset";
+                    //call $reset_controller();
+                    $do_reset = true;
+                }
+            }
+        }
+        method before_write(memop, msb1, lsb, value) {
+            $do_reset = false;
+        }
+        method after_write(memop) {
+            if ($do_reset) {
+                call $soft_reset();
+                call $h_init();
+                $do_reset = false;
+            }
+        }
+    }
+    register isr {
+        method write(value) {
+            $this &= ~value;
+            // Scan all ports for possible interrupt
+            call $scan_isr_ports();
+            call $update_irq();
+        }
+    }
+    register pi {
+        parameter hard_reset_value = $ports_impl[($default_cap[4:0,le]):0,le];
+    }
+    register vs is (constant) {
+        parameter value = $ahci_ver;
+    }
+    register ccc_ctl   {
+        field tv   [31:16] is (read_write) {
+            parameter hard_reset_value = 1;
+        }
+        field cc   [15:8] is (read_write) {
+            parameter hard_reset_value = 1;
+        }
+        field intr [7:3] is (read_only) {
+            parameter hard_reset_value = $ccc_int;
+        }
+        field en   [0:0] is (read_write);
+    }
+    register ccc_ports is (silent_unimplemented);
+    register em_loc {
+        parameter hard_reset_value = $default_em_loc;
+        field ofst [31:16] is (cap_dependent_read_only) {
+            parameter cap_bit = $cap.ems;
+            parameter value = $default_em_loc >> 16;
+        }
+        field sz   [15: 0] is (cap_dependent_read_only) {
+            parameter cap_bit = $cap.ems;
+            parameter value = $default_em_loc & 0xffff;
+        }
+    }
+    register em_ctrl {
+        parameter hard_reset_value = $default_em_ctrl;
+
+        field pm    [27] is (read_only);
+        field alhd  [26] is (read_only);
+        field xmt   [25] is (read_only);
+        field smb   [24] is (read_only);
+        field sgpio [19] is (read_only);
+        field ses2  [18] is (read_only);
+        field safte [17] is (read_only);
+        field led   [16] is (read_only);
+        field rst   [ 9] {
+            method write(value) {
+                if ($cap.ems != 0 && value == 1) {
+                    $this = 0;
+                    log "unimplemented", 2: "EM_CTRL - Reset";
+                }
+            }
+        }
+        field tm [8] {
+            method write(value) {
+                if ($cap.ems != 0 && value == 1) {
+                    $this = 0;
+                    log "unimplemented", 2: "EM_CTRL - Transmit Message";
+                }
+            }
+        }
+        field mr [0] is (read_only);
+    }
+    register cap2 is (read_only);
+    register bohc {
+        field bb   [ 4: 4] is (read_write);
+        field ooc  [ 3: 3] is (write_1_clears);
+        field sooe [ 2: 2] is (unimplemented);
+        field oos  [ 1: 1] is (unimplemented);
+        field bos  [ 0: 0] is (read_write);
+    }
+
+    method h_init() {
+        $h_ccc_timer = $ccc_ctl.tv;
+        $h_ccc_complete = $ccc_ctl.cc;
+        // Resets GHC.AE, GHC.IE, and the IS register to their reset values
+        call $ghc.ae.soft_reset();
+        call $ghc.ie.soft_reset();
+        call $isr.soft_reset();
+        $ghc.hr = 0;
+        call $init_ports();
+    }
+}
+
+
+/* Template for port control register banks */
+template ahci_pcr {
+    parameter port_num default undefined;
+    parameter p_offset = 0x100 + $port_num * 0x80;
+    parameter byte_order = "little-endian";
+    parameter register_size = 4;
+
+    data command_header_t cmdheader;
+
+    attribute current_prdt {
+        parameter documentation
+            = "Current PRDT that is used for receiving data.";
+        parameter allocate_type = "uint16";
+        parameter internal = true;
+    }
+
+    attribute prdt_pos {
+        parameter documentation
+            = "Position within current PRDT when receiving data.";
+        parameter allocate_type = "uint32";
+        parameter internal = true;
+    }
+
+    /* First Reg D2H FIS is stored in a buffer so that it can be posted when
+       cmd.fre is set to 1 */
+    data uint8 fis_fifo_buf[FISLEN_REGISTER];
+    attribute fis_fifo {
+        parameter documentation
+            = "FIFO to store the first REG D2H FIS received from device.";
+        parameter type = "d";
+        parameter internal = true;
+        method get() -> (value)
+        {
+            value = SIM_make_attr_data(FISLEN_REGISTER, $fis_fifo_buf);
+        }
+
+        method set(value)
+        {
+            if ($fis_fifo_buf == SIM_attr_data(value))
+                return;
+
+            if (SIM_attr_data_size(value) > FISLEN_REGISTER) {
+                log "error": "%s %s. %s %d %s %d",
+                    "Error setting attribute", $qname,
+                    "Required data size is", FISLEN_REGISTER,
+                    "but got",
+                    SIM_attr_data_size(value);
+                return;
+            }
+
+        memcpy($fis_fifo_buf, SIM_attr_data(value), SIM_attr_data_size(value));
+        }
+    }
+
+    register clb @ ($p_offset + 0x0) is (sticky) {
+        parameter desc = "Command List Base Address";
+        method write(value) {
+            // Command list maximum size is 32 * 32 = 1KB per port
+            if ((value & 0x3ff) != 0)
+                log "spec_violation", 1: "PxCLB should be aligned by 1KB";
+            $this = value & 0xfffffc00;
+        }
+    }
+    register clbu @ ($p_offset + 0x4) is (sticky) {
+        parameter desc = "Command List Base Address Upper 32-Bits";
+    }
+    register fb @ ($p_offset + 0x8) is (sticky) {
+        parameter desc = "FIS Base Address";
+        method write(value) {
+            // FIS entry size is 256B
+            if ((value & 0xff) != 0)
+                log "spec_violation", 1: "PxFB should be aligned by 256B";
+            if ($cmd.fre == 1)
+                log "spec_violation", 1: 
+                    "write to %s while CMD.FRE is set to 1.", $qname;
+            $this = value & 0xffffff00;
+        }
+    }
+    register fbu @ ($p_offset + 0xC) is (sticky) {
+        parameter desc = "FIS Base Address Upper 32-Bits";
+        method write(value) {
+            if ($cmd.fre == 1)
+                log "spec_violation", 1:
+                    "write to %s while CMD.FRE is set to 1.", $qname;
+            $this = value;
+        }
+    }
+    register isr @ ($p_offset + 0x10) is (isr) {
+        parameter desc = "Interrupt Status";
+        parameter mask = 0xfdc000ff;
+    }
+    register ie @ ($p_offset + 0x14) {
+        parameter desc = "Interrupt Enable";
+        method write(value) {
+            // For system that do not support cold presence
+            // detect, CPDE bit shall be a read-only ‘0’.
+            if (($cmd.cpd == 0) && (value[31, le] != 0)) {
+                log "spec_violation", 2:
+                    "Write to read-only field IE.CPDE(content=%d, value=%d)",
+                    $this[31,le], value[31,le];
+                value[31,le] = 0;
+            }
+            $this = value & $isr.mask;
+            call $isr.update_interrupts_and_irq();
+        }
+    }
+    register cmd @ ($p_offset + 0x18) {
+        parameter desc = "Command and Status";
+        parameter hard_reset_value = 0x00000004;
+        data uint1 old_alpe;
+        data uint1 old_st;
+        data uint1 old_fre;
+        data uint32 newstate;
+        method before_write(memop, msb1, lsb, value) {
+            $old_alpe = $alpe;
+            $old_st = $st;
+            $old_fre = $fre;
+            $newstate = $port_state;
+        }
+        field icc   [31:28] {
+            method write(value) {
+                if (value == 0x6) {
+                    if ($old_alpe != 0)
+                        log "spec_violation", 2:
+                            "%s: write with value of 0x6 while ALPE is set",
+                            $qname;
+                    log "unimplemented", 2:
+                        "%s: request for slumber mode is not supported",
+                        $qname;
+                } else if (value == 0x2) {
+                    if ($old_alpe != 0)
+                        log "spec_violation", 2:
+                            "%s: write with value of 0x2 while ALPE is set",
+                            $qname;
+                    log "unimplemented", 2:
+                        "%s: request for partial mode is not supported",
+                        $qname;
+                } else if (value == 0x1) {
+                    log "unimplemented", 2:
+                        "%s: request for active mode is not supported",
+                        $qname;
+                } else if (value == 0x0) {
+                    // No-Op
+                } else {
+                    log "spec_violation", 2:
+                        "%s: write with reserved value (%x)",
+                    $qname, value;
+                }
+            }
+        }
+        field asp   [27:27] is (cap_dependent_reserved) {
+            parameter cap_bit = $default_cap[26,le];
+            parameter value = 0;
+        }
+        field alpe  [26:26] is (cap_dependent_reserved) {
+            parameter cap_bit = $default_cap[26,le];
+            parameter value = 0;
+        }
+        field dlae  [25:25] is (read_write);
+        field atapi [24:24] is (read_write);
+        field esp   [21:21] is (sticky, write_once);
+        field cpd   [20:20] is (read_only);
+        field isp   [19:19] is (sticky);
+        field hpcp  [18:18] is (sticky, write_once);
+        field pma   [17:17] is (cap_dependent_reserved) {
+            parameter cap_bit = $default_cap[17,le];
+            parameter value = 0;
+        }
+        field pmfse [16:16] is (zeros);
+        field cr    [15:15] is (read_only);
+        field fr    [14:14] is (read_only);
+        field iss   [13:13] is (read_only);
+        field ccs   [12: 8] is (read_only);
+        field fre   [ 4: 4] is (read_write);
+        field clo   [ 3: 3] {
+            method write(value) {
+                if (value == 1) {
+                    log "info", 4: "%s: Command list override.", $qname;
+                    $tfd.sts[7] = 0;
+                    $tfd.sts[3] = 0;
+                }
+                $this = 0;
+            }
+        }
+        field pod   [ 2: 2] is (cap_dependent_reserved) {
+            parameter cap_bit = $cpd;
+            parameter value = 1;
+            method operations(uint32 written_value) {
+                if ($port_state != P_NOT_RUNNING)
+                    log "spec_violation", 1:
+                        "%s can not be modified while HBA is running.", $qname;
+                $this = written_value;
+            }
+        }
+        field sud   [ 1: 1] is (cap_dependent_reserved) {
+            parameter cap_bit = $ahci.cap.sss;
+            parameter value = 1;
+            method operations(uint32 written_value) {
+                if ($port_state != P_NOT_RUNNING)
+                    log "spec_violation", 1:
+                        "%s can not be modified while HBA is running.", $qname;
+
+                $this = written_value;
+                if ($this == 0) {
+                    if ($sata.sctl.det == 0)
+                        log "unimplemented", 2: "listen mode";
+                } else if ($ghc.ae == 1)
+                    call $com_init();
+            }
+        }
+        field st    [ 0: 0] is (read_write);
+        method after_write(memop) {
+            $fr = $fre;
+            if ($old_fre != $fre) {
+                if ($fb == 0 && $fbu == 0 && $fre == 1)
+                    log "spec_violation", 1:
+                        "%s: PxFB/PxFBU should be configured%s",
+                        $qname, " before enabling CMD.FRE.";
+                if (($st == 1 || $cr == 1) && $fre == 0)
+                    log "spec_violation", 1:
+                        "Clear %s while CMD.ST or CMD.CR is set to 1",
+                        $qname;
+                if (($fre == 1) && ($fis_fifo_buf[0] == FIS_REG_D2H)
+                    && ($sata.serr.x == 0)
+                    && $port_state == P_NOT_RUNNING) {
+                    local bytes_t fis;
+                    local bool legal_fis;
+                    log "info", 4: "%s: Enabling CMD.FRE with Reg FIS %s",
+                        $qname, "in FIFO.";
+                    fis.len = FISLEN_REGISTER;
+                    fis.data = $fis_fifo_buf;
+                    call $p_reg_fis_post_to_mem(fis);
+                    memset($fis_fifo_buf, 0, FISLEN_REGISTER);
+                }
+            }
+
+            if (($old_st == 0) && ($st == 1)) {
+                if ($ahci.ghc.ae == 0)
+                    log "spec_violation", 2: "Accessing port %s",
+                        "registers while GHC.AE is cleared.";
+                if ($fre == 0)
+                    log "spec_violation", 2: "%s shall not be %s",
+                        $qname, "set after CMD.FRE was set";
+
+                if (($port_state == P_NOT_RUNNING) && ($tfd.sts[7] == 0)
+                    && ($tfd.sts[3] == 0)) {
+                    $newstate = P_IDLE;
+                }
+            }
+
+            if (($old_st == 1) && ($st == 0)) {
+                $fbs.sde = 0;
+
+                // P:StartBitCleared
+                $ci = 0;
+                $sact = 0;
+                $ccs = 0;
+                $cr = 0;
+                $p_dma_xfer_cnt = 0;
+                $newstate = P_NOT_RUNNING;
+            }
+            call $change_port_state($newstate);
+        }
+    }
+    register dummy @ ($p_offset + 0x1c) is (read_only);
+    register tfd @ ($p_offset + 0x20) {
+        parameter desc = "Task File Data";
+        field err [15:8] is (read_only);
+        field sts [ 7:0] is (read_only) {
+            parameter hard_reset_value = 0x7F;
+        }
+    }
+    register sig @ ($p_offset + 0x24) is (read_only) {
+        parameter desc = "Signature";
+        parameter hard_reset_value = 0xFFFFFFFF;
+    }
+
+    group sata is (sata_superset_registers) {
+        parameter g_offset = $p_offset + 0x28;
+        method initialize_interface() {
+            log "info", 2: "Reset port %d", $port_num;
+            if ($ghc.ae == 1) {
+                call $tfd.sts.soft_reset();
+                call $ssts.det.soft_reset();
+            }
+        }
+        method clear_det_after_init() {
+            if ($ghc.ae == 1)
+                call $com_init();
+        }
+        method clear_is(int bit) {
+            if ($ghc.ae == 1)
+                call $isr.lower(bit);
+        }
+        method check_cmd_st(const char* field_name) {
+            if ($cmd.st == 1) {
+                log "spec_violation", 1: 
+                    "%s may only be changed when CMD.ST is 0",
+                    field_name;
+            }
+        }
+    }
+
+    register sact @ ($p_offset + 0x34) is (sticky) {
+        parameter desc = "Serial ATA Active";
+        method write(value) {
+            if ($this != value) {
+                $this |= value;
+                if ($cmd.st != 1)
+                    log "spec_violation", 2:
+                        "write to %s when CMD.ST is 0.", $qname;
+            }
+        }
+    }
+    register ci @ ($p_offset + 0x38) {
+        parameter desc = "Command Issue";
+        method write(value) {
+            /* Only enter if a unset bit is set */
+            if (($this | value) != $this) {
+                // Check if command slot is available to use
+                if ((value & ~((1 << ($cap.ncs + 1)) - 1)) != 0) {
+                    log "spec_violation", 2:
+                        "Unsupported command slot bit written.";
+                    value &= (1 << ($cap.ncs + 1)) - 1;
+                }
+                if (value == 0)
+                    return;
+                if ($cmd.st == 0)
+                    log "spec_violation", 2:
+                        "%s shall only be set when CMD.ST is 1.", $qname;
+
+                $this |= value;
+                value = $this;
+                if ((value & (value - 1)) != 0) {
+                    log "info", 3: 
+                        "%s: Multiple commands in command queue", 
+                        $qname;
+                    while (value != 0) {
+                        if ((value & 1) == 1)
+                            $p_multiple_cmd++;
+                        value >>= 1;
+                    }
+                }
+
+                if ($port_state != P_IDLE)
+                    log "spec_violation", 2:
+                        "write to %s when not in P:IDLE state.", $qname;
+                /* If there is no ongoing command $p_issue_slot will be 32 */
+                if ($p_issue_slot == 32) {
+                    inline $next();
+                } else {
+                    log "info", 3: "%s: New command added to CI while %s",
+                        $qname, "another command still is running";
+                }
+            }
+        }
+        method next() {
+            if (($port_state == P_IDLE) && ($this != 0)) {
+                log "info", 4: "%s: P:SelectCMD and P:FetchCMD", $qname;
+                call $p_select_and_fetch_cmd();
+                if ($p_dma_xfer_cnt == 0 && $p_cmd_to_issue == 1) {
+                    if ($cmdheader.dw0.reset == 1) {
+                        //set pUpdateSig according to AHCI spec chapter 5.3.6.1
+                        //Fix state when sending reset FIS to device behind PM
+                        $p_update_sig = 1;   
+                    }
+                    call $cfis_xmit();
+                }
+            }
+        }
+    }
+    register sntf @ ($p_offset + 0x3c) is (read_write) {
+        parameter desc = "SATA Notification";
+    }
+    register fbs @ ($p_offset + 0x40) {
+        parameter desc = "FIS-based Switching Control";
+        field dwe  [19:16] is (read_only);
+        field ado  [15:12] is (read_only);
+        field devi [11: 8] is (read_write);
+        field sde  [ 2: 2] is (read_only);
+        field dec  [ 1: 1] is (write_1_only);
+        field en   [ 0: 0] is (read_write);
+        method write_access(memop, msb1, lsb, value) {
+            log "unimplemented", 2: "%s: FIS-based switching.", $qname;
+            inline default(memop, msb1, lsb, value);
+        }
+    }
+    register devslp @ ($p_offset + 0x44) is (constant) {
+        // Device Sleep, introduced in SATA 1.3.1. Not supported.
+        parameter value = 0;
+    }
+
+    register vs[4] @ ($p_offset + 0x70 + ($i * 4)) is (read_write) {
+        parameter desc = "Vendor Specific";
+    }
+
+    /* Port state machine variables */
+    register p_update_sig @ undefined;
+    register p_dev_issue @ undefined;
+    register p_issue_slot @ undefined {
+        parameter desc = "Slot location of last command issued to the device.";
+        parameter hard_reset_value = 32;
+    }
+    register p_data_slot @ undefined;
+    register p_pmp @ undefined;
+    register p_xfer_atapi @ undefined;
+    register p_pio_xfer @ undefined;
+    register p_pio_e_sts @ undefined;
+    register p_pio_err @ undefined;
+    register p_pio_ibit @ undefined;
+    register p_dma_xfer_cnt @ undefined;
+    register p_cmd_to_issue @ undefined {
+        parameter desc = "This variable is set whenever the currently fetched command still needs to be transmitted to the device.";
+    }
+    register p_prd_intr @ undefined;
+    register p_s_active @ undefined;
+    register p_slot_loc @ undefined;
+    register p_transmitted @ undefined {
+        parameter desc = "How many bytes have been transmitted to device. Used when data transmitted is larger than maximum supported FIS length.";
+    }
+    register p_multiple_cmd @undefined {
+        parameter desc = "How many commands left unexecuted when multiple commands was issued in s single write to port register CI.";
+    }
+
+    register port_state @ undefined "Current state of the port";
+
+
+    /* Port specific methods */
+
+    /* Return command list base address */
+    method get_command_list_base_addr() -> (physical_address_t addr) {
+        call $get_base_addr($clbu, $clb) -> (addr);
+    }
+
+    /* Return received FIS base address */
+    method get_rfis_base_addr() -> (physical_address_t addr) {
+        call $get_base_addr($fbu, $fb) -> (addr);
+    }
+
+    /* Return command table descriptor base address */
+    method get_cmd_table_desc_base_addr() -> (physical_address_t addr) {
+        call $get_base_addr($cmdheader.ctbau, $cmdheader.dw2.ctba << 7)
+            -> (addr);
+    }
+
+    /* Called when posting received FIS */
+    method post_received_fis(bytes_t fis) -> (bool fis_legal) {
+        /* Check FIS entry size */
+        assert fis.len < FIS_ENTRY_SIZE;
+
+        /* Read FIS type */
+        local int fis_type = fis.data[0];
+        log "info", 3: "%s: Posting received fis (type = %s, len = %zd)", 
+            $qname, sata_fis_type_name(fis_type), fis.len;
+
+        local physical_address_t fba;
+        call $get_rfis_base_addr() -> (fba);
+        fis_legal = true;
+        switch (fis_type) {
+        case FIS_DMA_SETUP_BI:
+            if (fis.len == FISLEN_DMA_SETUP)
+                call $sata_ahci_dma_write(Sim_Addr_Space_Memory,
+                                          cast(fis.data, uint8*),
+                                          fba, fis.len);
+            else
+                fis_legal = false;
+            break;
+        case FIS_PIO_SETUP_D2H:
+            if (fis.len == FISLEN_PIO_SETUP)
+                call $sata_ahci_dma_write(Sim_Addr_Space_Memory,
+                                          cast(fis.data, uint8*),
+                                          fba + 0x20, fis.len);
+            else
+                fis_legal = false;
+            break;
+        case FIS_REG_D2H:
+            if (fis.len == FISLEN_REGISTER)
+                call $sata_ahci_dma_write(Sim_Addr_Space_Memory,
+                                          cast(fis.data, uint8*),
+                                          fba + 0x40, fis.len);
+            else
+                fis_legal = false;
+            break;
+        case FIS_SET_DEVICE_BIT_D2H:
+            if (fis.len == FISLEN_SDB)
+                call $sata_ahci_dma_write(Sim_Addr_Space_Memory,
+                                          cast(fis.data, uint8*),
+                                          fba + 0x58, fis.len);
+            else
+                fis_legal = false;
+            break;
+        case FIS_REG_H2D:
+        case FIS_DMA_ACTIVATE_D2H:
+        case FIS_DATA_BI:
+        case FIS_BIST_ACTIVATE_BI:
+            fis_legal = false;
+            break;
+        default:
+            if (fis.len > 64) {
+                log "info", 2: "Incorrect FIS, larger than 64 bytes received";
+                call $err_fatal(false);
+                $sata.serr.p = 1;
+                fis_legal = false;
+                return;
+            } else {
+                call $sata_ahci_dma_write(Sim_Addr_Space_Memory,
+                                          cast(fis.data, uint8*),
+                                          fba + 0x60, fis.len);
+            }
+            break;
+        }
+        if (!fis_legal)
+            call $illegal_fis();
+    }
+
+    /* Called when an FIS arrives from the device */
+    method receive_fis(bytes_t fis) {
+        local int fis_type = fis.data[0];
+
+        /* the first D2H register FIS after the initialization sequence
+           should be accepted */
+        if ($ahci.ghc.ae == 0 && $port_state != P_NOT_RUNNING) {
+            inline $receive_fis_log("GHC.AE = 0");
+            return;
+        }
+        if ($port_state == ERR_WAIT_FOR_CLEAR) {
+            inline $receive_fis_log("in state ERR:WaitForClear");
+            return;
+        }
+        log "info", 3: "%s: Received FIS, type %s", 
+            $qname, sata_fis_type_name(fis_type);
+
+        if (fis_type != FIS_DATA_BI) {
+            /* Non-Data FIS */
+            call $ndr_receive(fis);
+        } else {
+            /* Data FIS */
+            if ($cmd.fre != 0 && $port_state == P_IDLE) {
+                call $dr_receive(fis);
+            }
+        }
+    }
+
+    /* Buffer for output FIS, so that we don't have allocate buffer 
+       every time */
+    data uint8 odfis_buf[DATA_FIS_SIZE_MAX + 4];
+
+    /* Called to transmit data FIS */
+    method send_data_fis(const uint8 *src, int length, int pmp) {
+        $odfis_buf[0] = FIS_DATA_BI;
+        $odfis_buf[1] = pmp & 0x0F;
+        if (src)
+            memcpy(&$odfis_buf[4], src, length);
+
+        local bytes_t fis;
+        fis.data = &$odfis_buf[0];
+        fis.len = length + 4;
+
+        local bool ok;
+        call $transmit_fis(fis) -> (ok);
+    }
+
+    /* Called to send FIS from host to device */
+    method transmit_fis(bytes_t fis) -> (bool transmit_ok) {
+        call $sata_device[$port_num].send_fis(fis) -> (transmit_ok);
+        if (!transmit_ok)
+            log "error": "%s: Error when transferring FIS to device.",
+                $qname;
+    }
+
+    method p_init() {
+        // Reset all port state machine variables
+        log "info", 4: "%s: Init", $qname;
+        $p_update_sig = 1;
+        $p_dev_issue = 0;
+        $p_issue_slot = 32;
+        $p_data_slot = 0;
+        $p_pmp = 0;
+        $p_xfer_atapi = 0;
+        $p_pio_xfer = 0;
+        $p_pio_e_sts = 0;
+        $p_pio_ibit = 0;
+        $p_dma_xfer_cnt = 0;
+        $p_cmd_to_issue = 0;
+        $p_prd_intr = 0;
+        $p_s_active = 0;
+        $p_slot_loc = 0;
+        $p_transmitted = 0;
+        $p_multiple_cmd = 0;
+        call $isr.soft_reset();
+        call $ie.soft_reset();
+        call $cmd.soft_reset();
+        call $tfd.soft_reset();
+        call $sig.soft_reset();
+        call $sata.ssts.soft_reset();
+        call $sata.sctl.soft_reset();
+        call $sata.serr.soft_reset();
+        call $ci.soft_reset();
+        call $sntf.soft_reset();
+        call $fbs.soft_reset();
+        call $vs[0].soft_reset();
+        call $vs[1].soft_reset();
+        call $vs[2].soft_reset();
+        call $vs[3].soft_reset();
+        $sact = 0;
+        $tfd.sts = 0x7f;
+        memset($fis_fifo_buf, 0, FISLEN_REGISTER);
+        if ($cmd.sud == 1) {
+            call $com_init();
+        }
+        call $change_port_state(P_NOT_RUNNING);
+    }
+
+    method change_port_state(int newstate) {
+        if ($port_state == newstate)
+            return;
+        switch (newstate) {
+        case P_IDLE:
+            $cmd.cr = 1;
+            log "info", 4: "%s: Changing state to P:Idle.", $qname;
+            break;
+        case P_NOT_RUNNING:
+            $p_slot_loc = $ahci.cap.ncs;
+            $p_issue_slot = 32;
+            log "info", 4: "%s: Changing state to P:NotRunning.", $qname;
+            // clear busy
+            break;
+        case ERR_WAIT_FOR_CLEAR:
+            $cmd.cr = 0;
+            log "info", 4: "%s: Changing state to ERR:WaitForClear.", $qname;
+            break;
+        }
+        $port_state = newstate;
+    }
+
+    /* Host sends COMRESET to device and gets a COMINIT back */
+    method com_init() {
+        log "info", 4: "%s: COMINIT received.", $qname;
+
+        $tfd.sts = 0x80;
+        // Check if sata device is present
+        if ($sata_device[$port_num].obj) {
+            $sata.ssts.det = 3;
+            if ($sata.sctl.spd == 0 || $sata.sctl.spd >= $ahci.cap.iss)
+                $sata.ssts.spd = $ahci.cap.iss;
+            else
+                $sata.ssts.spd = $sata.sctl.spd;
+            $sata.ssts.ipm = 1;
+            log "info", 4: "%s: Device present.", $qname;
+            call $sata_device[$port_num].send_com_init();
+            $sata.serr.x = 1;
+            call $isr.raise(ISR_PCS);
+        } else {
+            $sata.ssts.det = 0;
+            $sata.ssts.spd = 0;
+            $sata.ssts.ipm = 0;
+            log "info", 4: "%s: Device not present.", $qname;
+        }
+        call $change_port_state(P_NOT_RUNNING);
+    }
+
+    method p_select_and_fetch_cmd() {
+        local int i = 0;
+        log "info", 4: "%s: Select and Fetch CMD.", $qname;
+        if ($p_transmitted != 0) {
+            log "spec_violation", 1: "%s: P:SelectCmd while transmitting data",
+                $qname;
+            $p_transmitted = 0;
+        }
+        // Select Command
+        do {
+            $p_slot_loc = ($p_slot_loc + 1) % ($ahci.cap.ncs + 1);
+            i++;
+        } while (((($ci >> $p_slot_loc) & 1) == 0) && i <= 32);
+        if (i > 32) {
+            log "error": "%s: P:SelectCmd state entered without %s %d.",
+                $qname, "any command to issue. PxCI = ", $ci;
+            assert false;
+        }
+        $p_dev_issue = 0;
+        // Reset to base position in PRDB Table
+        $current_prdt = 0;
+        $prdt_pos = 0;
+        // Fetch Command
+        local physical_address_t clba;
+        call $get_command_list_base_addr() -> (clba);
+        call $get_command_header(clba, $p_slot_loc, &$cmdheader);
+        $p_issue_slot = $p_slot_loc;
+        $cmd.ccs = $p_slot_loc;
+        $p_cmd_to_issue = 1;
+    }
+
+    method cfis_xmit() {
+        log "info", 4: "%s: CFIS:Xmit", $qname;
+        assert $p_issue_slot < 32;
+        $tfd.sts[7] = 1;
+        $p_data_slot = $p_issue_slot;
+        $p_pmp = $cmdheader.dw0.pmp;
+        $p_xfer_atapi = $cmdheader.dw0.atapi;
+        $p_dma_xfer_cnt = 0;
+        // Fetch FIS from CTBA
+        local bytes_t cfis;
+        call $get_cfis() -> (cfis);
+        // Transmit FIS to device, receive success
+        local bool success;
+        call $transmit_fis(cfis) -> (success);
+        delete cast(cfis.data, uint8 *);
+        if (success) {
+            if ($cmdheader.dw0.bist) {
+                log "unimplemented", 1: "Bist";
+            } else {
+                if ($cmdheader.dw0.clear) {
+                    log "info", 4: "%s: CFIS:ClearCI", $qname;
+                    $tfd.sts[7] = 0;
+                    $ci[$p_issue_slot] = 0;
+                    $p_issue_slot = 32;
+                    // TODO: CCC
+                }
+            }
+            call $change_port_state(P_IDLE);
+            $p_cmd_to_issue = 0;
+        } else
+            log "error", 1: 
+                "%s: Error when transferring Command FIS to device.",
+                $qname;
+    }
+
+    /* Receive Data FIS */
+    method dr_receive(bytes_t fis) {
+        local physical_address_t clba;
+        local physical_address_t ctba;
+        local physical_address_t prdt_addr;
+        local physical_address_t data_base_addr;
+        local phys_region_desc_t prd;
+
+        // DR:Entry
+        $p_prd_intr = 0;
+        // DR:Receive
+        call $get_command_list_base_addr() -> (clba);
+        call $get_command_header(clba, $p_data_slot, &$cmdheader);
+        call $get_cmd_table_desc_base_addr() -> (ctba);
+
+        // Receive Data
+        local int32 bytes_stored = 0;
+        local int32 data_len = fis.len - 4;
+        if ($p_dma_xfer_cnt > 0 && $p_dma_xfer_cnt < data_len) {
+            log "info", 3: "%s: PDmaXferCnt %d is less than data size %d",
+                $qname, $p_dma_xfer_cnt, data_len;
+            data_len = $p_dma_xfer_cnt;
+        }
+        while (bytes_stored < data_len) {
+            if ($current_prdt >= $cmdheader.dw0.prdtl) {
+                log "info", 2: "%s: Physical Region Descriptor Table is full.",
+                    $qname;
+                // ERR:Non-Fatal Overflow
+                call $err_overflow();
+                break;
+            }
+
+            call $store_received_data(ctba, data_len, fis.data,
+                                      &bytes_stored);
+        }
+        // DR: UpdateBytesCount
+        call $increase_cmdheader_prdbc(clba, $p_slot_loc, bytes_stored);
+
+        if (($p_dma_xfer_cnt > 0) && ($p_dma_xfer_cnt < (fis.len - 4))) {
+            $p_dma_xfer_cnt = 0;
+            $current_prdt = 0;
+            $prdt_pos = 0;
+        } else if ($p_dma_xfer_cnt != 0) {
+            $p_dma_xfer_cnt -= fis.len - 4;
+        }
+        if ($p_prd_intr == 1) {
+            // DX:PrdSetIntr
+            $p_prd_intr = 0;
+            call $isr.raise(ISR_DPS);
+        }
+        if ($p_pio_xfer == 1) {
+            call $pio_update();
+        }
+        call $change_port_state(P_IDLE);
+    }
+
+    /* Receive Non-Data FIS */
+    method ndr_receive(bytes_t fis) {
+        log "info", 4:"%s: NDR:Accept", $qname;
+        local int fis_type = fis.data[0];
+        local bool legal_fis = true;
+        if (fis_type != FIS_DMA_ACTIVATE_D2H && $p_transmitted != 0) {
+            log "spec_violation", 1: "%s: Expecting Activate DMA FIS, %s",
+                $qname, "ongoing transfer has not completed.";
+            $p_transmitted = 0;
+        }
+        if (((fis_type == FIS_REG_D2H) || (fis_type == FIS_PIO_SETUP_D2H)) &&
+            ($tfd.sts[7] == 0) && ($tfd.sts[3] == 0)) {
+            log "info", 4:"%s: Bits BSY and DRQ of TFD.STS cleared %s0x%x%s",
+                $qname, "when receiving FIS of type ", fis_type,
+                ", FIS ignored.";
+        } else if ((fis_type == FIS_REG_D2H) && ($cmd.st == 0)) {
+            // P:RegFisUpdate
+            if (fis.len == FISLEN_REGISTER) {
+                call $update_sig(fis);
+                if ($cmd.fre == 1) {
+                    // P:RegFisPostToMem
+                    call $p_reg_fis_post_to_mem(fis);
+                } else if ($port_state == P_NOT_RUNNING) {
+                    // The first D2H register FIS after init is accepted
+                    assert fis.len == FISLEN_REGISTER;
+                    memcpy($fis_fifo_buf, fis.data, fis.len);
+                } else
+                    inline $receive_fis_log("CMD.FRE = 0");
+
+            } else
+                call $illegal_fis();
+        } else if ($cmd.fre == 0) {
+            inline $receive_fis_log("CMD.FRE = 0");
+        } else if ($ci == 0 && $sact == 0) {
+            log "info", 2: "%s: D2H FIS received with no active command slot",
+                $qname;
+            if (fis_type == FIS_DMA_SETUP_BI) {
+                call $err_fatal(false);
+            }
+        } else if (fis_type == FIS_DMA_ACTIVATE_D2H) {
+            if (fis.len == FISLEN_DMA_ACTIVATE) {
+                // DX:Entry
+                call $data_transmit(fis);
+            } else {
+                call $illegal_fis();
+            }
+        } else if (fis_type == FIS_BIST_ACTIVATE_BI) {
+            if (fis.len == FISLEN_BIST)
+                log "unimplemented" : "Bist";
+            else
+                call $illegal_fis();
+        } else {
+            /* All other states will receive FIS to memory */
+            call $post_received_fis(fis) -> (legal_fis);
+            if (!legal_fis)
+                return;
+            switch (fis_type) {
+            case FIS_REG_D2H:
+                // RegFIS:Entry
+                call $reg_fis(fis);
+                break;
+            case FIS_SET_DEVICE_BIT_D2H:
+                // SDB:Entry
+                call $set_device_bits(fis);
+                break;
+            case FIS_DMA_SETUP_BI:
+                // DmaSet:Entry
+                call $dma_setup_receive(fis);
+                break;
+            case FIS_PIO_SETUP_D2H:
+                // PIO:Entry
+                call $pio(fis);
+                break;
+            default:
+                // UFIS:Entry - FIS of unknown type.
+                $sata.serr.f = 1;
+                call $isr.raise(ISR_UFS);
+                call $change_port_state(P_IDLE);
+            }
+        }
+    }
+
+    method reg_fis(bytes_t fis) default {
+        // RegFIS:Entry
+        $tfd.err = fis.data[3];
+        $tfd.sts = fis.data[2];
+        if ($tfd.sts[0] == 1) {
+            // ERR:FatalTaskfile
+            call $err_fatal(true);
+        } else {
+            if (($tfd.sts & 0x88) == 0) { // bsy = 0 and drq = 0
+                // RegFIS:ClearCI
+                $ci[$p_issue_slot] = 0;
+                $p_issue_slot = 32;
+                // Update PRDBC is not needed here since it has been 
+                // updated in each single data transfer
+                // TODO: CCC
+                if (((fis.data[1] >> 6) & 1) == 1) {
+                    // RegFIS:SetIntr
+                    call $isr.raise(ISR_DHRS);
+                }
+            }
+            // RegFIS:UpdateSig
+            if ($p_update_sig == 1) {
+                call $update_sig(fis);
+            }
+            if ($p_multiple_cmd != 0) {
+                call $ci.next();
+                $p_multiple_cmd--;
+            }
+        }
+    }
+
+    method p_reg_fis_post_to_mem(bytes_t fis) {
+        local bool legal_fis;
+        call $post_received_fis(fis) -> (legal_fis);
+        $tfd.err = fis.data[3];
+        $tfd.sts = fis.data[2];
+    }
+
+    method update_sig(bytes_t fis) {
+        $sig = ((fis.data[4] << 8) | (fis.data[5] << 16) |
+                (fis.data[6] << 24) | fis.data[12]);
+        $p_update_sig = 0;
+    }
+
+    /* Set Device Bits States (BSY and DRQ are not updated with this FIS) */
+    method set_device_bits(bytes_t fis) {
+        // SDB:Entry
+        local uint32 s_active;
+        $tfd.sts = ($tfd.sts & 0x88) | (fis.data[2] & 0x77);
+        $tfd.err = fis.data[3];
+        s_active = (fis.data[4] | (fis.data[5] << 8) | (fis.data[6] << 16) |
+                    fis.data[7] << 24);
+        $sact &= ~s_active;
+        $p_s_active = s_active;
+        $p_dma_xfer_cnt = 0;
+        if ($tfd.sts[0] == 1) {
+            // ERR:FatalTaskfile
+            call $err_fatal(true);
+        } else {
+            if ((fis.data[1] & 0x40) == 0x40) {
+                if (($ahci.cap.ssntf == 1) && ((fis.data[1] & 0x80) == 0x80)) {
+                    // SDB:Notification
+                    // ICH10 does not support notification
+                    log "unimplemented", 2: "%s: SDB:Notification.", $qname;
+                }
+                // SDB:SetIntr
+                call $isr.raise(ISR_SDBS);
+                // TODO: CCC
+            }
+            // PM:Aggr
+            call $change_port_state(P_IDLE);
+        }
+    }
+
+    /* Transmit data to device */
+    method data_transmit(bytes_t fis) {
+        // DX:Entry
+        local physical_address_t clba;
+        call $get_command_list_base_addr() -> (clba);
+        call $get_command_header(clba, $p_data_slot, &$cmdheader);
+
+        local size_t bytes_len;
+        call $get_transfer_size($cmdheader) -> (bytes_len);
+        assert bytes_len != 0;
+
+        // Check if all bytes can fit into one FIS, otherwise they will
+        // be transmitted in several FISes. The bytes transmitted is stored
+        // in $p_transmitted
+        local size_t transmit_len;
+        if (bytes_len > $p_transmitted + DATA_FIS_SIZE_MAX)
+            transmit_len = DATA_FIS_SIZE_MAX;
+        else {
+            assert bytes_len >= $p_transmitted;
+            transmit_len = bytes_len - $p_transmitted;
+        }
+        local uint8 *buf = malloc(transmit_len);
+        local bytes_t data_send;
+        data_send.data = buf;
+        data_send.len = transmit_len;
+        call $fill_transfer_data(buf, transmit_len);
+        $p_prd_intr = 0;
+
+        if(data_send.len == 0) {
+            /* Only header, no data to transmit */
+        } else {
+            // DX:Transmit
+            if (($p_dma_xfer_cnt > 0) && ($p_dma_xfer_cnt < data_send.len)) {
+                log "info", 4: "%s: PDmaXferCnt < PDRT data length, transmitting %d bytes", $qname, $p_dma_xfer_cnt;
+                data_send.len = $p_dma_xfer_cnt;
+            }
+            log "info", 3: "Transmitting %zd bytes data to device.", 
+                data_send.len;
+            call $send_data_fis(data_send.data, data_send.len, $cmdheader.dw0.pmp);
+
+            if (bytes_len != $p_transmitted + data_send.len)
+                $p_transmitted += data_send.len;
+            else
+                $p_transmitted = 0;
+
+            // TODO: Failed transfer -> Error
+            // DX:UpdateByteCount
+            call $increase_cmdheader_prdbc(clba, $p_data_slot, 
+                                           data_send.len);
+            if ($p_dma_xfer_cnt > data_send.len)
+                $p_dma_xfer_cnt -= data_send.len;
+            else
+                $p_dma_xfer_cnt = 0;
+            if ($p_prd_intr == 1) {
+                // DX:PrdSetIntr
+                call $isr.raise(ISR_DPS);
+                $p_prd_intr = 0;
+            }
+        }
+
+        free(buf);
+        if ($p_pio_xfer == 1) {
+            call $pio_update();
+        } else
+            call $change_port_state(P_IDLE);
+    }
+
+    method dma_setup_receive(bytes_t fis) {
+        $p_data_slot = fis.data[4]; // TODO: Make certain this is true
+        $p_dma_xfer_cnt = fis.data[20] | (fis.data[21] << 8)
+            | (fis.data[22] << 16) | (fis.data[23] << 24);
+        if ((fis.data[1] & 0x40) == 0x40)
+            call $isr.raise(ISR_DSS);
+
+        // Reset PRDT to base of list
+        $current_prdt = 0;
+        $prdt_pos = 0;
+
+        if ($ci[$p_data_slot] != 1) {
+            // DMA setup fis received without active command slot
+            call $isr.raise(ISR_IFS);
+        }
+        // DmaSet:AutoActivate
+        local physical_address_t clba;
+        call $get_command_list_base_addr() -> (clba);
+        call $get_command_header(clba, $p_data_slot, &$cmdheader);
+        if (($cmdheader.dw0.write == 1) && ((fis.data[1] & 0x80) == 0x80))
+        {
+            // DX:Entry
+            call $data_transmit(fis);
+        } else {
+            call $change_port_state(P_IDLE);
+        }
+    }
+
+    method pio(bytes_t fis) {
+        $p_pio_xfer = 1;
+        $p_pio_e_sts = fis.data[15];
+        $p_pio_err = fis.data[3];
+        $p_pio_ibit = (fis.data[1] >> 6) & 1;
+        $p_dma_xfer_cnt = (fis.data[17] << 8) | fis.data[16];
+        if ($p_dma_xfer_cnt == 0)
+            log "spec_violation": "Transfer count value shall be non-zero.";
+        else if (($p_dma_xfer_cnt & 1) == 1)
+            log "spec_violation": 
+                "Low order bit of Transfer count shall be zero.";
+        $tfd.sts = fis.data[2];
+        if ($tfd.sts[0] == 1) {
+            // ERR:FatalTaskfile
+            call $err_fatal(true);
+        } else if (((fis.data[1] >> 5) & 1) == 0) {
+            if ($p_xfer_atapi == 0) {
+                // DX:Entry
+                log "info", 4: "%s: PIO, DX:Entry", $qname;
+                call $data_transmit(fis);
+            } else {
+                // ATAPI:Entry
+                log "info", 4: "%s: PIO, ATAPI:Entry", $qname;
+                local physical_address_t clba;
+                call $get_command_list_base_addr() -> (clba);
+                call $get_command_header(clba, $p_slot_loc, &$cmdheader);
+                local int len = $p_dma_xfer_cnt < 16 ? $p_dma_xfer_cnt : 16;
+                local bytes_t acmd;
+                call $get_atapi_cmd($cmdheader, len) -> (acmd);
+
+                local bool ok;
+                call $transmit_fis(acmd) -> (ok);
+                delete cast(acmd.data, uint8 *);
+                $p_dma_xfer_cnt = 0;
+                if (!ok) {
+                    // ERR:Fatal
+                    call $err_fatal(false);
+                }
+            }
+            call $pio_update();
+        } else {
+            call $change_port_state(P_IDLE);
+        }
+    }
+
+    method pio_update() {
+        $tfd.sts = $p_pio_e_sts;
+        $tfd.err = $p_pio_err;
+        $p_pio_xfer = 0;
+        if ($tfd.sts[0] == 1) {
+            // ERR:FatalTaskfile
+            call $err_fatal(true);
+        } else {
+            if (($tfd.sts & 0x88) == 0) { // bsy = 0 and drq = 0
+                // PIO:ClearCI
+                // Update PRDBC is not needed here since it has been 
+                // updated in each single data transfer
+                $ci[$p_issue_slot] = 0;
+                $p_issue_slot = 32;
+                // TODO: CCC
+            }
+            if ($p_pio_ibit == 1)
+                call $isr.raise(ISR_PSS);
+            call $change_port_state(P_IDLE);
+        }
+    }
+
+    method err_overflow() {
+        log "info", 3: "%s: Err:Non-Fatal Overflow", $qname;
+        call $isr.raise(ISR_OFS);
+    }
+
+    method err_fatal(bool taskfile) {
+        if (taskfile) {
+            log "info", 2: "%s: ERR:Fatal Taskfile", $qname;
+            call $isr.raise(ISR_TFES);
+        } else {
+            log "info", 2: "%s: ERR:Fatal", $qname;
+            call $isr.raise(ISR_IFS);
+        }
+        // ERR:WaitForClear
+        call $change_port_state(ERR_WAIT_FOR_CLEAR);
+    }
+
+    /* Return command fis */
+    method get_cfis() -> (bytes_t cfis) {
+        local physical_address_t ctba;
+        call $get_cmd_table_desc_base_addr() -> (ctba);
+
+        /* CFIS can be up to 64 bytes, cfl measures in DW(4 bytes) */
+        assert $cmdheader.dw0.cfl <= 16;
+        local uint8 *buf = new uint8[$cmdheader.dw0.cfl * 4];
+        log "info", 4: "Fetching Command FIS at 0x%x", ctba;
+        // TODO: what happen is cfl is 0
+        if ($cmdheader.dw0.cfl == 0)
+            log "spec_violation", 1: "cfis length in cmd header is 0";
+        call $sata_ahci_dma_read(Sim_Addr_Space_Memory, buf, 
+                                 ctba, $cmdheader.dw0.cfl * 4);
+
+        cfis.data = buf;
+        cfis.len = $cmdheader.dw0.cfl * 4;
+    }
+
+    method store_received_data(physical_address_t ctba, int data_len,
+                               const uint8 *fis_data, int *byte_cnt) {
+        local physical_address_t prdt_addr;
+        prdt_addr = ctba + PRDT_OFFSET
+            + $current_prdt * sizeoftype(phys_region_desc_t);
+        local phys_region_desc_t prd;
+        call $sata_ahci_dma_read(Sim_Addr_Space_Memory,
+                                 cast(&prd, uint8 *),
+                                 prdt_addr,
+                                 sizeoftype(phys_region_desc_t));
+
+        local int bytes_stored = *byte_cnt;
+        local int store_size =
+            ((prd.dw3.dbc + 1 - $prdt_pos) < (data_len - bytes_stored)
+             ? prd.dw3.dbc + 1 - $prdt_pos: data_len - bytes_stored);
+        assert store_size > 0;
+
+        local physical_address_t data_base_addr;
+        call $get_data_base_addr(prd) -> (data_base_addr);
+        call $sata_ahci_dma_write(Sim_Addr_Space_Memory, 
+                                  fis_data + 4 + bytes_stored, 
+                                  data_base_addr + $prdt_pos, 
+                                  store_size);
+
+        *byte_cnt += store_size;
+        bytes_stored = *byte_cnt;
+
+        if (prd.dw3.int_on_comp == 1)
+            $p_prd_intr = 1;
+        log "info", 4: "%s: %u/%u bytes from Data FIS stored at 0x%x.",
+            $qname, bytes_stored, data_len, data_base_addr + $prdt_pos;
+        if (bytes_stored >= data_len
+            && prd.dw3.dbc + 1 > $prdt_pos + store_size) {
+            // Last one, Remember position for next store
+            $prdt_pos += store_size;
+        } else {
+            $current_prdt += 1;
+            $prdt_pos = 0;
+        }
+    }
+
+    /* Check that FIS has expected length */
+    method illegal_fis() {
+        log "info", 2: "Incorrect FIS or illegal length FIS received";
+        $sata.serr.p = 1;
+        call $isr.raise(ISR_INFS); /* Non-fatal */
+    }
+
+    /* Fill buf which needs to be transferred to device */
+    method fill_transfer_data(uint8 *buf, const size_t transmit_len) {
+        assert transmit_len > 0;
+
+        local physical_address_t cfis_base_addr;
+        call $get_base_addr($cmdheader.ctbau, $cmdheader.dw2.ctba << 7)
+            -> (cfis_base_addr);
+
+        /* A maximum length of 4MB may exist for any entry */
+        local physical_address_t data_base_addr;
+        /* Bytes in current PRDT */
+        local uint32 prdt_byte_cnt = 0;
+        /* Bytes been passed without read */
+        local uint32 byte_passed = 0;
+        /* Bytes been read into buffer */
+        local uint32 byte_read = 0;
+        /* Bytes offset in current PRDT to read data from */
+        local uint32 prdt_byte_idx = 0;
+        /* Bytes to be read out from current PRDT */
+        local uint32 prdt_byte_len = 0;
+        local phys_region_desc_t prdt;
+        local int entries_left = $cmdheader.dw0.prdtl;
+        local physical_address_t prdt_addr = cfis_base_addr + PRDT_OFFSET;
+        while (byte_passed < $p_transmitted + transmit_len) {
+            assert entries_left > 0;
+
+            call $sata_ahci_dma_read(Sim_Addr_Space_Memory,
+                                     cast(&prdt, uint8 *),
+                                     prdt_addr,
+                                     sizeoftype(phys_region_desc_t));
+            prdt_byte_cnt = (prdt.dw3.dbc | 1) + 1;
+            byte_passed += prdt_byte_cnt;
+            if (byte_passed > $p_transmitted) {
+                /* Need to read out data from this block */
+                /* Determine how many bytes need to be read out */
+                if (byte_read == 0) {
+                    prdt_byte_idx = $p_transmitted - byte_passed + prdt_byte_cnt;
+                    if (byte_passed >= $p_transmitted + transmit_len)
+                        prdt_byte_len = transmit_len;
+                    else
+                        prdt_byte_len = byte_passed - $p_transmitted;
+                } else {
+                    prdt_byte_idx = 0;
+                    if (byte_passed >= $p_transmitted + transmit_len)
+                        prdt_byte_len = $p_transmitted + transmit_len - byte_passed + prdt_byte_cnt;
+                    else
+                        prdt_byte_len = prdt_byte_cnt;
+                }
+
+                call $get_data_base_addr(prdt) -> (data_base_addr);
+                // TODO: What happen if prdt_byte_len is 0
+                if (prdt_byte_len == 0)
+                    log "spec_violation", 1: "prdt byte length is 0";
+                call $sata_ahci_dma_read(Sim_Addr_Space_Memory, 
+                                         buf + byte_read,
+                                         data_base_addr + prdt_byte_idx,
+                                         prdt_byte_len);
+                byte_read += prdt_byte_len;
+            }
+
+            /* Pass on to the next item */
+            entries_left -= 1;
+            prdt_addr += sizeoftype(phys_region_desc_t);
+        }
+    }
+}
+
+template sata_port {
+    parameter port_group default undefined;
+    implement sata {
+        method receive_fis(bytes_t fis) {
+            call $port_group.receive_fis(fis);
+        }
+    }
+}
+
+template isr {
+    method write(value) {
+        local int clear_bits = 0xfd8000af & value;
+        $this &= ~clear_bits;
+
+        if (value != 0xffffffff) {
+            // Keep spec violation silent when all 1's are written
+            if (value[22,le] != $this[22,le])
+                log "spec_violation", 2:
+                    "Write to read-only field ISR.PRCS (content=%d, value=%d)",
+                    $this[22,le], value[22,le];
+            if (value[6,le] != $this[6,le])
+                log "spec_violation", 2:
+                    "Write to read-only field ISR.PCS (content=%d, value=%d)",
+                    $this[6,le], value[6,le];
+            if (value[4,le] != $this[4,le])
+                log "spec_violation", 2:
+                    "Write to read-only field ISR.UFS (content=%d, value=%d)",
+                    $this[4,le], value[4,le];
+            if ((value[25,le] != 0) || value[21:8,le] != 0)
+                log "spec_violation", 2:
+                    "Write to reserved fields in %s", $qname;
+        }
+    }
+
+    // propagate interrupt status to ahci.isr
+    method update_interrupts() {
+        local bool high = (($this & $ie) != 0);
+        if (high)
+            $ahci.isr[$port_num] = 1;
+    }
+
+    // propagate interrupt status to ahci.isr and update IRQ line/raise MSI
+    method update_interrupts_and_irq() {
+        local bool was_high = ($ahci.isr[$port_num] == 1);
+        call $update_interrupts();
+        local bool is_high = ($ahci.isr[$port_num] == 1);
+
+        if (!was_high && is_high)
+            call $update_irq();
+    }
+
+    method raise(uint32 bit) {
+        if (!$this[bit]) {
+            log "info", 4: "set bit %d of %s", bit, $qname;
+
+            $this[bit] = 1;
+            call $update_interrupts_and_irq();
+        }
+    }
+
+    method lower(uint32 bit) {
+        if ($this[bit])
+            log "info", 4: "clear bit %d of %s", bit, $qname;
+
+        $this[bit] = 0;
+    }
+}
+
+// Common methods
+
+/* Return all kinds of base address */
+method get_base_addr(uint32 upper, uint32 lower) 
+    -> (physical_address_t addr) {
+    addr = EXT_ADDR(lower, upper, $ahci.cap.s64a);
+}
+
+/* Return data base address */
+method get_data_base_addr(phys_region_desc_t prd) 
+    -> (physical_address_t addr) {
+    call $get_base_addr(prd.dbau, prd.dw0.dba << 1) -> (addr);
+}
+
+/* Return command header */
+method get_command_header(physical_address_t base_addr, uint8 index, 
+                          command_header_t *cmd_header) {
+    /* Check command entry index range */
+    assert index <= $ahci.cap.ncs;
+
+    local physical_address_t cmd_addr = base_addr 
+        + COMMAND_LIST_ENTRY_SIZE * index;
+    call $sata_ahci_dma_read(Sim_Addr_Space_Memory,
+                             cast(cmd_header, uint8*), 
+                             cmd_addr, COMMAND_LIST_ENTRY_SIZE);
+
+    log "info", 4: "Get command header %d from memory at 0x%x: PRDTL(%d), PMP(%d), C(%d), B(%d), R(%d), P(%d), W(%d), A(%d), CFL(%d), PRDBC(0x%x), CTBA(0x%x), CTBAU(0x%x)",
+        index, cmd_addr,
+        cmd_header->dw0.prdtl, cmd_header->dw0.pmp,
+        cmd_header->dw0.clear, cmd_header->dw0.bist,
+        cmd_header->dw0.reset, cmd_header->dw0.pref,
+        cmd_header->dw0.write, cmd_header->dw0.atapi,
+        cmd_header->dw0.cfl,   cmd_header->prdbc,
+        cmd_header->dw2.ctba,  cmd_header->ctbau;
+
+    /* Optional. Check cmd_header */
+    if (cmd_header->dw0.cfl == 0 || cmd_header->dw0.cfl == 1)
+        log "spec_violation", 1: "Length of Command FIS can not be 0 or 1";
+    else if (cmd_header->dw0.cfl > 16) {
+        log "spec_violation", 1:
+            "Length of Command FIS can not exceed 16, truncating to 16";
+        cmd_header->dw0.cfl = 16;
+    }
+
+}
+
+/* Increase the prdbc field by amount for the command header at base_addr */
+method increase_cmdheader_prdbc(physical_address_t base_addr, uint8 index,
+                                uint32 amount) {
+    local uint32 bytes;
+    local physical_address_t prdbc_addr = base_addr
+        + COMMAND_LIST_ENTRY_SIZE * index + 4;
+    call $sata_ahci_dma_read(Sim_Addr_Space_Memory,
+                             cast(&bytes, uint8*),
+                             prdbc_addr, sizeof(bytes));
+
+    bytes += amount;
+    call $sata_ahci_dma_write(Sim_Addr_Space_Memory,
+                              cast(&bytes, uint8*),
+                              prdbc_addr, sizeof(bytes));
+
+    log "info", 4: "Updated PRDBC at address 0x%x, new value is %d",
+        prdbc_addr, bytes;
+}
+
+/* Return ATAPI command (12 or 16 bytes) */
+method get_atapi_cmd(command_header_t cmdheader, int len) -> (bytes_t acmd) {
+    local physical_address_t cfis_base_addr;
+    call $get_base_addr(cmdheader.ctbau, cmdheader.dw2.ctba << 7)
+        -> (cfis_base_addr);
+
+    if (len != 12 && len != 16) {
+        log "error", 1: "ATAPI command not in 12 or 16 bytes.";
+        return;
+    }
+    local uint8 *buf = new uint8[len + 4];
+    call $sata_ahci_dma_read(Sim_Addr_Space_Memory, buf + 4, 
+                             cfis_base_addr + ACMD_OFFSET, len);
+
+    buf[0] = FIS_DATA_BI;
+    buf[1] = cmdheader.dw0.pmp & 0x0F;
+    // set PM port according to SATA spec chapter 10.3.11
+    acmd.data = buf;
+    acmd.len = len + 4;
+}
+
+method get_transfer_size(command_header_t cmdheader) -> (size_t size) {
+    local physical_address_t cfis_base_addr;
+    call $get_base_addr(cmdheader.ctbau, cmdheader.dw2.ctba << 7)
+        -> (cfis_base_addr);
+
+    if (cmdheader.dw0.prdtl == 0) {
+        /* No data transfer shall occur */
+        return;
+    }
+
+    /* Calc the total byte count */
+    local phys_region_desc_t prdt;
+    local int entries_left = cmdheader.dw0.prdtl;
+    local physical_address_t prdt_addr = cfis_base_addr + PRDT_OFFSET;
+    while (entries_left > 0) {
+        call $sata_ahci_dma_read(Sim_Addr_Space_Memory,
+                                 cast(&prdt, uint8 *), prdt_addr,
+                                 sizeoftype(phys_region_desc_t));
+
+        size += (prdt.dw3.dbc | 1) + 1;
+        entries_left -= 1;
+        prdt_addr += sizeoftype(phys_region_desc_t);
+    }
+}
+
+method sata_ahci_dma_read(addr_space_t type, uint8 *buf,
+                          physical_address_t addr, uint32 size)  {
+    local exception_type_t ex;
+    call $pci_data_from_memory(type, buf, addr, size) -> (ex);
+    if (ex != Sim_PE_No_Exception)
+        log "error", 1, PCI_DMA: 
+            "Unexpected read error from 0x%x, with %d bytes",
+            addr, size;
+}
+
+method sata_ahci_dma_write(addr_space_t type, const uint8 *buf,
+                           physical_address_t addr, uint32 size)  {
+    local exception_type_t ex;
+    call $pci_data_to_memory(type, buf, addr, size) -> (ex);
+    if (ex != Sim_PE_No_Exception)
+        log "error", 1, PCI_DMA: 
+            "Unexpected write error to 0x%x, with %u bytes",
+            addr, size;
+}
+
+method receive_fis_log(const char *msg) {
+    log "info", 2: "%s: FIS received while %s. Ignored.", $qname, msg;
+}
+
+
+/* Generate possible interrupt */
+method update_irq() {
+    if ($ahci.isr != 0 && $ahci.ghc.ie == 1) {
+        if ($pci_config.msi_control.msie == 1) {
+            log "info", 3: "MSI: writing 0x%04x to 0x%016x",
+                $pci_config.msi_data,
+                $pci_config.msi_address;
+
+            local exception_type_t ex;
+            call $pci_value_to_memory(
+                Sim_Addr_Space_Memory,
+                    $pci_config.msi_data,
+                $pci_config.msi_address,
+                $pci_config.msi_data.size) -> (ex);
+        } else
+                call $pci_config.pci_raise_interrupt();
+    } else
+        call $pci_config.pci_lower_interrupt();
+}
+
+method before_hard_reset() {
+    // Clear all pending interrupts
+    call $pci_config.pci_lower_interrupt();
+}

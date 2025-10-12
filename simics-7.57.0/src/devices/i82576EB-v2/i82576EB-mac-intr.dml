@@ -1,0 +1,34 @@
+/*
+  i82576EB-mac-intr.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+constant ITR_UNIT = 2.56e-7; /* 256 ns */
+
+constant INTR_TXDW     = 1;		// Transmit Descriptor Written Back
+constant INTR_LSC      = 1 << 2;	// Link Status Change
+constant INTR_RXDMT0   = 1 << 4;	// Receive Descriptor Minimum Threshold hit
+constant INTR_RXO      = 1 << 6;	// Receive Overrun
+constant INTR_RXTO     = 1 << 7;	// Receive Timer Interrupt
+constant INTR_TCP      = 1 << 30;       // TCP Timer
+
+parameter EITR_CNT = 24;
+parameter IVAR_CNT = 32;
+
+bank csr {
+    /* --------------------------------------------------------------
+       INTERRUPT REGISTERS
+       -------------------------------------------------------------- */
+}

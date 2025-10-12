@@ -1,0 +1,491 @@
+/*
+  sata-pci.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "utility.dml";
+import "simics/devs/pci.dml";
+import "pci/common.dml";
+is pci_device;
+
+bank pci_config {
+    is pci_config_sata_common;
+}
+
+template pci_config_sata_common {
+    register vendor_id     { parameter hard_reset_value = 0x8086; }
+    register command       { parameter hard_reset_value = 0x0000; }
+    register status        { parameter hard_reset_value = 0x02b0; }
+    register class_code    { parameter hard_reset_value = 0x01018a; }
+    register latency_timer { parameter hard_reset_value = 0x00; }
+    register header_type   { parameter hard_reset_value = 0x00; }
+
+    register pcmd_bar @ 0x10 "Primary Command Block Base Address";
+    register pcnl_bar @ 0x14 "Primary Control Block Base Address";
+    register scmd_bar @ 0x18 "Secondary Command Block Base Address";
+    register scnl_bar @ 0x1c "Secondary Control Block Base Address";
+    register bar      @ 0x20 "Legacy Bus Master Base Address";
+
+    register ide_tim[2] size 2 @ (0x40 + 2*$i) {
+        parameter desc = "Primary/Secondary IDE Timing Register";
+    }
+
+    // Power Management Capability
+    // The defining_pci_power_management_capability template defined
+    // in pci_common.dml unfortunately can not be used here.
+    register pid  size 2 @ 0x70;
+    register pc   size 2 @ 0x72;
+    register pmcs size 2 @ 0x74;
+
+    // MSI Capability
+    parameter msi_offset   = 0x80;
+    parameter msi_next_ptr = 0x70;
+    is defining_pci_msi_capability;
+    register msi_control {
+        field msie {
+            method write(value) {
+                local bool is_ide;
+                inline $sata_is_ide_controller() -> (is_ide);
+                if (is_ide) {
+                    log "spec_violation", 1: "Write to read-only field %s",
+                        $qname;
+                    return;
+                }
+                if ($this != value && value == 1)
+                    log "info", 2: "MSI is enabled.";
+                $this = value;
+            }
+        }
+        
+    }
+
+    register map    size 2 @ 0x90 "Address Map";
+    register pcs    size 2 @ 0x92 "Port Control and Status";
+
+    // SATA Capability
+    parameter sata_capability_offset = 0xa8;
+    is defining_sata_capability;
+
+    // FLR Capability
+    parameter flr_offset   = 0xb0;
+    parameter flr_next_ptr = 0x00;
+    is defining_flr_capability;
+
+    register atc   size 1 @ 0xc0 "APM Trapping Control";
+    register ats   size 1 @ 0xc4 "ATM Trapping Status";
+}
+
+method sata_is_ide_controller() -> (yes) {
+    local uint8 scc;
+    inline $pci_config.get_SCC() -> (scc);
+    yes = scc == 0x01;
+}
+
+method sata_is_ahci_controller() -> (yes) {
+    local uint8 scc;
+    inline $pci_config.get_SCC() -> (scc);
+    yes = scc == 0x06;
+}
+
+method sata_is_raid_controller() -> (yes) {
+    local uint8 scc;
+    inline $pci_config.get_SCC() -> (scc);
+    yes = scc == 0x04;
+}
+
+// Register/Field whose value is read-only 0 when SCC is 0x01
+template ide_read_only_zero {
+    parameter normal_value default undefined;
+    is _reg_or_field;
+
+    method normal_read() -> (value) default {
+        if (defined $normal_value)
+            value = $normal_value;
+        else
+            value = $this;
+    }
+    method normal_write(value) default {
+        if (defined $normal_value) {
+            static uint8 log_level = 1;
+            log "spec_violation", log_level, Register_Write:
+                "write to read-only %s %s (value written %#x, content %#x).",
+                $reg_or_field, $qname, value, $normal_value;
+            log_level = 2;
+        } else
+            $this = value;
+    }
+    method read() -> (value) {
+        local bool is_ide;
+        inline $sata_is_ide_controller() -> (is_ide);
+        if (is_ide)
+            value = 0;
+        else
+            inline $normal_read() -> (value);
+    }
+    method write(value) {
+        static uint8 log_level = 1;
+        local bool is_ide;
+        inline $sata_is_ide_controller() -> (is_ide);
+        if (is_ide) {
+            log "spec_violation", log_level, Register_Write:
+                "write to read-only (IDE mode) %s %s (value written = %#x).",
+                $reg_or_field, $qname, value;
+            log_level = 2;
+        }
+        else
+            inline $normal_write(value);
+    }
+}
+
+template ide_base_address {
+    is io_base_address;
+    parameter ch default undefined;
+    parameter legacy_base_address default undefined;
+
+    method pci_mapping_enabled() -> (bool enabled) {
+        enabled = $pci_config.ide_tim[$ch].ide != 0;
+    }
+    method pci_mapping_base() -> (map_base) {
+        if ($pci_config.class_code[$ch*2]) {    // native mode
+            inline $get_base() -> (map_base);
+            map_base <<= $base.lsb;
+        } else {                    // legacy mode
+            map_base = $legacy_base_address;
+        }
+    }
+    method pci_mapping_object() -> (conf_object_t *obj) {
+        obj = $ide[$ch].obj;
+    }
+}
+
+template ide_command_block_base_address {
+    is ide_base_address;
+    parameter size_bits = 3;
+    parameter map_func = 0;
+    parameter legacy_base_address = $ch == 0 ? 0x1f0 : 0x170;
+}
+
+template ide_control_block_base_address {
+    is ide_base_address;
+    parameter size_bits = 2;
+    parameter map_func = 1;
+    parameter legacy_base_address = $ch == 0 ? 0x3f4 : 0x374;
+    method pci_mapping_customize(map_info_t *info) {
+        info->start = 6;
+    }
+}
+
+template defining_sata_capability {
+    parameter sata_capability_offset default undefined;
+
+    register sata_capability_header {
+        parameter offset = $sata_capability_offset;
+        parameter size = 4;
+
+        field majrev   [23:20] "Major Revision";
+        field minrev   [19:16] "Minor Revision";
+        field next_ptr [15: 8] "Next Capability Pointer";
+        field id       [ 7: 0] "Capability ID";
+    }
+    register sata_capability_bar {
+        parameter offset = $sata_capability_offset + 4;
+        parameter size = 4;
+
+        field barofst [15: 4] "BAR Offset";
+        field barloc  [ 3: 0] "BAR Location";
+    }
+}
+
+template defining_flr_capability {
+    parameter flr_offset default undefined;
+    parameter flr_next_ptr default undefined;
+
+    register flr_cap  size 1 @ $flr_offset       "Capability ID";
+    register flr_next size 1 @ ($flr_offset + 1) is (constant) {
+        parameter desc = "Next Capability Pointer";
+        parameter value = $flr_next_ptr;
+    }
+    register flr_clv_lo size 1 @ ($flr_offset + 2) {
+        parameter desc = "Vendor-Specific Capability ID";
+    }
+    register flr_clv_hi size 1 @ ($flr_offset + 3) {
+        parameter desc = "FLR Capability Length and Version";
+    }
+    register flr_control size 2 @ ($flr_offset + 4) {
+        parameter desc = "FLR Control";
+    }
+}
+
+method get_flrcssel_value() -> (int value) {
+    local uint32 gcs;
+    call $read_chipset_config(0x3410) -> (gcs);
+    value = gcs[12];
+}
+
+// Register/Field whose value/behavior depends on the
+// value of FLRCSSEL
+template flrcssel_dependent {
+    is _reg_or_field;
+    method read() -> (value) {
+        local int flrcssel;
+        call $get_flrcssel_value() -> (flrcssel);
+        if (flrcssel == 0)
+            inline $flrcssel_0_read() -> (value);
+        else
+            inline $flrcssel_1_read() -> (value);
+    }
+    method write(value) {
+        local int flrcssel;
+        call $get_flrcssel_value() -> (flrcssel);
+        if (flrcssel == 0)
+            inline $flrcssel_0_write(value);
+        else
+            inline $flrcssel_1_write(value);
+    }
+    method flrcssel_0_read() -> (value) default {
+        error;
+    }
+    method flrcssel_1_read() -> (value) default {
+        error;
+    }
+    method flrcssel_0_write(value) default {
+        error;
+    }
+    method flrcssel_1_write(value) default {
+        error;
+    }
+}
+
+template flrcssel_dependent_constant {
+    parameter allocate = false;
+    parameter configuration = "pseudo";
+
+    is flrcssel_dependent;
+
+    parameter flrcssel_0_value default undefined;
+    parameter flrcssel_1_value default undefined;
+
+    method get() -> (value) {
+        if (SIM_object_is_configured($dev.obj))
+            inline $read() -> (value);
+        else
+            value = 0;
+    }
+    method flrcssel_0_read() -> (value) {
+        value = $flrcssel_0_value;
+    }
+    method flrcssel_1_read() -> (value) {
+        value = $flrcssel_1_value;
+    }
+    method flrcssel_0_write(value) {
+        inline $invalid_write(value, $flrcssel_0_value);
+    }
+    method flrcssel_1_write(value) {
+        inline $invalid_write(value, $flrcssel_1_value);
+    }
+    method invalid_write(value, content) {
+        static uint8 log_level = 1;
+        log "spec_violation", log_level, Register_Write:
+            "%s %s %s (value written = %#x, content = %#x).",
+            "Write to read-only",
+            $reg_or_field, $qname, value, content;
+        log_level = 2;
+    }
+}
+
+bank pci_config {
+    register latency_timer is (silent_constant);
+
+    register pcmd_bar {
+        parameter ch = 0;
+        is ide_command_block_base_address;
+    }
+    register pcnl_bar {
+        parameter ch = 0;
+        is ide_control_block_base_address;
+    }
+    register scmd_bar {
+        parameter ch = 1;
+        is ide_command_block_base_address;
+    }
+    register scnl_bar {
+        parameter ch = 1;
+        is ide_control_block_base_address;
+    }
+    register bar {
+        parameter map_func = $bm.function;
+        is io_base_address;
+
+        method pci_bar_size_bits() -> (int bits) {
+            local uint8 scc;
+            inline $get_SCC() -> (scc);
+            bits = (scc == 0x01) ? 4 : 5;
+        }
+    }
+
+    register ide_tim[2] {
+        field ide [15:15] "IDE Decode Enable";
+    }
+
+    register pid is (read_only) {
+        parameter desc = "PCI Power Management Capability "
+                       + "Identification Register";
+        parameter allocate = false;
+        parameter configuration = "pseudo";
+        method get() -> (value) {
+            local uint8 scc;
+            inline $get_SCC() -> (scc);
+            if (scc == 0x01)   // IDE mode
+                value = 0xb001;
+            else
+                value = 0xa801;
+        }
+        method read() -> (value) {
+            inline $get() -> (value);
+        }
+    }
+    register pc is (read_only) {
+        parameter desc = "PCI Power Management Capabilities";
+        parameter allocate = false;
+        parameter configuration = "pseudo";
+        method get() -> (value) {
+            local uint8 scc;
+            inline $get_SCC() -> (scc);
+            if (scc == 0x01)   // IDE mode
+                value = 0x0003;
+            else
+                value = 0x4003;
+        }
+        method read() -> (value) {
+            inline $get() -> (value);
+        }
+    }
+    register pmcs {
+        parameter desc = "PCI Power Management Control and Status";
+        field pmes [15:15] "PME Status" {
+            method read() -> (value) {
+                local uint8 scc;
+                inline $get_SCC() -> (scc);
+                if (scc == 0x01)   // IDE mode
+                    value = 0;
+                else
+                    value = $this;
+            }
+            method write(value) {
+                local uint8 scc;
+                inline $get_SCC() -> (scc);
+                if (scc != 0x01)
+                    $this &= ~value;
+            }
+        }
+        field pmee [8:8]   "PME Enable" {
+            method read() -> (value) {
+                local uint8 scc;
+                inline $get_SCC() -> (scc);
+                if (scc == 0x01)   // IDE mode
+                    value = 0;
+                else
+                    value = $this;
+            }
+            method write(value) {
+                local uint8 scc;
+                inline $get_SCC() -> (scc);
+                if (scc != 0x01)
+                    $this = value;
+            }
+        }
+        // ICH specific field implementation
+        field nsfrst [3:3] is (read_only) "No Soft Reset" {
+            parameter hard_reset_value = 1;
+        }
+        field ps     [1:0] is (unimplemented) "Power State";
+    }
+
+    register sata_capability_header {
+        field majrev is (ide_read_only_zero) {
+            parameter normal_value = 0x1;
+        }
+        field minrev is (ide_read_only_zero) {
+            parameter normal_value = 0x0;
+        }
+        field next_ptr is (ide_read_only_zero) {
+            parameter normal_value = 0xb0;
+        }
+        field id is (ide_read_only_zero) {
+            parameter normal_value = 0x12;
+        }
+    }
+    register sata_capability_bar {
+        field barofst is (ide_read_only_zero) {
+            parameter normal_value = 0x004;
+        }
+        field barloc is (ide_read_only_zero) {
+            parameter normal_value = 0x8;
+        }
+    }
+
+    register flr_cap is (flrcssel_dependent_constant) {
+        parameter flrcssel_0_value = 0x13;
+        parameter flrcssel_1_value = 0x09;
+    }
+    register flr_clv_lo is (constant) {
+        parameter value = 0x06;
+    }
+    register flr_clv_hi is (flrcssel_dependent) {
+        parameter hard_reset_value = 0x03;
+        parameter flrcssel_1_value = 0x20;
+
+        method flrcssel_0_read() -> (value) {
+            value = $this;
+        }
+        method flrcssel_1_read() -> (value) {
+            value = $flrcssel_1_value;
+        }
+        method flrcssel_0_write(value) {
+            // TXP and FLR are write-once bits with default value of 1
+            if ($this[0] == 1 && value[0] == 0)
+                $this[0] = 0;
+            if ($this[1] == 1 && value[1] == 0)
+                $this[1] = 0;
+        }
+        method flrcssel_1_write(value) {
+            static uint8 log_level = 1;
+            log "spec_violation", log_level, Register_Write:
+                "%s %s %s (value written = %#x, content = %#x).",
+                "Write to read-only",
+                $reg_or_field, $qname, value,
+                $flrcssel_1_value;
+            log_level = 2;
+        }
+        method get() -> (value) {
+            if (SIM_object_is_configured($dev.obj))
+                inline $read() -> (value);
+            else
+                value = 0;
+        }
+    }
+    register flr_control {
+        field txp  [8:8] "Transactions Pending" {
+            is read_only;
+        }
+        field iflr [0:0] "Initiate FLR" {
+            is unimplemented;
+        }
+    }
+
+    method get_SCC() -> (value) {
+        value = $pci_config.class_code[15:8];
+    }
+}

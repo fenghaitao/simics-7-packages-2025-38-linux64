@@ -1,0 +1,37 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/model-iface/describe-registers.h>
+%}
+
+import "simics/simulator-api.dml";
+
+extern typedef int description_type_t;
+constant Description_Type_Group = 0;
+constant Description_Type_Int_Reg = 1;
+constant Description_Type_Float_Reg = 2;
+constant Description_Type_Fields_Reg = 3;
+constant Description_Type_Int_Field = 4;
+constant Description_Type_Float_Field = 5;
+extern typedef int reg_role_t;
+constant Reg_Role_None = 0;
+constant Reg_Role_Program_Counter = 1;
+extern typedef int reg_bitorder_t;
+constant Reg_Bitorder_Little_Endian = 0;
+constant Reg_Bitorder_Big_Endian = 1;
+extern typedef struct { char const *name; char const *description; bytes_t const value; } named_value_t;
+extern typedef struct { description_type_t type; char const *name; char const *description; int16 dwarf_id; reg_bitorder_t bitorder; reg_role_t role; bool memory_mapped; uint64 offset; bool catchable; int msb; int lsb; int regsize; int reg_id; } description_t;
+extern typedef struct { description_t const *(*first_child)(conf_object_t *obj, description_t const *parent); description_t const *(*next_description)(conf_object_t *obj, description_t const *prev); void (*free_description)(conf_object_t *obj, description_t const *desc); named_value_t const *(*first_named_value)(conf_object_t *obj, description_t const *parent); named_value_t const *(*next_named_value)(conf_object_t *obj, named_value_t const *prev); void (*free_named_value)(conf_object_t *obj, named_value_t const *nv); void (*get)(conf_object_t *obj, int reg_id, buffer_t dest); void (*set)(conf_object_t *obj, int reg_id, bytes_t value); } describe_registers_interface_t;

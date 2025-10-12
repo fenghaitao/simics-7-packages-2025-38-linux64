@@ -1,0 +1,1943 @@
+/*
+  ehci.dml - USB EHCI common code
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "io-memory.dml";
+import "usb/internal/host.dml";
+
+parameter usb_ehci_limitations
+    = "<li>Interrupt and Isochronous transfers not supported</li>"
+    + "<li>Cannot handle when USB devices send NAK or STALL"
+    + " status during Control and Bulk transfers</li>"
+    + "<li>Cannot handle USB devices with a latency"
+    + " (<fun>submit_transfer</fun> must return"
+    + " <const>USB_Transfer_Completed</const>)</li>"
+    + "<li>Bulk and Control transfers will only be initiated while the"
+    + " attribute <attr>async_list_polling_enabled</attr> is set.</li>"
+    + $async_sched_park_limitation;
+
+parameter async_sched_park_limitation
+    = $usb_regs.hccparams.async_sched_park.enabled
+    ? "<li>Asynchronous schedule park capability not implemented.</li>"
+    : "";
+
+parameter use_async_sched_park default false;
+parameter use_4_2_api default false;
+parameter hcsp_portroute_enable default true;
+
+parameter CAPLENGTH default undefined;
+parameter ASYNC_LIST_UPDATE_FREQ = 0.001;
+parameter PERIODIC_LIST_UPDATE_FREQ = 0.000125;
+parameter EECP default undefined;
+
+loggroup log_usb_common;
+
+constant USB_EHCI_Typ_iTD = 0;
+constant USB_EHCI_Typ_QH  = 1;
+constant USB_EHCI_siTD    = 2;
+constant USB_EHCI_FSTN    = 3;
+
+constant USB_EHCI_PID_Code_Out   = 0;
+constant USB_EHCI_PID_Code_In    = 1;
+constant USB_EHCI_PID_Code_Setup = 2;
+
+constant USB_EHCI_INT_USBINT              = 0;
+constant USB_EHCI_INT_USBERRINT           = 1;
+constant USB_EHCI_INT_PORT_CHANGE_DETECT  = 2;
+constant USB_EHCI_INT_FRAME_LIST_ROLLOVER = 3;
+constant USB_EHCI_INT_HOST_SYSTEM_ERROR   = 4;
+constant USB_EHCI_INT_ASYNC_ADVANCE       = 5;
+
+struct usb_ehci_frame_list_entry_t {
+    /* Frame List Link pointers always reference
+       memory objects that are 32-byte aligned.
+       (frame_list_pointer[4:0] is always 0) */
+    uint32 frame_list_link_pointer;
+    uint2  type;
+    uint1  terminate;
+}
+
+struct usb_ehci_qtd_t {
+
+    uint32 next_qtd;
+    uint1  next_qtd_terminate;
+    uint32 alt_next_qtd;
+    uint4  nac_cnt;
+    uint1  alt_next_qtd_terminate;
+
+    uint1  data_toggle;
+    uint15 bytes_to_transfer;
+    uint1  ioc;
+    uint3  c_page;
+    uint2  cerr;
+    uint2  pid;
+    uint1  status_active;
+    uint1  status_halted;
+    uint1  status_data_buffer_error;
+    uint1  status_babble_detected;
+    uint1  status_xacterr;
+    uint1  status_missed_mframe;
+    uint1  status_spitxstate;
+    uint1  status_ping_state;
+
+    uint12 current_offset;
+    uint20 buffer_ptr[5];
+
+    /* only used in 64-bit mode */
+    uint32 ext_buffer_ptr[5];
+}
+
+struct usb_ehci_qh_t {
+
+    uint32 link_ptr;
+    uint2  typ;
+    uint1  terminate;
+
+    uint4  rl;
+    uint1  c;
+    uint11 max_packet_len;
+    uint1  head;
+    uint1  dtc;
+    uint2  eps;
+    uint4  endpoint;
+    uint1  i;
+    uint7  device_addr;
+
+    /* not used */
+    /*
+    uint7  port;
+    uint7  hub_addr;
+    uint8  c_mask;
+    */
+
+    uint2  mult;
+    uint8  s_mask;
+    uint32 current_qtd_ptr;
+
+    // overlay
+    usb_ehci_qtd_t qtd;
+}
+
+struct usb_ehci_queue_t {
+
+    // the queue head
+    usb_ehci_qh_t qh;
+
+    // send state
+    int exec_state;
+
+    usb_transfer_t transfer;
+}
+
+template defining_debug_port_capability {
+    parameter dbg_port_offset   default undefined;
+    parameter dbg_port_next_ptr default undefined;
+    parameter dbg_port_bar_num  default undefined;
+    parameter dbg_port_bar_off  default undefined;
+
+    register dbg_capid    size 1 @ ($dbg_port_offset + 0x0)
+                "Debug Port Capability ID Register";
+    register dbg_next_ptr size 1 @ ($dbg_port_offset + 0x1)
+                "Next Item Pointer #2 Register";
+    register dbg_base     size 2 @ ($dbg_port_offset + 0x2)
+                "Debug Port Base Offset Register";
+
+    register dbg_capid    is (constant) { parameter value = 0x0A; }
+    register dbg_next_ptr is (constant) { parameter value = $dbg_port_next_ptr;}
+    register dbg_base  {
+        field bar_num[15:13] "Bar Number used by the Residing EHCI Bank" {
+            is constant;
+            parameter value = $dbg_port_bar_num;
+        }
+        field port_off[12:0] "Debug Port Register Offset in the EHCI Bank" {
+            is constant;
+            parameter value = $dbg_port_bar_off;
+        }
+    }
+}
+
+template defining_usb2_debug_port_registers {
+    parameter usb2_debug_port_reg_off default undefined;
+
+    // Internal constants
+    parameter usb2_dbg_port_ex_no_err = 0b000;
+    parameter usb2_dbg_port_ex_tr_err = 0b001; // Transaction Error
+    parameter usb2_dbg_port_ex_hw_err = 0b010; // Hardware Error
+
+    register ctrl_status size 4 @ ($usb2_debug_port_reg_off + 0x00)
+                "Control/Status Register";
+    register usb_pids    size 4 @ ($usb2_debug_port_reg_off + 0x04)
+                "USB PIDs Register";
+    register data_buf    size 8 @ ($usb2_debug_port_reg_off + 0x08)
+                "Data Buffer Register";
+    register dev_addr    size 4 @ ($usb2_debug_port_reg_off + 0x10)
+                "Device Address Register";
+
+    register ctrl_status {
+        field owner[30] "Owner";
+        field enabled[28] "Enabled";
+        field done[16] is (write_1_clears) "Done";
+        field in_use[10] "In Use";
+        field ex[9:7] is (read_only) "Exception";
+        field err[6]  is (read_only) "Error/Good";
+        field go[5] "Go";
+        field rw[4] "Read/Write";
+        field len[3:0] "Data Length";
+    }
+
+    register usb_pids {
+        field r_pid[23:16] is (read_only) "Received PID";
+        field s_pid[15:8]  "Send PID";
+        field t_pid[7:0]   "Token PID";
+    }
+
+    register dev_addr {
+        field usb_addr[14:8] "USB Address";
+        field usb_ep[3:0]    "USB Endpoint";
+
+        field usb_addr { parameter hard_reset_value = 0x7F; }
+        field usb_ep   { parameter hard_reset_value = 0x1;  }
+    }
+
+    register ctrl_status {
+        field go {
+            method write(val) {
+                // Port index
+                local int   p = $usb_regs.hcsparams.debug_port_number - 1;
+                local uint8 pid = $usb_pids.t_pid;
+                local usb_transfer_t trans;
+                local usb_transfer_completion_t rslt;
+
+                if (val == 0)
+                    return;
+
+                if ($enabled == 0 || $owner == 0) {
+                    log info, 3: "debug port %d is %s", p,
+                        ($owner == 0) ? "not owned by the debug capability"
+                                      : "disabled";
+                    $err  = 1;
+                    $ex   = $usb2_dbg_port_ex_hw_err;
+                    $done = 1;
+                    $this = 0;
+                    return;
+                }
+
+                if (pid == $USB_PID_SOF) {
+                    log info, 4: "no need to send a SOF packet";
+                    return;
+                } else if (pid != $USB_PID_IN &&
+                           pid != $USB_PID_OUT &&
+                           pid != $USB_PID_SETUP) {
+                    log info, 3: "unsupported pid %d to port %d", pid, p;
+                    return;
+                }
+
+                if (pid == $USB_PID_SETUP) {
+                    if ($len != 8 || $rw == 0) {
+                        log info, 3:
+                            "a SETUP packet must have set %s and %s",
+                            "Write/Read# bit", "'Data Length' to 8";
+                        $err  = 1;
+                        $ex   = $usb2_dbg_port_ex_tr_err;
+                        $done = 1;
+                        $this = 0;
+                        return;
+                    }
+                    memcpy(&trans.u.control_request, &$data_buf, 8);
+                }
+
+                trans.function_address = $dev_addr.usb_addr;
+                trans.endpoint_number  = $dev_addr.usb_ep;
+                trans.type = (pid == $USB_PID_SETUP)
+                                ? USB_Type_Control : USB_Type_Bulk;
+                trans.direction = (pid == $USB_PID_IN)
+                                    ? USB_Direction_In : USB_Direction_Out;
+                trans.status = USB_Status_Undef;
+                trans.buf = new_dbuffer();
+                trans.size = 0;
+                if (pid == $USB_PID_OUT) {
+                    if ($len > 8)
+                        $len = 8;
+                    if ($len > 0) {
+                        dbuffer_append_external_data(trans.buf,
+                            &$data_buf, $len, false);
+                        trans.size = $len;
+                    }
+                } else {
+                    trans.size = $len;
+                }
+
+                assert (p >= 0 && p < $NUM_PORTS);
+                rslt = $usb_devices[p].usb_device.submit_transfer(&trans);
+
+                if (pid == $USB_PID_IN)
+                    log info, 4: "IN debug transfer on port %d", p;
+                else if (pid == $USB_PID_OUT)
+                    log info, 4: "OUT debug transfer on port %d", p;
+                else if (pid == $USB_PID_SETUP)
+                    log info, 4: "SETUP debug transfer on port %d", p;
+                else
+                    assert false;
+
+                $done = 1;
+                $this = 0;
+                if (rslt != USB_Transfer_Completed) {
+                    $err = 1;
+                    $ex  = $usb2_dbg_port_ex_tr_err;
+                } else {
+                    $err = 0;
+                    $ex  = $usb2_dbg_port_ex_no_err;
+                    if (pid == $USB_PID_IN) {
+                        if (dbuffer_len(trans.buf) > 0) {
+                            $len = dbuffer_len(trans.buf);
+                            if ($len > 8)
+                                $len = 8;
+                            memcpy(&$data_buf,
+                                   dbuffer_read_all(trans.buf), $len);
+                        } else {
+                            // Notify software no data had been read
+                            $len = 0;
+                        }
+                        log info, 3: "cannot get the data packet PID";
+                        $usb_pids.r_pid = 0;
+                    } else {
+                        if (trans.status == USB_Status_Ack)
+                            $usb_pids.r_pid = $USB_PID_ACK;
+                        else if (trans.status == USB_Status_Nak)
+                            $usb_pids.r_pid = $USB_PID_NAK;
+                        else if (trans.status == USB_Status_Stall) {
+                            $usb_pids.r_pid = $USB_PID_STALL;
+                            $err = 1;
+                            $ex  = $usb2_dbg_port_ex_tr_err;
+                        } else {
+                            log info, 3: "no received PID";
+                            $usb_pids.r_pid = 0;
+                        }
+                    }
+                }
+
+                dbuffer_free(trans.buf);
+            }
+        }
+    }
+}
+
+
+/*
+ * Standard USB host methods
+ */
+method usb_host_connect_device(int p) {
+    if ($usb_regs.prtsc[p].port_owner == 1) {
+        /* companion host controller owns the port */
+
+        log info, 2, log_usb_common:
+            "USB device connected to port %d but host companion owns the port",
+            p;
+
+        if ($companion_hc[p].obj == NULL) {
+            log info, 2, log_usb_common:
+                "device connected to port %d without any companion hc", p;
+        } else {
+            local usb_speed_t speed;
+            local int dummy_port;
+            call $usb_get_device_speed(p) -> (speed);
+            dummy_port = $companion_hc[p].usb.connect_device(
+                $usb_devices[p].obj, speed);
+            if (dummy_port == -1)
+                log error, 1, log_usb_common:
+                    "device could not be connected to companion hc";
+        }
+        // Prevent this device to be used by eHCI
+        $usb_ctrl.own_device[p] = 0;
+    } else {
+        /* this host controller owns the port */
+
+        log info, 2, log_usb_common:
+            "USB device connected to port %d owned by this host controller", p;
+        $usb_ctrl.own_device[p] = 1;
+        call $usb_regs.prtsc[p].connect_status.update();
+        call $update_line_speed(p);
+    }
+}
+
+method usb_host_disconnect_device(int p) -> (int res) {
+
+    if ($usb_regs.prtsc[p].port_owner == 1) {
+        /* companion host controller owns port */
+
+        if ($companion_hc[p].obj == NULL) {
+            log error, 1, log_usb_common:
+                "device disconnected from port %d without any companion hc", p;
+            res = -1;
+        } else {
+            res = $companion_hc[p].usb.disconnect_device($usb_devices[p].obj);
+            if ($usb_regs.configflag.cf == 1)
+                $usb_regs.prtsc[p].port_owner = 0;
+        }
+    } else {
+        /* this host controller owns port */
+        if ($usb_regs.prtsc[p].port_enabled == 1) {
+            call $usb_regs.prtsc[p].port_enabled.change(0);
+        }
+        $usb_ctrl.own_device[p] = 0;
+        res = 0;
+        call $update_interrupts();
+    }
+}
+
+method usb_host_after_disconnect_device(int p) {
+    call $usb_regs.prtsc[p].connect_status.update();
+}
+
+event periodic_list_update {
+    parameter timebase = "seconds";
+
+    method event(data) {
+        call $traverse_periodic_list();
+        inline $post($PERIODIC_LIST_UPDATE_FREQ, NULL);
+    }
+
+    method update() {
+        if ($periodic_list_polling_enabled
+            && ($usb_regs.usbcmd.periodic_sched_en 
+                || $usb_regs.usbsts.periodic_sched_status) 
+            && $usb_regs.usbcmd.rc) {
+            local bool en;
+            inline $posted(NULL) -> (en);
+            if (!en)
+                inline $post($PERIODIC_LIST_UPDATE_FREQ, NULL);
+        } else {
+            inline $remove(NULL);
+        }
+    }
+}
+
+event async_list_update {
+    parameter timebase = "seconds";
+
+    method event(data) {
+        call $traverse_async_list();
+        inline $post($ASYNC_LIST_UPDATE_FREQ, NULL);
+    }
+
+    method update() {
+        if ($async_list_polling_enabled
+            && $usb_regs.usbcmd.async_sched_en && $usb_regs.usbcmd.rc) {
+            local bool en;
+            inline $posted(NULL) -> (en);
+            if (!en)
+                inline $post($ASYNC_LIST_UPDATE_FREQ, NULL);
+        } else {
+            inline $remove(NULL);
+        }
+    }
+}
+
+connect companion_hc[$NUM_PORTS] {
+    parameter documentation = "Per port companion host controller.";
+    parameter configuration = "optional";
+    interface usb {
+        parameter required = true;
+    }
+}
+
+attribute periodic_list_polling_enabled {
+    parameter documentation = "Poll the periodic list in 0.125ms intervals.";
+    parameter configuration = "optional";
+    parameter allocate_type = "bool";
+
+    method after_set() {
+        if (!SIM_is_restoring_state($dev.obj))
+            call $periodic_list_update.update();
+    }
+}
+
+attribute async_list_polling_enabled {
+    parameter documentation = "Poll the asynchronous list in 1ms intervals.";
+    parameter configuration = "optional";
+    parameter allocate_type = "bool";
+
+    method after_set() {
+        if (!SIM_is_restoring_state($dev.obj))
+            call $async_list_update.update();
+    }
+}
+
+bank usb_regs {
+    parameter function = 1;
+    parameter register_size = 1;
+    parameter byte_order = "little-endian";
+    parameter partial = true;
+    parameter overlapping = true;
+
+    register caplength      size 1 @ 0x0;
+    register reserved       size 1 @ 0x1;
+    register hciversion     size 2 @ 0x2;
+    register hcsparams      size 4 @ 0x4;
+    register hccparams      size 4 @ 0x8;
+    if ($hcsp_portroute_enable) {
+        register hcsp_portroute size 8 @ 0xC;
+    }
+
+    register usbcmd            size 4 @ $CAPLENGTH + 0x0;
+    register usbsts            size 4 @ $CAPLENGTH + 0x4;
+    register usbintr           size 4 @ $CAPLENGTH + 0x8;
+    register frindex           size 4 @ $CAPLENGTH + 0xC;
+    register ctrldssegment     size 4 @ $CAPLENGTH + 0x10;
+    register periodiclistbase  size 4 @ $CAPLENGTH + 0x14;
+    register asynclistaddr     size 4 @ $CAPLENGTH + 0x18;
+    // Windows uses the 1C register to write 0xabadbabe magic to, in
+    // order to trig some debug system but the register is reserved
+    register dummy_1c          size 4 @ $CAPLENGTH + 0x1C is (reserved);
+    register configflag        size 4 @ $CAPLENGTH + 0x40;
+    register prtsc[$NUM_PORTS] size 4 @ $CAPLENGTH + 0x44 + $i * 4;
+}
+
+
+/* methods */
+
+method print_qh(usb_ehci_qh_t qh, int log_level) {
+    log info, log_level, log_usb_common: "  link_ptr        : 0x%x", qh.link_ptr;
+    log info, log_level, log_usb_common: "  typ             : %d", qh.typ;
+    log info, log_level, log_usb_common: "  terminate       : %d", qh.terminate;
+    log info, log_level, log_usb_common: "  rl              : %d", qh.rl;
+    log info, log_level, log_usb_common: "  c               : %d", qh.c;
+    log info, log_level, log_usb_common: "  max_packet_len  : %d", qh.max_packet_len;
+    log info, log_level, log_usb_common: "  head            : %d", qh.head;
+    log info, log_level, log_usb_common: "  dtc             : %d", qh.dtc;
+    log info, log_level, log_usb_common: "  eps             : %d", qh.eps;
+    log info, log_level, log_usb_common: "  endpoint        : %d", qh.endpoint;
+    log info, log_level, log_usb_common: "  i               : %d", qh.i;
+    log info, log_level, log_usb_common: "  device_addr     : %d", qh.device_addr;
+    log info, log_level, log_usb_common: "  s_mask          : 0x%x", qh.s_mask;
+    log info, log_level, log_usb_common: "  current_qtd_ptr : 0x%x", qh.current_qtd_ptr;
+}
+
+method print_qtd(usb_ehci_qtd_t qtd, int log_level) {
+    log info, log_level, log_usb_common: "  next_qtd                 : 0x%x", qtd.next_qtd;
+    log info, log_level, log_usb_common: "  next_qtd_terminate       : %d", qtd.next_qtd_terminate;
+    log info, log_level, log_usb_common: "  alt_next_qtd             : 0x%x", qtd.alt_next_qtd;
+    log info, log_level, log_usb_common: "  nac_cnt                  : %d", qtd.nac_cnt;
+    log info, log_level, log_usb_common: "  alt_next_qtd_terminate   : %d", qtd.alt_next_qtd_terminate;
+    log info, log_level, log_usb_common: "  data_toggle              : %d", qtd.data_toggle;
+    log info, log_level, log_usb_common: "  bytes_to_transfer        : %d", qtd.bytes_to_transfer;
+    log info, log_level, log_usb_common: "  ioc                      : %d", qtd.ioc;
+    log info, log_level, log_usb_common: "  c_page                   : %d", qtd.c_page;
+    log info, log_level, log_usb_common: "  cerr                     : %d", qtd.cerr;
+    log info, log_level, log_usb_common: "  pid                      : %d", qtd.pid;
+    log info, log_level, log_usb_common: "  status_active            : %d", qtd.status_active;
+    log info, log_level, log_usb_common: "  status_halted            : %d", qtd.status_halted;
+    log info, log_level, log_usb_common: "  status_data_buffer_error : %d", qtd.status_data_buffer_error;
+    log info, log_level, log_usb_common: "  status_babble_detected   : %d", qtd.status_babble_detected;
+    log info, log_level, log_usb_common: "  status_xacterr           : %d", qtd.status_xacterr;
+    log info, log_level, log_usb_common: "  status_missed_mframe     : %d", qtd.status_missed_mframe;
+    log info, log_level, log_usb_common: "  status_spitxstate        : %d", qtd.status_spitxstate;
+    log info, log_level, log_usb_common: "  status_ping_state        : %d", qtd.status_ping_state;
+    log info, log_level, log_usb_common: "  current_offset           : 0x%06x", qtd.current_offset;
+
+    if ($usb_regs.hccparams.addr_64bit) {
+        local int i;
+        for (i = 0; i < 5; i++) {
+            local uint64 tmp = 0;
+            tmp[63:32] = qtd.ext_buffer_ptr[i];
+            tmp[31:0] = qtd.buffer_ptr[i];
+            log info, log_level, log_usb_common:
+                "  buffer_ptr[%d] : 0x%llx", i, tmp;
+        }
+    } else {
+        local int i;
+        for (i = 0; i < 5; i++)
+            log info, log_level, log_usb_common:
+                "  buffer_ptr[%d] : 0x%x", i, qtd.buffer_ptr[i];
+    }
+}
+
+method get_64bit_addr(uint32 low) -> (uint64 addr) {
+    if ($usb_regs.hccparams.addr_64bit == 1)
+        addr[63:32] = $usb_regs.ctrldssegment;
+    else
+        addr[63:32] = 0;
+    addr[31:0] = low;
+}
+
+method load_fle(uint64 addr)
+    -> (usb_ehci_frame_list_entry_t frame) {
+    local uint32 dword;
+    if ($use_4_2_api)
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                cast(&dword, uint8*), addr, 4);
+    else
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                &dword, addr, 4);
+    
+    dword = LOAD_LE32(&dword);
+    frame.frame_list_link_pointer[31:5] = dword[31:5];
+    frame.frame_list_link_pointer[4:0]  = 0;
+    frame.type                          = dword[2:1];
+    frame.terminate                     = dword[0];
+}
+
+method load_qh_no_overlay(uint64 addr) -> (usb_ehci_qh_t qh) {
+    local uint32 buf[4];
+
+    if ($use_4_2_api)
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                cast(buf, uint8*), addr, 4 * 4);
+    else
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                buf, addr, 4 * 4);
+
+    buf[0] = LOAD_LE32(&buf[0]);
+    buf[1] = LOAD_LE32(&buf[1]);
+    buf[2] = LOAD_LE32(&buf[2]);
+    buf[3] = LOAD_LE32(&buf[3]);
+
+    memset(&qh, 0, sizeof(qh));
+    qh.link_ptr[31:5]        = buf[0][31:5];
+    qh.link_ptr[4:0]         = 0;
+    qh.typ                   = buf[0][2:1];
+    qh.terminate             = buf[0][0:0];
+    qh.rl                    = buf[1][31:28];
+    qh.c                     = buf[1][27:27];
+    qh.max_packet_len        = buf[1][26:16];
+    qh.head                  = buf[1][15:15];
+    qh.dtc                   = buf[1][14:14];
+    qh.eps                   = buf[1][13:12];
+    qh.endpoint              = buf[1][11:8];
+    qh.i                     = buf[1][7:7];
+    qh.device_addr           = buf[1][6:0];
+    qh.mult                  = buf[2][31:30];
+    qh.s_mask                = buf[2][7:0];
+    qh.current_qtd_ptr[31:5] = buf[3][31:5];
+    qh.current_qtd_ptr[4:0]  = 0;
+}
+
+method load_qh_overlay(uint64 addr) -> (usb_ehci_qh_t qh) {
+    call $load_qh_no_overlay(addr) -> (qh);
+    call $load_qtd(addr + 4 * 4) -> (qh.qtd);
+}
+
+
+method save_qh_overlay(uint64 addr, usb_ehci_qh_t qh) {
+    local uint32 dword;
+
+    STORE_LE32(&dword, qh.current_qtd_ptr);
+
+    if ($use_4_2_api)
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory,
+                                 cast(&dword, uint8*), addr + 3 * 4, 4);
+    else
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory,
+                                 &dword, addr + 3 * 4, 4);
+
+    call $save_qtd_overlay(addr + 4 * 4, qh.qtd);
+}
+
+method load_qtd(uint64 addr) -> (usb_ehci_qtd_t qtd) {
+    local uint32 buf[13];
+    local int size;
+
+    if ($usb_regs.hccparams.addr_64bit)
+        size = 13;
+    else
+        size = 8;
+
+    if ($use_4_2_api)
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                cast(buf, uint8*), addr, size * 4);
+    else
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                buf, addr, size * 4);
+
+    buf[0] = LOAD_LE32(&buf[0]);
+    buf[1] = LOAD_LE32(&buf[1]);
+    buf[2] = LOAD_LE32(&buf[2]);
+    buf[3] = LOAD_LE32(&buf[3]);
+    buf[4] = LOAD_LE32(&buf[4]);
+    buf[5] = LOAD_LE32(&buf[5]);
+    buf[6] = LOAD_LE32(&buf[6]);
+    buf[7] = LOAD_LE32(&buf[7]);
+    buf[8] = LOAD_LE32(&buf[8]);
+    buf[9] = LOAD_LE32(&buf[9]);
+    buf[10] = LOAD_LE32(&buf[10]);
+    buf[11] = LOAD_LE32(&buf[11]);
+    buf[12] = LOAD_LE32(&buf[12]);
+
+    memset(&qtd, 0, sizeof(qtd));
+    qtd.next_qtd[31:5]           = buf[0][31:5];
+    qtd.next_qtd[4:0]            = 0;
+    qtd.next_qtd_terminate       = buf[0][0];
+    qtd.alt_next_qtd[31:5]       = buf[1][31:5];
+    qtd.alt_next_qtd[4:0]        = 0;
+    qtd.nac_cnt                  = buf[1][4:1];
+    qtd.alt_next_qtd_terminate   = buf[1][0];
+    qtd.data_toggle              = buf[2][31];
+    qtd.bytes_to_transfer        = buf[2][30:16];
+    qtd.ioc                      = buf[2][15];
+    qtd.c_page                   = buf[2][14:12];
+    qtd.cerr                     = buf[2][11:10];
+    qtd.pid                      = buf[2][9:8];
+    qtd.status_active            = buf[2][7];
+    qtd.status_halted            = buf[2][6];
+    qtd.status_data_buffer_error = buf[2][5];
+    qtd.status_babble_detected   = buf[2][4];
+    qtd.status_xacterr           = buf[2][3];
+    qtd.status_missed_mframe     = buf[2][2];
+    qtd.status_spitxstate        = buf[2][1];
+    qtd.status_ping_state        = buf[2][0];
+    qtd.current_offset           = buf[3][11:0];
+    qtd.buffer_ptr[0]            = buf[3][31:12];
+    qtd.buffer_ptr[1]            = buf[4][31:12];
+    qtd.buffer_ptr[2]            = buf[5][31:12];
+    qtd.buffer_ptr[3]            = buf[6][31:12];
+    qtd.buffer_ptr[4]            = buf[7][31:12];
+
+    if ($usb_regs.hccparams.addr_64bit) {
+        qtd.ext_buffer_ptr[0]        = buf[8];
+        qtd.ext_buffer_ptr[1]        = buf[9];
+        qtd.ext_buffer_ptr[2]        = buf[10];
+        qtd.ext_buffer_ptr[3]        = buf[11];
+        qtd.ext_buffer_ptr[4]        = buf[12];
+    }
+}
+
+method save_qtd_overlay(uint64 addr, usb_ehci_qtd_t qtd) {
+    local uint32 buf[13];
+    local int size;
+
+    buf[0][31:5]  = qtd.next_qtd[31:5];
+    buf[0][4:1]   = 0;
+    buf[0][0]     = qtd.next_qtd_terminate;
+    buf[1][31:5]  = qtd.alt_next_qtd[31:5];
+    buf[1][4:1]   = qtd.nac_cnt;
+    buf[1][0]     = qtd.alt_next_qtd_terminate;
+    buf[2][31:31] = qtd.data_toggle;
+    buf[2][30:16] = qtd.bytes_to_transfer;
+    buf[2][15]    = qtd.ioc;
+    buf[2][14:12] = qtd.c_page;
+    buf[2][11:10] = qtd.cerr;
+    buf[2][9:8]   = qtd.pid;
+    buf[2][7]     = qtd.status_active;
+    buf[2][6]     = qtd.status_halted;
+    buf[2][5]     = qtd.status_data_buffer_error;
+    buf[2][4]     = qtd.status_babble_detected;
+    buf[2][3]     = qtd.status_xacterr;
+    buf[2][2]     = qtd.status_missed_mframe;
+    buf[2][1]     = qtd.status_spitxstate;
+    buf[2][0]     = qtd.status_ping_state;
+    buf[3][31:12] = qtd.buffer_ptr[0];
+    buf[3][11:0]  = qtd.current_offset;
+    buf[4][31:12] = qtd.buffer_ptr[1];
+    buf[4][11:0]  = 0;
+    buf[5][31:12] = qtd.buffer_ptr[2];
+    buf[5][11:0]  = 0;
+    buf[6][31:12] = qtd.buffer_ptr[3];
+    buf[6][11:0]  = 0;
+    buf[7][31:12] = qtd.buffer_ptr[4];
+    buf[7][11:0]  = 0;
+
+    STORE_LE32(&buf[0], buf[0]);
+    STORE_LE32(&buf[1], buf[1]);
+    STORE_LE32(&buf[2], buf[2]);
+    STORE_LE32(&buf[3], buf[3]);
+    STORE_LE32(&buf[4], buf[4]);
+    STORE_LE32(&buf[5], buf[5]);
+    STORE_LE32(&buf[6], buf[6]);
+    STORE_LE32(&buf[7], buf[7]);
+
+    if ($usb_regs.hccparams.addr_64bit) {
+        buf[8]  = qtd.ext_buffer_ptr[0];
+        buf[9]  = qtd.ext_buffer_ptr[1];
+        buf[10] = qtd.ext_buffer_ptr[2];
+        buf[11] = qtd.ext_buffer_ptr[3];
+        buf[12] = qtd.ext_buffer_ptr[4];
+
+        STORE_LE32(&buf[8], buf[8]);
+        STORE_LE32(&buf[9], buf[9]);
+        STORE_LE32(&buf[10], buf[10]);
+        STORE_LE32(&buf[11], buf[11]);
+        STORE_LE32(&buf[12], buf[12]);
+
+        size = 13;
+    } else {
+        size = 8;
+    }
+
+    if ($use_4_2_api)
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory, cast(buf, uint8*), addr, size * 4);
+    else
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory, buf, addr, size * 4);
+}
+
+method save_qtd(uint64 addr, usb_ehci_qtd_t qtd) {
+    local uint32 dword;
+    local int size;
+
+    dword[31:31] = qtd.data_toggle;
+    dword[30:16] = qtd.bytes_to_transfer;
+    dword[15]    = qtd.ioc;
+    dword[14:12] = 0; // there should be the value of c_page which is currently in memory now
+                      // in other words this value should be untouched but in order to keep
+                      // single call usb_ehci_dma_write instead of several writes around c_page
+                      // the assumption was made that the untouched value always equal to 0!!!
+    dword[11:10] = qtd.cerr;
+    dword[9:8]   = qtd.pid;
+    dword[7]     = qtd.status_active;
+    dword[6]     = qtd.status_halted;
+    dword[5]     = qtd.status_data_buffer_error;
+    dword[4]     = qtd.status_babble_detected;
+    dword[3]     = qtd.status_xacterr;
+    dword[2]     = qtd.status_missed_mframe;
+    dword[1]     = qtd.status_spitxstate;
+    dword[0]     = qtd.status_ping_state;
+
+    if ($use_4_2_api)
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory, cast(&dword, uint8*), addr + 2 * 4, 4);
+    else
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory, &dword, addr + 2 * 4, 4);
+}
+
+method load_qtd_data(usb_ehci_qtd_t *qtd, dbuffer_t *buf) {
+    local int i;
+    local int size;
+    local uint16 data_left = qtd->bytes_to_transfer;
+    local uint12 offset = qtd->current_offset;
+    local uint64 addr = 0;
+
+    for (i = 0; i < 5; i++) {
+
+        // size
+        size = 4096 - offset;
+        if (size > data_left)
+            size = data_left;
+
+        // address
+        addr[31:12] = qtd->buffer_ptr[qtd->c_page];
+        addr[11:0] = offset;
+        if ($usb_regs.hccparams.addr_64bit == 1)
+            addr[63:32] = qtd->ext_buffer_ptr[qtd->c_page];
+        else
+            addr[63:32] = 0;
+
+        call $usb_ehci_dma_read(Sim_Addr_Space_Memory,
+                                dbuffer_append(buf, size), addr, size);
+
+        data_left -= size;
+        offset += size;
+        if (offset >= 4096)
+            offset = 0;
+        qtd->c_page += 1;
+        if (data_left == 0)
+            break;
+    }
+    qtd->bytes_to_transfer = data_left;
+    qtd->current_offset = offset;
+}
+
+method save_qtd_data(usb_ehci_qtd_t *qtd, dbuffer_t *buf) {
+    local int i;
+    local int size;
+    local int dbuffer_offset = 0;
+    local uint16 data_left;
+    local uint12 offset = qtd->current_offset;
+    local uint64 addr = 0;
+
+    data_left = qtd->bytes_to_transfer < dbuffer_len(buf)
+        ? qtd->bytes_to_transfer : dbuffer_len(buf);
+    for (i = 0; i < 5; i++) {
+
+        // size
+        size = 4096 - offset;
+        if (size > data_left)
+            size = data_left;
+
+        // address
+        addr[31:12] = qtd->buffer_ptr[qtd->c_page];
+        addr[11:0] = offset;
+        if ($usb_regs.hccparams.addr_64bit == 1)
+            addr[63:32] = qtd->ext_buffer_ptr[qtd->c_page];
+        else
+            addr[63:32] = 0;
+
+        call $usb_ehci_dma_write(Sim_Addr_Space_Memory,
+                                 dbuffer_read(buf, dbuffer_offset, size),
+                                 addr, size);
+
+        data_left -= size;
+        offset += size;
+        dbuffer_offset += size;
+        if (offset >= 4096)
+            offset = 0;
+        qtd->c_page += 1;
+        if (data_left == 0)
+            break;
+    }
+    qtd->bytes_to_transfer = data_left;
+    qtd->current_offset = offset;
+}
+
+constant QH_Exec_State_None        = 0;
+constant QH_Exec_State_Ctrl_In     = 1;
+constant QH_Exec_State_Ctrl_Out    = 2;
+constant QH_Exec_State_Ctrl_Status = 3;
+
+constant QH_State_None                = 0;
+constant QH_State_Fetch_QH            = 1;
+constant QH_State_Advance_Queue       = 2;
+constant QH_State_Execute_Transaction = 3;
+constant QH_State_Write_Back_qTD      = 4;
+constant QH_State_Follow_Horizontal   = 5;
+constant QH_State_End                 = 6;
+
+data int qh_state;
+
+method fetch_qh(uint64 addr) -> (usb_ehci_qh_t qh) {
+    log info, 4, log_usb_common: "STATE: fetch QH";
+
+    log info, 4, log_usb_common: "fetching QH from address 0x%llx", addr;
+    inline $load_qh_overlay(addr) -> (qh);
+    inline $print_qh(qh, 4);
+    inline $print_qtd(qh.qtd, 4);
+
+    /* empty schedule detection, section 4.8.3 */
+    if (qh.head == 1) {
+        if ($usb_regs.usbsts.reclamation == 0) {
+            $qh_state = QH_State_End;
+            return;
+        } else {
+            $usb_regs.usbsts.reclamation = 0;
+        }
+    }
+
+    /* TODO nak counter reloads, section 4.9 */
+
+    /* next state, figure 4.14 section 4.10 */
+    if (qh.qtd.status_active == 1 && qh.qtd.status_halted == 0)
+        $qh_state = QH_State_Execute_Transaction;
+    else if (qh.qtd.status_active == 0 && qh.qtd.status_halted == 0)
+        $qh_state = QH_State_Advance_Queue;
+    else if (qh.qtd.status_halted == 1
+             || (qh.qtd.status_active == 0 && qh.i == 1))
+        $qh_state = QH_State_Follow_Horizontal;
+    else
+        $qh_state = QH_State_None;
+}
+
+method advance_queue(usb_ehci_queue_t *queue) {
+    local usb_ehci_qtd_t qtd;
+    local uint64 addr;
+    local uint32 qtd_addr;
+
+    log info, 4, log_usb_common: "STATE: advance queue";
+
+    /* TODO interrupt on async advance, section 4.15.2.3 */
+
+    if (queue->qh.qtd.bytes_to_transfer != 0) {
+        /* short packet detect */
+        inline $usb_regs.usbsts.interrupt.update(1<<USB_EHCI_INT_USBINT);
+    }
+
+    /* section 4.10.2 */
+    if (queue->qh.qtd.bytes_to_transfer != 0
+        && queue->qh.qtd.alt_next_qtd_terminate == 0) {
+        qtd_addr = queue->qh.qtd.alt_next_qtd;
+    } else if (queue->qh.qtd.next_qtd_terminate == 0) {
+        qtd_addr = queue->qh.qtd.next_qtd;
+    } else {
+        $qh_state = QH_State_Follow_Horizontal;
+        return;
+    }
+
+    inline $get_64bit_addr(qtd_addr) -> (addr);
+    log info, 4, log_usb_common: "fetching qTD from address 0x%llx", addr;
+    inline $load_qtd(addr) -> (qtd);
+    inline $print_qtd(qtd, 4);
+
+    if (qtd.status_active == 1) {
+        queue->qh.qtd = qtd;
+        queue->qh.current_qtd_ptr = qtd_addr;
+    } else {
+        $qh_state = QH_State_Follow_Horizontal;
+        return;
+    }
+
+    /* next state */
+    $qh_state = QH_State_Execute_Transaction;
+}
+
+method usb_device_submit_transfer(usb_transfer_t *transfer) {
+    local int port;
+    call $usb_ehci_uhci_address_to_port(transfer->function_address) -> (port);
+    assert port != -1;
+    if ($usb_devices[port].usb_device.submit_transfer(transfer)
+        != USB_Transfer_Completed)
+        log error:
+            "Invalid response from USB device, submit_transfer"
+            + " should return USB_Transfer_Completed";
+}
+
+
+method qh_exec_state_none(usb_ehci_queue_t *queue) {
+    local dbuffer_t *buf;
+    log info, 4, log_usb_common: "sub-state: state_none";
+
+    switch (queue->qh.qtd.pid) {
+    case USB_EHCI_PID_Code_Setup:
+        log info, 4, log_usb_common: "sub-state: state_ctrl_setup";
+
+        assert queue->qh.qtd.bytes_to_transfer == 8;
+        buf = new_dbuffer();
+        try {
+            call $load_qtd_data(&queue->qh.qtd, buf);
+        } catch {
+            dbuffer_free(buf);
+            throw;
+        }
+        assert dbuffer_len(buf) == 8;
+
+        queue->transfer.u.control_request.bmRequestType
+            = UNALIGNED_LOAD_LE8(dbuffer_read(buf, 0, 1));
+        queue->transfer.u.control_request.bRequest
+            = UNALIGNED_LOAD_LE8(dbuffer_read(buf, 1, 1));
+        queue->transfer.u.control_request.wValue
+            = UNALIGNED_LOAD_LE16(dbuffer_read(buf, 2, 2));
+        queue->transfer.u.control_request.wIndex
+            = UNALIGNED_LOAD_LE16(dbuffer_read(buf, 4, 2));
+        queue->transfer.u.control_request.wLength
+            = UNALIGNED_LOAD_LE16(dbuffer_read(buf, 6, 2));
+
+        dbuffer_free(buf);
+
+        queue->transfer.type = USB_Type_Control;
+        queue->transfer.buf = new_dbuffer();
+
+        // clean up
+        queue->qh.qtd.status_active = 0;
+        queue->qh.qtd.bytes_to_transfer = 0;
+
+        // next state
+        if (queue->transfer.u.control_request.bmRequestType[7] == 1) {
+            queue->exec_state = QH_Exec_State_Ctrl_In;
+            queue->transfer.direction = USB_Direction_In;
+        } else {
+            queue->exec_state = QH_Exec_State_Ctrl_Out;
+            queue->transfer.direction = USB_Direction_Out;
+        }
+        break;
+
+    case USB_EHCI_PID_Code_In:
+        log info, 4, log_usb_common: "sub-state: in request state";
+
+        // init
+        queue->transfer.size = queue->qh.qtd.bytes_to_transfer;
+        queue->transfer.status = USB_Status_Undef;
+        queue->transfer.buf = new_dbuffer();
+        if (queue->qh.s_mask != 0)
+            queue->transfer.type = USB_Type_Interrupt;
+        else
+            queue->transfer.type = USB_Type_Bulk;
+        queue->transfer.direction = USB_Direction_In;
+
+        call $usb_device_submit_transfer(&queue->transfer);
+
+        if (queue->transfer.status == USB_Status_Stall)
+            log unimpl:
+                "incoming bulk transfer: device replied with STALL";
+
+        // NAK handling refer to 4.10.3 Execute 
+        if (queue->transfer.status == USB_Status_Nak && queue->qh.rl == 0) {
+            // do not need to do anything     
+        } else {
+            if (queue->transfer.status == USB_Status_Nak)
+                log unimpl:
+                    "incoming bulk transfer: device replied with NAK and RL != 0";
+
+            call $save_qtd_data(&queue->qh.qtd, queue->transfer.buf);
+
+            // clean up
+            queue->qh.qtd.status_active = 0;
+        }
+        dbuffer_free(queue->transfer.buf);
+
+        break;
+
+    case USB_EHCI_PID_Code_Out:
+        log info, 4, log_usb_common: "sub-state: out request state";
+
+        // init
+        queue->transfer.buf = new_dbuffer();
+        call $load_qtd_data(&queue->qh.qtd, queue->transfer.buf);
+        queue->transfer.size = dbuffer_len(queue->transfer.buf);
+        queue->transfer.status = USB_Status_Undef;
+        queue->transfer.type = USB_Type_Bulk;
+        queue->transfer.direction = USB_Direction_Out;
+
+        call $usb_device_submit_transfer(&queue->transfer);
+        if (queue->transfer.status == USB_Status_Nak ||
+            queue->transfer.status == USB_Status_Stall)
+            log unimpl:
+                "outgoing bulk transfer: device replied with NAK or STALL";
+
+        // clean up
+        queue->qh.qtd.status_active = 0;
+        dbuffer_free(queue->transfer.buf);
+
+        break;
+    default:
+        log spec_viol: "Invalid PID %d in qTD token", queue->qh.qtd.pid;
+    }
+}
+
+method qh_exec_state_ctrl_out(usb_ehci_queue_t *queue) {
+    switch (queue->qh.qtd.pid) {
+    case USB_EHCI_PID_Code_Out:
+        log info, 4, log_usb_common: "sub-state: state_ctrl_out";
+
+        call $load_qtd_data(&queue->qh.qtd, queue->transfer.buf);
+
+        queue->transfer.size = dbuffer_len(queue->transfer.buf);
+        queue->transfer.status = USB_Status_Undef;
+
+        call $usb_device_submit_transfer(&queue->transfer);
+        if (queue->transfer.status == USB_Status_Nak ||
+            queue->transfer.status == USB_Status_Stall)
+            log unimpl:
+                "outgoing control transfer: device replied with NAK or STALL";
+
+        // clean up
+        queue->qh.qtd.status_active = 0;
+        dbuffer_free(queue->transfer.buf);
+
+        // next state
+        queue->exec_state = QH_Exec_State_Ctrl_Status;
+        break;
+
+    case USB_EHCI_PID_Code_In:
+        log info, 4, log_usb_common: "sub-state: state_ctrl_in (status)";
+
+        queue->transfer.size = 0;
+        queue->transfer.status = USB_Status_Undef;
+
+        call $usb_device_submit_transfer(&queue->transfer);
+        if (queue->transfer.status == USB_Status_Nak ||
+            queue->transfer.status == USB_Status_Stall)
+            log unimpl:
+                "incoming control transfer: device replied with NAK or STALL";
+
+        // clean up
+        queue->qh.qtd.status_active = 0;
+        if (dbuffer_len(queue->transfer.buf) != 0) {
+            assert false;
+            dbuffer_free(queue->transfer.buf);
+        }
+
+        if (queue->transfer.u.control_request.bRequest == 5) {
+            local int port;
+            call $usb_ehci_uhci_address_to_port(queue->transfer.function_address)
+                -> (port);
+            assert port != -1;
+            log info, 3, log_usb_common:
+                "address for device connected to port %d changed to %d",
+                port, queue->transfer.u.control_request.wValue;
+            inline $usb_set_device_address(
+                port, queue->transfer.u.control_request.wValue);
+        }
+
+        // next state
+        queue->exec_state = QH_Exec_State_None;
+
+        break;
+    default:
+        // TODO
+        assert false;
+    }
+}
+
+method qh_exec_state_ctrl_in(usb_ehci_queue_t *queue) {
+    log info, 4, log_usb_common: "sub-state: state_ctrl_in";
+
+    queue->transfer.size = queue->qh.qtd.bytes_to_transfer;
+    queue->transfer.status = USB_Status_Undef;
+
+    call $usb_device_submit_transfer(&queue->transfer);
+
+    if (queue->transfer.status == USB_Status_Nak ||
+        queue->transfer.status == USB_Status_Stall)
+        log unimpl:
+            "incoming control transfer: device replied with NAK or STALL";
+
+    call $save_qtd_data(&queue->qh.qtd, queue->transfer.buf);
+
+    // clean up
+    queue->qh.qtd.status_active = 0;
+    dbuffer_free(queue->transfer.buf);
+
+    // next state
+    queue->exec_state = QH_Exec_State_Ctrl_Status;
+}
+
+method qh_exec_state_ctrl_status(usb_ehci_queue_t *queue) {
+    log info, 4, log_usb_common: "sub-state: state_ctrl_status";
+
+    assert (queue->transfer.direction == USB_Direction_In
+            && queue->qh.qtd.pid == USB_EHCI_PID_Code_Out)
+        || (queue->transfer.direction == USB_Direction_Out
+            && queue->qh.qtd.pid == USB_EHCI_PID_Code_In);
+
+    // clean up
+    queue->qh.qtd.status_active = 0;
+
+    // next state
+    queue->exec_state = QH_Exec_State_None;
+}
+
+method execute_transaction(usb_ehci_queue_t *queue) {
+    local uint8 qHTransactionCounter = 0;
+    local uint32 frindex;
+
+    log info, 3, log_usb_common: "STATE: executing transaction";
+    inline $print_qtd(queue->qh.qtd, 3);
+    inline $print_qh(queue->qh, 4);
+
+    // Check pre-condition for interrupt transfer
+    if (queue->qh.s_mask != 0) {
+        qHTransactionCounter = queue->qh.mult;
+        call $usb_regs.frindex.do_read() -> (frindex);
+ 	log info, 3, log_usb_common:
+            "%s is 0x%x, %s is 0x%x, %s is 0x%x",
+            "executing transaction frindex", frindex,
+            "queue->qh.s_mask", queue->qh.s_mask,
+            "qHTransactionCounter", qHTransactionCounter;
+        if (((1 << frindex[2:0]) != queue->qh.s_mask)
+            || (qHTransactionCounter == 0)) {
+            $qh_state = QH_State_Follow_Horizontal;
+            return;
+ 	}
+    } else {
+        qHTransactionCounter = 1;	
+    }
+    while (qHTransactionCounter != 0) {
+
+        /* TODO check nak counter reload state, section 4.9 */
+
+        /* we cheat, do only one async list round */
+        $usb_regs.usbsts.reclamation = 0;
+        /* no cheat */
+        /* $usb_regs.usbsts.reclamation = 1;*/
+
+        /*
+         * do transfer
+         */
+        queue->transfer.function_address = queue->qh.device_addr;
+        // sanity check
+        local int port;
+        call $usb_ehci_uhci_address_to_port(queue->transfer.function_address)
+            -> (port);
+        if (port == -1) {
+            log error:
+                "Invalid device_addr field (%d) in Queue Head, %s",
+                queue->transfer.function_address,
+                "dropping transfer and halting queue";
+            // TODO: find a better way to handle this (and write some tests!)
+            //       for now, handle this as a transaction timeout error
+            // halt queue and set error interrupt status bit (sec 4.10.3.1)
+            queue->qh.qtd.status_active = 0;
+            queue->qh.qtd.status_halted = 1;
+            $usb_regs.usbsts.interrupt[USB_EHCI_INT_USBERRINT] = 1;
+            // always write back when halted, and then follow horizontal link ptr
+            $qh_state = QH_State_Write_Back_qTD;
+            return;
+        }
+        queue->transfer.endpoint_number = queue->qh.endpoint;
+
+        switch (queue->exec_state) {
+        case QH_Exec_State_None:
+            call $qh_exec_state_none(queue);
+            break;
+        case QH_Exec_State_Ctrl_Out:
+            call $qh_exec_state_ctrl_out(queue);
+            break;
+        case QH_Exec_State_Ctrl_In:
+            call $qh_exec_state_ctrl_in(queue);
+            break;
+        case QH_Exec_State_Ctrl_Status:
+            call $qh_exec_state_ctrl_status(queue);
+            break;
+        default:
+            // invalid exec_state
+            assert false;
+        }
+
+        /* next state */
+        if (queue->qh.qtd.status_active == 0)
+            $qh_state = QH_State_Write_Back_qTD;
+        else
+            $qh_state = QH_State_Follow_Horizontal;
+
+        qHTransactionCounter--;
+    }
+}
+
+method write_back_qtd(usb_ehci_queue_t *queue) {
+    local uint64 addr;
+
+    log info, 4, log_usb_common: "STATE: write back qTD";
+
+    /* TODO make sure qtd ptr is correct */
+    assert queue->qh.current_qtd_ptr != 0;
+    inline $get_64bit_addr(queue->qh.current_qtd_ptr) -> (addr);
+    inline $save_qtd(addr, queue->qh.qtd);
+
+    /* interrupt on complete */
+    if (queue->qh.qtd.ioc && queue->qh.qtd.status_active == 0)
+        inline $usb_regs.usbsts.interrupt.update(1<<USB_EHCI_INT_USBINT);
+
+    /* next state */
+    /* we cheat, we send all transfers from this queue */
+    $qh_state = QH_State_Advance_Queue;
+    /* no cheat
+     $qh_state = QH_State_Follow_Horizontal; */
+}
+
+method follow_horizontal(usb_ehci_queue_t *queue, uint64 addr)
+    -> (uint64 new_addr) {
+    log info, 4, log_usb_common: "STATE: follow horizontal";
+
+    call $save_qh_overlay(addr, queue->qh);
+
+    if (queue->qh.terminate == 1 || queue->qh.typ != USB_EHCI_Typ_QH) {
+        $qh_state = QH_State_End;
+        return;
+    }
+    inline $get_64bit_addr(queue->qh.link_ptr) -> (new_addr);
+
+    /* next state */
+    $qh_state = QH_State_Fetch_QH;
+}
+
+// Periodic frame list is an array of physical memory pointers
+method traverse_periodic_list() {
+    local uint64 addr;
+    local usb_ehci_queue_t queue;
+    local usb_ehci_frame_list_entry_t fle;
+    local usb_ehci_qh_t qh;
+    local bool qh_process_end = false;
+    local uint32 frindex;
+    local int size;
+    
+    // start/disable periodic schedule only when frindex[2:0] is zero
+    call $usb_regs.frindex.do_read() -> (frindex);
+    if (frindex[2:0] == 0)
+        $usb_regs.usbsts.periodic_sched_status = $usb_regs.usbcmd.periodic_sched_en;
+
+    if (!$usb_regs.usbsts.periodic_sched_status || !$usb_regs.usbcmd.rc)
+        return;
+
+    queue.exec_state = QH_Exec_State_None;
+    log info, 4, log_usb_common:
+        "traversing periodic list with frindex 0x%x", frindex;
+    $usb_regs.usbsts.periodic_sched_status = 1;
+
+    // get current frame list element
+    inline $get_64bit_addr($usb_regs.periodiclistbase) -> (addr);
+    inline $usb_regs.usbcmd.frame_list_size.get_size_log2() -> (size);
+    addr |= frindex[size:3] << 2;
+
+    while(true) {
+ 	log info, 4, log_usb_common: "traversing periodic list ======";
+
+        // 4 bytes is the width of the frame list element
+ 	inline $load_fle(addr) -> (fle);
+        inline $get_64bit_addr(fle.frame_list_link_pointer) -> (addr);
+
+        // first time here addr is for frame list element, 
+        // then it is for data structure's next link pointer
+
+        if (fle.type != USB_EHCI_Typ_QH) { // we are not ready to support other types
+            // Log level 2 to reduce the spam when booting viper-uefi-busybox
+            log unimpl, 2, log_usb_common:
+                "unsupported TD(type %d) in periodic list, only QH(type 1) is supported!",
+                fle.type;
+            return;
+        }
+
+        $qh_state = QH_State_Fetch_QH;
+        while (!qh_process_end) {
+            switch ($qh_state) {
+            case QH_State_Fetch_QH:
+                call $fetch_qh(addr) -> (queue.qh);
+                break;
+            case QH_State_Advance_Queue:
+                call $advance_queue(&queue);
+                break;
+            case QH_State_Execute_Transaction:
+                call $execute_transaction(&queue);
+                break;
+            case QH_State_Write_Back_qTD:
+                call $write_back_qtd(&queue);
+                break;
+            case QH_State_Follow_Horizontal:
+                call $follow_horizontal(&queue, addr) -> (addr);
+                break;
+            case QH_State_End:
+                call $update_interrupts();
+                qh_process_end = true;
+                break;
+            }
+        }
+
+        // The end of the periodic schedule. This causes the host
+        // controller to cease working on the periodic schedule
+        // and transitions immediately to traversing the
+        // asynchronous schedule.
+        if (fle.terminate) {
+            call $traverse_async_list();
+            return;
+        }
+    }
+}
+ 
+method traverse_async_list() {
+    local uint64 addr;
+    local usb_ehci_queue_t queue;
+
+    if (!$usb_regs.usbcmd.async_sched_en || !$usb_regs.usbcmd.rc)
+        return;
+
+    queue.exec_state = QH_Exec_State_None;
+
+    log info, 4, log_usb_common: "traversing asynchronous list";
+
+    $usb_regs.usbsts.async_sched_status = 1;
+    $usb_regs.usbsts.reclamation = 1;
+
+    inline $get_64bit_addr($usb_regs.asynclistaddr) -> (addr);
+    $qh_state = QH_State_Fetch_QH;
+
+    while (true) {
+        switch ($qh_state) {
+        case QH_State_Fetch_QH:
+            call $fetch_qh(addr) -> (queue.qh);
+            break;
+        case QH_State_Advance_Queue:
+            call $advance_queue(&queue);
+            break;
+        case QH_State_Execute_Transaction:
+            call $execute_transaction(&queue);
+            break;
+        case QH_State_Write_Back_qTD:
+            call $write_back_qtd(&queue);
+            break;
+        case QH_State_Follow_Horizontal:
+            call $follow_horizontal(&queue, addr) -> (addr);
+            break;
+        case QH_State_End:
+            call $update_interrupts();
+            return;
+        }
+    }
+}
+
+method all_list_update() {
+    if (!SIM_is_restoring_state($dev.obj)) {
+        call $periodic_list_update.update(); 
+        call $async_list_update.update();
+    }
+}
+
+method update_line_speed(int p) {
+    local usb_speed_t speed;
+    inline $usb_get_device_speed(p) -> (speed);
+    // line_status field is valid only when the port enable bit is
+    // zero and the current connect status bit is set to a one.
+    if ($usb_regs.prtsc[p].port_enabled == 0
+        && $usb_regs.prtsc[p].connect_status == 1) {
+        if (speed == USB_Speed_Low || speed == USB_Speed_Full)
+            $usb_regs.prtsc[p].line_status = 1;
+        else
+            $usb_regs.prtsc[p].line_status = 2;
+    } else {
+        $usb_regs.prtsc[p].line_status = 0;
+    }
+}
+
+method update_interrupts() {
+    // generic interrupt generation
+    if (($usb_regs.usbsts.interrupt & $usb_regs.usbintr.mask) > 0)
+        call $usb_ehci_raise_interrupt();
+    else
+        call $usb_ehci_lower_interrupt();
+}
+
+method usb_ehci_host_reset() default {
+    call $usb_host_reset();
+    call $usb_regs.hard_reset();
+}
+
+method reset_device(int p) {
+    if ($usb_devices[p].obj != NULL) {
+        log info, 2, log_usb_common:
+            "resetting device connected to port %d", p;
+        $usb_devices[p].usb_device.reset();
+    }
+}
+
+method reset_port(int p) {
+    local usb_speed_t speed;
+    call $reset_device(p);
+    inline $usb_get_device_speed(p) -> (speed);
+    if (speed == USB_Speed_High) {
+        call $usb_regs.prtsc[p].port_enabled.change(1); // refer to  2.3.9
+    }
+    call $update_line_speed(p);
+}
+
+template read_unimplemented {
+    is _read_unimplemented;
+}
+
+template write_unimplemented {
+    is _write_unimplemented;
+}
+
+bank usb_regs {
+
+    register caplength      is (read_only) {
+        parameter hard_reset_value = $CAPLENGTH;
+    }
+    register reserved       is (reserved);
+    register hciversion     is (read_only) {
+        parameter hard_reset_value = 0x0100;
+    }
+    register hcsparams {
+        field debug_port_number  [23:20] is (read_only);
+        field p_indicator        [16:16] is (read_only);
+        field n_cc               [15:12] is (read_only);
+        field n_pcc              [11:8]  is (read_only);
+        field port_routing_rules  [7:7]  is (read_only);
+        field ppc                 [4:4]  is (read_only);
+        field n_ports             [3:0]  is (read_only) {
+            parameter hard_reset_value = $NUM_PORTS;
+        }
+    }
+    register hccparams {
+        field eecp            [15:8] is (read_only) {
+            parameter hard_reset_value = $EECP;
+        }
+        field iso_sched        [7:4] is (read_only);
+        field async_sched_park [2:2] is (read_only) {
+            parameter hard_reset_value = $enabled ? 1 : 0;
+            parameter enabled default false;
+        }
+        field prog_frame_list  [1:1] is (read_only);
+        field addr_64bit       [0:0] is (read_only);
+    }
+    if ($hcsp_portroute_enable) {
+        register hcsp_portroute is (read_only);
+    }
+
+
+    register usbcmd {
+        field int_thres_ctrl    [23:16] is (design_limitation) {
+            parameter hard_reset_value = 0x8;
+        }
+        field async_pm_en       [11:11] is (design_limitation) {
+            parameter hard_reset_value
+                = $usb_regs.hccparams.async_sched_park.enabled
+                ? 1 : 0;
+        }
+        field async_pm_count     [9:8]  is (design_limitation) {
+            parameter hard_reset_value
+                = $usb_regs.hccparams.async_sched_park.enabled
+                ? 3 : 0;
+        }
+        field light_hcreset      [7:7]  is (write_unimplemented);
+        field async_doorbell     [6:6] {
+            method write(value) {
+                if ($this == value)
+                    return;
+                if (value == 1) {
+                    if ($async_sched_en == 0) {
+                        log spec_viol: "write 1 to %s while %s = 0",
+                            $qname, $async_sched_en.qname;
+                        return;
+                    }
+                    log info, 4, log_usb_common: "async doorbell event";
+                    inline $usb_regs.usbsts.interrupt.update(1<<USB_EHCI_INT_ASYNC_ADVANCE);
+                    call $update_interrupts();
+                }
+            }
+        }
+        field async_sched_en     [5:5] {
+            method write(value) {
+                if (value == 0 && $this == 1) {
+                    $this = 0;
+                    $usbsts.async_sched_status = 0;
+                } else if (value == 1 && $this == 0) {
+                    $this = 1;
+                }
+            }
+        }
+        field periodic_sched_en  [4:4] {
+             method write(value) {
+                if (value == 0 && $this == 1) {
+                    $this = 0;
+                    $usbsts.periodic_sched_status = 0;
+                } else if (value == 1 && $this == 0) {
+                    $this = 1;
+                }
+            }
+        }
+        field frame_list_size    [3:2] {
+            method write(value) {
+                if ($usb_regs.hccparams.prog_frame_list) {
+                    if (value == 3) {
+                        log spec_viol: "write illegal value 3 to %s",
+                            $qname;
+                        return;
+                    }
+                    $this = value;
+                    local int size;
+                    inline $get_size_log2() -> (size);
+                    $frindex[31:size + 1] = 0;
+                } else if ($this != value)
+                    log spec_viol, 1:
+                        "Write value %d to read-only field %s",
+                        value, $qname;
+            }
+            method get_size_log2() -> (int size) default {
+                size = 12 - $this;
+            }
+        }
+        field hcreset           [1:1] {
+            method write(value) {
+                if (value && $usbsts.hchalted)
+                    call $usb_ehci_host_reset();
+                $this = 0;
+            }
+        }
+        field rc                [0:0] {
+            method write(value) {
+                // frindex is calculated differently depending on the
+                // value of rc, so we need to refresh it.
+                local uint32 frindex;
+                call $frindex.do_read() -> (frindex);
+                $this = value;
+                $usbsts.hchalted = ($this == 0);
+                call $frindex.do_write(frindex);
+            }
+        }
+        method after_write(memop) {
+            call $all_list_update(); 
+        }
+    }
+    register usbsts {
+        field async_sched_status    [15:15] is (read_only, read_unimplemented);
+        field periodic_sched_status [14:14] is (read_only);
+        field reclamation           [13:13] is (read_only, read_unimplemented);
+        field hchalted              [12:12] is (read_only) { parameter hard_reset_value = 1; }
+        field interrupt              [5:0]  {
+            method side_effects() {
+                // update shadow bits but not for all bits - add others when implemented
+                inline $interrupt_side_effects($this);
+            }
+            // has side effects but does not call update_interrupts after all unlike write method
+            method update(value) {
+                $this |= value;
+                inline $side_effects();
+            }
+            method write(value) {
+                $this &= ~value;
+                inline $side_effects();
+                // initiate interrupts
+                inline $update_interrupts();
+            }
+        }
+
+        method after_read(memop) {
+            call $traverse_async_list();
+        }
+    }
+    register usbintr {
+        field mask [5:0];
+        method after_write(memop) {
+            inline $update_interrupts();
+        }
+    }
+    register frindex {
+        parameter limitations =
+            "The controller may process frames in advance, i.e.,"
+            + " before they have been referenced by frindex";
+        // When the counter stands still (usbcmd.rc == 0), the actual
+        // value is checkpointed.  When the counter runs (rc == 1), we
+        // checkpoint the value the register would have had at time 0.
+        method get_time() -> (uint32 uframes) {
+            // TODO: check overflow
+            uframes = SIM_time($dev.obj) * 8000;
+        }
+        method write(value) {
+            if ($usb_regs.usbcmd.rc == 0 && $usbsts.hchalted == 1)
+                call $do_write(value);
+            else
+                log spec_viol, 1:
+                    "Write to frindex while Run/Stop bit is set or"
+                    + " host controller not in halted state";
+        }
+        method do_write(uint32 value) {
+            local int size;
+            inline $usb_regs.usbcmd.frame_list_size.get_size_log2()
+                -> (size);
+            value = value[size + 1:0];
+            if ($usb_regs.usbcmd.rc == 1) {
+                local uint32 now;
+                inline $get_time() -> (now);
+                $this = value - now;
+            } else {
+                $this = value;
+            }
+        }
+        method read() -> (value) {
+            call $do_read() -> (value);
+            // make sure that the previous frame has been processed
+            if ($usb_regs.usbcmd.rc == 1)
+                call $traverse_async_list();
+        }
+        method do_read() -> (uint32 value) {
+            if ($usb_regs.usbcmd.rc == 1) {
+                local uint32 now;
+                inline $get_time() -> (now);
+                value = $this + now;
+            } else {
+                value = $this;
+            }
+            local int size;
+            inline $usb_regs.usbcmd.frame_list_size.get_size_log2()
+                -> (size);
+            value = value[size + 1:0];
+        }
+    }
+    register ctrldssegment is (read_write);
+    register periodiclistbase {
+        method write(value) {
+            // Physical memory base address for periodic list
+            $this[31:12] = value[31:12];
+            $this[11:0] = 0;
+        }
+    }
+    register asynclistaddr {
+        method write(value) {
+            $this[31:5] = value[31:5];
+            $this[4:0] = 0;
+        }
+    }
+    register configflag {
+        field cf [0:0] {
+            method raise() {
+                $this = 1;
+                local int i;
+                for (i = 0; i < $NUM_PORTS; i++) {
+                    call $usb_regs.prtsc[i].port_owner.change(0);
+                }
+            }
+            method lower() {
+                $this = 0;
+                local int i;
+                for (i = 0; i < $NUM_PORTS; i++) {
+                    call $usb_regs.prtsc[i].port_owner.change(1);
+                }
+            }
+            method write(value) {
+                inline $do_write(value);
+            }
+            method do_write(value) default {
+                if ($this == value)
+                    return;
+                if (value == 0) {
+                    call $lower();
+                } else {
+                    call $raise();
+                }
+            }
+        }
+    }
+    register prtsc[$NUM_PORTS] {
+        field wake_on_over_current_en [22:22] is (silent_unimplemented);
+        field wake_on_disconnect_en   [21:21] is (silent_unimplemented);
+        field wake_on_connect_en      [20:20] is (silent_unimplemented);
+        field port_test_ctrl          [19:16] is (write_unimplemented);
+        field port_indicator_ctrl     [15:14] {
+            method write(value) {
+                if ($this != value && $usb_regs.hcsparams.p_indicator == 1
+                    && $port_power == 1) {
+                    $this = value;
+                    if ($this == 0)
+                        log info, 3, log_usb_common: "port led off";
+                    else if ($this == 1)
+                        log info, 3, log_usb_common: "port led set to amber";
+                    else if ($this == 2)
+                        log info, 3, log_usb_common: "port led set to green";
+                    else
+                        log info, 3, log_usb_common:
+                            "port led set to undefined";
+                }
+            }
+        }
+        field port_owner              [13:13] {
+            parameter hard_reset_value = 1;
+
+            method change(uint1 value) {
+                if ($this == value)
+                    return;
+                $this = value;
+                log info, 4: "Write to %s with value %d", $qname, value;
+                if ($this) {
+                    if ($companion_hc[$i].obj != NULL && $usb_devices[$i].obj != NULL) {
+                        local usb_speed_t speed;
+                        local int dummy_port;
+                        local set_error_t err;
+
+                        /* connect to companion host controller */
+                        call $usb_get_device_speed($i) -> (speed);
+                        dummy_port = $companion_hc[$i].usb.connect_device(
+                            $usb_devices[$i].obj, speed);
+                        if (dummy_port == -1)
+                            log error, 1, log_usb_common:
+                                "device could not be connected to companion hc";
+
+                        log info, 2, log_usb_common:
+                            "port %d owner changed to companion host controller", $i;
+                        $usb_ctrl.own_device[$i] = 0;
+                    }
+                    $line_status = 0;
+                } else {
+                    if ($companion_hc[$i].obj != NULL
+                        && $usb_devices[$i].obj != NULL) {
+                        local int res;
+                        res = $companion_hc[$i].usb.disconnect_device(
+                            $usb_devices[$i].obj);
+                        call $reset_port($i); // TODO should we do this?
+
+                        log info, 2, log_usb_common:
+                            "port %d owner changed to this host controller", $i;
+                        $usb_ctrl.own_device[$i] = 1;
+                    }
+                }
+                call $connect_status.update();
+                call $update_line_speed($i);
+            }
+
+            method do_write(value) default {
+                if ($usb_regs.configflag.cf == 1) {
+                    call $change(value);
+                }
+            }
+
+            method write(value) {
+                inline $do_write(value);
+            }
+        }
+        field port_power              [12:12] {
+            method write(value) {
+                if ($this == value || $usb_regs.hcsparams.ppc == 0)
+                    return;
+                $this = value;
+                if ($this == 0) {
+                    $port_reset = 0;
+                    $port_enabled = 0;
+                    $port_enabled_change = 0;
+                } else {
+                    call $port_enabled.change(1);
+                }
+                call $connect_status.update();
+            }
+        }
+        field line_status             [11:10] is (read_only);
+        field port_reset               [8:8] {
+            method write(value) {
+                if ($this == value)
+                    return;
+                if (value == 1)
+                    call $reset_port($i);
+                $this = value;
+            }
+        }
+        field suspend                  [7:7] is (write_unimplemented);
+        field force_port_resume        [6:6] is (write_unimplemented);
+        field over_current_change      [5:5] is (write_1_clears);
+        field over_current             [4:4] is (read_only, read_unimplemented);
+        field port_enabled_change      [3:3] is (write_1_clears);
+        field port_enabled             [2:2] {
+            method change(uint1 value) {
+                if ($this == value)
+                    return;
+                $this = value;
+                $port_enabled_change = 1;
+                inline $usb_regs.usbsts.interrupt.update(1<<USB_EHCI_INT_PORT_CHANGE_DETECT);
+                call $update_interrupts();
+                call $update_line_speed($i);
+            }
+            method write(value) {
+                if (value == 0 && $port_enabled == 1)
+                    call $change(0);
+            }
+        }
+        field connect_status_change    [1:1] {
+            method update(value) {
+                $this = value;
+                inline $update_port_change_detect($this);
+            }
+            method write(value) {
+                $this &= ~value;
+                inline $update_port_change_detect($this);
+                call $update_interrupts();
+            }
+        }
+        field connect_status           [0:0] is (read_only) {
+            method update() default {
+                local uint1 value = $usb_devices[$i].obj != NULL
+                                 && $port_power
+                                 && !$port_owner;
+                if ($this != value) {
+                    inline $connect_status_change.update(1);
+                    $this = value;
+                    // When the status change bits are set to a one, the host
+                    // controller sets the Port Change Detect bit in the USBSTS
+                    // register to a one
+                    inline $usb_regs.usbsts.interrupt.update(1<<USB_EHCI_INT_PORT_CHANGE_DETECT);
+                    call $update_interrupts();
+                }
+            }
+        }
+    }
+}
+
+method usb_ehci_post_init default {}
+method interrupt_side_effects(uint8 interrupt) default {}
+method update_port_change_detect(uint1 cs_change) default {}
+
+method post_init {
+    // Do the delayed call to update now that we have the clock object
+    local conf_object_t *clock = SIM_object_clock($dev.obj);
+    if (clock) {
+        SIM_require_object(clock);
+        call $all_list_update();
+    } else {
+        log error:
+            "Device does not have a queue but needs to post an event.";
+    }
+
+    call $usb_ehci_post_init;
+}

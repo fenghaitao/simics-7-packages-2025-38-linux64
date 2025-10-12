@@ -1,0 +1,689 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "internal.dml";
+
+/////////////////
+// Descriptors //
+/////////////////
+
+typedef struct {
+    uint32 status;                           // TDES0/RDES0
+    uint32 bc;                               // TDES1/RDES1
+    uint32 buf1;                             // First address
+    uint32 buf2;                             // Second address
+} descriptor_t;
+
+// bits in first transmit descriptor field
+param TDES0_DE  = 0;                      // Deferred
+param TDES0_UF  = 1;                      // Underflow
+param TDES0_LF  = 2;                      // Link Fail Report
+param TDES0_HF  = 7;                      // Heartbeat Failed
+param TDES0_EC  = 8;                      // Excessive Collisions
+param TDES0_LC  = 9;                      // Late Collision
+param TDES0_NC  = 10;                     // No Carrier
+param TDES0_LO  = 11;                     // Loss of Carrier
+param TDES0_TO  = 14;                     // Transmit Jabber Timeout
+param TDES0_ES  = 15;                     // Error Summary
+param TDES0_OWN = 31;                     // Ownership
+
+// bits in second transmit descriptor field
+param TDES1_FT0 = 22;                     // Filtering Type
+param TDES1_DPD = 23;                     // Disable Padding
+param TDES1_TCH = 24;                     // Second Address Chained
+param TDES1_TER = 25;                     // Transmit End of Ring
+param TDES1_AC  = 26;                     // Add CRC Disable
+param TDES1_SET = 27;                     // Setup Packet
+param TDES1_FT1 = 28;                     // Filtering Type
+param TDES1_FS  = 29;                     // First Segment
+param TDES1_LS  = 30;                     // Last Segment
+param TDES1_IC  = 31;                     // Interrupt on Completion
+
+// bits in first receive descriptor field
+param RDES0_OF  = 0;                      // Overflow
+param RDES0_CE  = 1;                      // CRC Error
+param RDES0_DB  = 2;                      // Dribbling Bit
+param RDES0_RE  = 3;                      // MII Receive Error
+param RDES0_RW  = 4;                      // Receive Watchdog
+param RDES0_FT  = 5;                      // Frame Type
+param RDES0_CS  = 6;                      // Collision Seen
+param RDES0_TL  = 7;                      // Frame Too Long
+param RDES0_LS  = 8;                      // Last Descriptor
+param RDES0_FS  = 9;                      // First Descriptor
+param RDES0_MF  = 10;                     // Multicast Frame
+param RDES0_RF  = 11;                     // Runt Frame
+//       RDES0_DT  = 13:12;                  // Data Type
+param RDES0_DE  = 14;                     // Descriptor Error
+param RDES0_ES  = 15;                     // Error Summary
+//       RDES0_FL  = 29:16;                  // Frame Length
+param RDES0_FF  = 30;                     // Filtering Failed
+param RDES0_OWN = 31;                     // Ownership
+
+// bits in second receive descriptor field
+param RDES1_RCH = 24;                     // Second Address Chained
+param RDES1_RER = 25;                     // Receive End of Ring
+
+
+// Read a descriptor from memory at address 'addr' to fill in 'desc'
+method read_descriptor(descriptor_t *desc, uint32 addr)
+    -> (exception_type_t) {
+    local exception_type_t ex;
+    local uint32 i;
+    local uint32 *desc_data = cast(desc, uint32 *);
+
+    log info, 4: "fetching a descriptor at address 0x%x", addr;
+    ex = pci_data_from_memory(Sim_Addr_Space_Memory, cast(desc, void *), addr,
+                               sizeoftype(descriptor_t));
+
+    // Read the descriptor in correct endian format
+    for (i=0; i<(sizeoftype(descriptor_t)/4); i++) {
+        if (csr.csr0.dbo.val == 1)              // big-endian descriptors
+            desc_data[i] = LOAD_BE32(&desc_data[i]);
+        else                                 // little-endian
+            desc_data[i] = LOAD_LE32(&desc_data[i]);
+    }
+    return ex;
+}
+
+
+// Write a descriptor to memory at address 'addr' from 'desc'
+method write_descriptor(descriptor_t *desc, uint32 addr)
+    -> (exception_type_t) {
+    local exception_type_t ex;
+    local uint32 i;
+    local descriptor_t desc_tmp;
+    local uint32 *desc_tmp_data;
+    local uint32 *desc_data = cast(desc, uint32 *);
+
+    // Put back the descriptor into correct endian format
+    desc_tmp_data = cast(&desc_tmp, uint32 *);
+    for (i=0; i<(sizeoftype(descriptor_t)/4); i++) {
+        if (csr.csr0.dbo.val == 1)              // big-endian descriptors
+            STORE_BE32(&desc_tmp_data[i], desc_data[i]);
+        else                                 // little-endian
+            STORE_LE32(&desc_tmp_data[i], desc_data[i]);
+    }
+
+    log info, 4: "writing a descriptor at address 0x%x", addr;
+    ex = pci_data_to_memory(Sim_Addr_Space_Memory, cast(&desc_tmp, void *), 
+                             addr, sizeoftype(descriptor_t));
+    return ex;
+}
+
+
+// Update the current TX address to point to the next descriptor
+method compute_next_tx_descriptor(descriptor_t *txd) {
+    if (txd->bc[TDES1_TER] == 1) {
+        // end of ring
+        log info, 4: "end of ring, starting again at 0x%x", csr.csr4.val;
+        csr.current_tx_address.val = csr.csr4.val;
+    } else if (txd->bc[TDES1_TCH] == 1) {
+        // chained
+        log info, 4: 
+            "chained descriptor, next address is 0x%x", txd->buf2;
+        csr.current_tx_address.val = txd->buf2;
+    } else {
+        // next descriptor in ring
+        local uint32 new_address = 
+            csr.current_tx_address.val + 16 + (4 * csr.csr0.dsl.val);
+        log info, 4: "next ring descriptor is 0x%x", new_address;
+        csr.current_tx_address.val = new_address;
+    }
+}
+
+
+// Update the current RX address to point to the next descriptor
+method compute_next_rx_descriptor(descriptor_t *rxd) {
+    if (rxd->bc[RDES1_RER] == 1) {
+        // end of ring
+        log info, 4: "end of ring, starting again at 0x%x", csr.csr3.val;
+        csr.current_rx_address.val = csr.csr3.val;
+    } else if (rxd->bc[RDES1_RCH] == 1) {
+        // chained?
+        log info, 4: 
+            "chained descriptor, next address is 0x%x", rxd->buf2;
+        csr.current_rx_address.val = rxd->buf2;
+    } else {
+        // next descriptor in ring
+        local uint32 new_address = 
+            csr.current_rx_address.val + 16 + (4 * csr.csr0.dsl.val);
+        log info, 4: "next ring descriptor is 0x%x", new_address;
+        csr.current_rx_address.val = new_address;
+    }
+}
+
+
+
+
+////////////////
+// Interrupts //
+////////////////
+
+// Interrupts in CSR5/7
+param INT_TI  =  0;  // Transmit Interrupt
+param INT_TPS =  1;  // Transmit Process Stop
+param INT_TU  =  2;  // Transmit Buffer Unavailable
+param INT_TJT =  3;  // Transmit Jabber Timeout
+param INT_UNF =  5;  // Transmit Underflow
+param INT_RI  =  6;  // Receive Interrupt
+param INT_RU  =  7;  // Receive Buffer Unavailable
+param INT_RPS =  8;  // Receive Process Stopped
+param INT_RWT =  9;  // Receive Watchdog Timeout
+param INT_ETI = 10;  // Early Transmit Interrupt
+param INT_GTE = 11;  // General-purpose Timer Expired
+param INT_FBE = 13;  // Fatal Bus Error
+
+// Normal interrupts
+param INT_NORMAL_MASK = ((1 << INT_TI) |
+                            (1 << INT_TU) |
+                            (1 << INT_RI));
+
+// Errors
+param INT_ABNORMAL_MASK = ((1 << INT_TPS) |
+                              (1 << INT_TJT) |
+                              (1 << INT_UNF) |
+                              (1 << INT_RU)  |
+                              (1 << INT_RPS) |
+                              (1 << INT_RWT) |
+                              (1 << INT_ETI) |
+                              (1 << INT_GTE) |
+                              (1 << INT_FBE));
+
+
+// Update interrupt summary and PCI interrupt pin according to current status
+method update_interrupts() {
+    // update interrupt summary
+    if ((csr.csr5.itr.val & INT_ABNORMAL_MASK & csr.csr7.itr_mask.val) != 0)
+        csr.csr5.ais.val = 1 & csr.csr7.ais_mask.val;
+    else
+        csr.csr5.ais.val = 0;
+
+    if ((csr.csr5.itr.val & INT_NORMAL_MASK & csr.csr7.itr_mask.val) != 0)
+        csr.csr5.nis.val = 1 & csr.csr7.nis_mask.val;
+    else
+        csr.csr5.nis.val = 0;
+
+    // set PCI interrupt pin
+    if ((csr.csr5.nis.val | csr.csr5.ais.val) != 0)
+        pci_config.pci_raise_interrupt();
+    else
+        pci_config.pci_lower_interrupt();
+}
+
+
+// Raise a given interrupt 'bit'
+method raise_interrupt(int bit) {
+    if (csr.csr5.itr.val[bit] == 0)
+        log info, 4: "raise interrupt %d", bit;
+    csr.csr5.itr.val[bit] = 1;
+    update_interrupts();
+}
+
+
+// Lower a given interrupt 'bit'
+method lower_interrupt(int bit) {
+    if (csr.csr5.itr.val[bit] == 1)
+        log info, 4: "lower interrupt %d", bit;
+    csr.csr5.itr.val[bit] = 0;
+    update_interrupts();
+}
+
+
+
+
+
+//////////////////
+// State Engine //
+//////////////////
+
+// Transmit Engine State
+param TX_STOPPED   = 0;
+param TX_FETCHING  = 1;
+param TX_WAITING   = 2;
+param TX_READING   = 3;
+                     // 4 is reserved
+param TX_SETUP     = 5;
+param TX_SUSPENDED = 6;
+param TX_CLOSING   = 7;
+
+// Receive Engine State
+param RX_STOPPED   = 0;
+param RX_FETCHING  = 1;
+param RX_CHECKING  = 2;
+param RX_WAITING   = 3;
+param RX_SUSPENDED = 4;
+param RX_CLOSING   = 5;
+param RX_FLUSHING  = 6;
+param RX_QUEUEING   = 7;
+
+
+// Set the current TX state, raising and lowering interrupt if appropriate
+method set_tx_state(int state) {
+    if (state != csr.csr5.ts.val) {
+        csr.csr5.ts.val = state;
+
+        if (state == TX_STOPPED) {
+            log info, 4: "Tx State: stopped";
+            raise_interrupt(INT_TPS);
+        }
+        else if (state == TX_SUSPENDED) {
+            log info, 4: "Tx State: suspended";
+            lower_interrupt(INT_TPS);
+        }
+        else if (state == TX_WAITING) {
+            log info, 4: "Tx State: waiting";
+            lower_interrupt(INT_TU);
+            lower_interrupt(INT_TPS);
+        }
+        else if (state == TX_FETCHING) {
+            log info, 4: "Tx State: fetching";
+            lower_interrupt(INT_TU);
+            lower_interrupt(INT_TPS);
+        }
+        else if (state == TX_READING) {
+            log info, 4: "Tx State: reading";
+        }
+        else if (state == TX_CLOSING) {
+            log info, 4: "Tx State: closing";
+        }
+    }
+}
+
+method get_tx_state() -> (int) {
+    return csr.csr5.ts.val;
+}
+
+
+// Set the current RX state, raising and lowering interrupt if appropriate
+method set_rx_state(int state) {
+    if (state != csr.csr5.rs.val) {
+        csr.csr5.rs.val = state;
+
+        if (state == RX_STOPPED) {
+            log info, 4: "Rx State: stopped";
+            raise_interrupt(INT_RPS);
+        }
+        else if (state == RX_SUSPENDED) {
+            log info, 4: "Rx State: suspended";
+            lower_interrupt(INT_RPS);
+        }
+        else if (state == RX_WAITING) {
+            log info, 4: "Rx State: waiting";
+            lower_interrupt(INT_RU);
+            lower_interrupt(INT_RPS);
+        }
+        else if (state == RX_FETCHING) {
+            log info, 4: "Rx State: fetching";
+            lower_interrupt(INT_RU);
+            lower_interrupt(INT_RPS);
+        }
+        else if (state == RX_CHECKING) {
+            log info, 4: "Rx State: reading";
+        }
+        else if (state == RX_CLOSING) {
+            log info, 4: "Rx State: closing";
+        }
+        else if (state == RX_FLUSHING) {
+            log info, 4: "Rx State: flushing";
+        }
+        else if (state == RX_QUEUEING) {
+            log info, 4: "Rx State: queueing";
+        }
+    }
+}
+
+method get_rx_state() -> (int) {
+    return csr.csr5.rs.val;
+}
+
+
+
+
+/////////////////////
+// Transmit Engine //
+/////////////////////
+
+// Return values for transmit_frame()
+param TRANSMIT_NEXT  = 0;
+param TRANSMIT_END   = 1;
+param TRANSMIT_ERR   = 2;
+param TRANSMIT_LATER = 3;
+
+// Run the transmit process, looping over descriptors until everything is sent,
+// a delay is requested or an error is returned.
+method transmit() {
+    local int result;
+    local descriptor_t txd;
+
+    log info, 3: "transmit process running";
+
+    // Loop as long as we are allowed to work on the next descriptor
+    do {
+        result = transmit_frame(&txd);
+        if (result == TRANSMIT_NEXT || result == TRANSMIT_LATER) {
+            compute_next_tx_descriptor(&txd);
+            set_tx_state(TX_WAITING);
+        }
+    } while (result == TRANSMIT_NEXT);
+}
+
+
+// Handle a single frame, that may span over several descriptor
+method transmit_frame(descriptor_t *txd) -> (int) {
+    local int result;
+    local dbuffer_t *frame;
+    local int buffer_size;
+    local exception_type_t ex;
+
+    // Fetch the current descriptor
+    set_tx_state(TX_FETCHING);
+    ex = read_descriptor(txd, csr.current_tx_address.val);
+    if (ex != Sim_PE_No_Exception) {
+        log info, 1: "could not read descriptor at address 0x%x",
+            csr.current_tx_address.val;
+        set_tx_state(TX_SUSPENDED);
+        raise_interrupt(INT_TU);
+
+        return TRANSMIT_ERR;
+    }
+
+    log info, 4:
+        "new transmit descriptor fetched: 0x%x, 0x%x, 0x%x, 0x%x",
+        txd->status, txd->bc, txd->buf1, txd->buf2;
+
+    // Do we own the descriptor?
+    if (txd->status[TDES0_OWN] == 0) {
+        // No
+        log info, 2: "transmit buffer unavailable";
+        set_tx_state(TX_SUSPENDED);
+        raise_interrupt(INT_TU);
+        return TRANSMIT_ERR;
+    }
+
+    // Is this a setup packet?
+    if (txd->bc[TDES1_SET] == 1) {
+        // Yes
+        set_tx_state(TX_SETUP);
+        log info, 4: "received setup frame";
+
+        if (txd->bc[10:0] != 192) {
+            // Wrong size
+            log info, 1: "setup frame is not 192 bytes long";
+            set_tx_state(TX_SUSPENDED);
+            raise_interrupt(INT_TU);
+            return TRANSMIT_ERR;
+        }
+
+        if (txd->bc[TDES1_IC])
+            raise_interrupt(INT_TI);
+        txd->status = 0x7FFFFFFF;
+        ex = write_descriptor(txd, csr.current_tx_address.val);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 1:
+                "could not write descriptor at address 0x%x",
+                csr.current_tx_address.val;
+            set_tx_state(TX_SUSPENDED);
+            raise_interrupt(INT_TU);
+            result = TRANSMIT_ERR;
+        } else {
+            result = TRANSMIT_NEXT;
+        }
+        return result;
+    }
+
+    // Is this an empty frame? (can come after setup frame)
+    if (txd->bc[TDES1_FS] == 0
+        && txd->bc[TDES1_LS] == 0
+        && txd->buf1 == 0) {
+        // Yes
+        log info, 4: "got empty frame";
+        txd->status = 0x7FFFFFFF;
+        ex = write_descriptor(txd, csr.current_tx_address.val);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 1:
+                "could not write descriptor at address 0x%x",
+                csr.current_tx_address.val;
+            set_tx_state(TX_SUSPENDED);
+            raise_interrupt(INT_TU);
+            result = TRANSMIT_ERR;
+        } else {
+            result = TRANSMIT_NEXT;
+        }
+        return result;
+    }
+
+    // Is the first frame bit set? If not, ignore the frame
+    if (txd->bc[TDES1_FS] == 0) {
+        // No
+        log info, 1:
+            "fetching a frame with first frame bit not set";
+        txd->status = 0x7FFFFFFF;
+        ex = write_descriptor(txd, csr.current_tx_address.val);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 1:
+                "could not write descriptor at address 0x%x",
+                csr.current_tx_address.val;
+            set_tx_state(TX_SUSPENDED);
+            raise_interrupt(INT_TU);
+            result = TRANSMIT_ERR;
+        } else {
+            result = TRANSMIT_NEXT;
+        }
+        return result;
+    }
+
+    // Build the packet to send
+    // Loop over the descriptors until end of frame
+    frame = new_dbuffer();
+
+    while (true) {
+        set_tx_state(TX_READING);
+
+        // First buffer
+        buffer_size = txd->bc[10:0];
+        if (buffer_size > 0)
+            ex = pci_data_from_memory(Sim_Addr_Space_Memory,
+                                       dbuffer_append(frame, buffer_size),
+                                       txd->buf1,
+                                       buffer_size);
+
+        // Second buffer, if any
+        if (txd->bc[TDES1_TCH] == 0) {
+            buffer_size = txd->bc[21:11];
+            if (buffer_size > 0)
+                ex = pci_data_from_memory(Sim_Addr_Space_Memory,
+                                           dbuffer_append(frame, buffer_size),
+                                           txd->buf2,
+                                           buffer_size);
+        }
+
+        // Clear all error flags and write descriptor
+        set_tx_state(TX_CLOSING);
+        txd->status[15:0] = 0;
+        txd->status[TDES0_OWN] = 0;
+        ex = write_descriptor(txd, csr.current_tx_address.val);
+        if (ex != Sim_PE_No_Exception) {
+            log info, 1:
+                "could not write descriptor at address 0x%x",
+                csr.current_tx_address.val;
+            set_tx_state(TX_SUSPENDED);
+            raise_interrupt(INT_TU);
+            dbuffer_free(frame);
+            return TRANSMIT_ERR;
+        }
+
+        // Last segment in frame?
+        if (txd->bc[TDES1_LS] == 1) {
+            // should be dependent on a bit, not added automatically
+            if (dbuffer_len(frame) < (64 - 4))
+                dbuffer_append_value(frame, 0,
+                                     64 - dbuffer_len(frame));
+            else
+                dbuffer_append_value(frame, 0, 4);
+
+            // bandwidth available?
+            if (phy.ieee_802_3_phy_v2.check_tx_bandwidth() != 0) {
+                log info, 4: "bandwidth available, sending now";
+                result = phy.ieee_802_3_phy_v2.send_frame(frame, 1);
+                dbuffer_free(frame);
+                // check that we don't get bandwidth problem, since we already
+                // checked that it was available
+                assert(result != -1);
+                if (txd->bc[TDES1_IC] == 1)
+                    raise_interrupt(INT_TI);
+                result = TRANSMIT_NEXT;
+            } else {
+                log info, 4: "bandwidth not available, sending later";
+                pending_tx_interrupt = txd->bc[TDES1_IC];
+                pending_frame = frame;
+                result = TRANSMIT_LATER;
+            }
+
+            return result;
+        } else {
+            compute_next_tx_descriptor(txd);
+
+            // Fetch the next descriptor
+            set_tx_state(TX_FETCHING);
+            ex = read_descriptor(txd, csr.current_tx_address.val);
+            if (ex != Sim_PE_No_Exception) {
+                log info, 1:
+                    "could not read descriptor at address 0x%x",
+                    csr.current_tx_address.val;
+                set_tx_state(TX_SUSPENDED);
+                raise_interrupt(INT_TU);
+                dbuffer_free(frame);
+                return TRANSMIT_ERR;
+            }
+        }
+    }
+    return result;
+}
+
+
+// transmit_more() is called when more bandwidth is available to check if the
+// transmit process should run further or not.
+session dbuffer_t *pending_frame;          // frame waiting to be sent
+session int pending_tx_interrupt;          // interrupt raised after sending
+
+method transmit_more() {
+    local int state;
+    local int result;
+
+    log info, 4: "IEEE 802.3: bandwidth available";
+    state = get_tx_state();
+    if (state == TX_WAITING) {
+        if (pending_frame != NULL) {
+            result = phy.ieee_802_3_phy_v2.send_frame(pending_frame, 1);
+            assert(result != -1);
+            if (pending_tx_interrupt == 1) {
+                raise_interrupt(INT_TI);
+                pending_tx_interrupt = 0;
+            }
+            pending_frame = NULL;
+        }
+        transmit();
+    }
+}
+
+
+
+
+////////////////////
+// Receive Engine //
+////////////////////
+
+// receive() is run to handle an incoming frame
+method receive(const frags_t *frame, int crc_ok) {
+    local int size = frags_len(frame);
+    local uint8 buf[size];
+    frags_extract(frame, buf);
+    local descriptor_t rxd;
+    local exception_type_t ex;
+
+    log info, 4: "received a %d bytes packet", size;
+
+    // read the current descriptor from main memory
+    set_rx_state(RX_FETCHING);
+    ex = read_descriptor(&rxd, csr.current_rx_address.val);
+    if (ex != Sim_PE_No_Exception) {
+        log info, 1, 0: "could not read descriptor at address 0x%x",
+            csr.current_rx_address.val;
+        raise_interrupt(INT_RU);
+        set_rx_state(RX_SUSPENDED);
+        return;
+    }
+
+    log info, 4:
+        "new receive descriptor fetched: 0x%x, 0x%x, 0x%x, 0x%x",
+        rxd.status, rxd.bc, rxd.buf1, rxd.buf2;
+
+    // is this descriptor owned by the host (own = 0)?
+    if (rxd.status[RDES0_OWN] == 0) {
+        log info, 2: "no receive buffer available";
+        raise_interrupt(INT_RU);
+        set_rx_state(RX_SUSPENDED);
+        return;
+    }
+
+    // splitting a frame into several buffers is not implemented yet
+    if (rxd.bc[10:0] < size) {
+        log unimpl, 1:
+            "splitting a packet in several buffers is not implemented";
+        return;
+    }
+
+    // First and last descriptor
+    rxd.status = 0;
+    rxd.status[RDES0_FS] = 1;
+    rxd.status[RDES0_LS] = 1;
+
+    // set data type to 0 (serial received frame)
+    rxd.status[13:12] = 0;
+
+    // assume all frames are IEEE 802.3
+    rxd.status[RDES0_FT] = 0;
+
+    // save the length of the frame
+    rxd.status[29:16] = size;
+
+    // write packet into descriptor buffer 1
+    set_rx_state(RX_FLUSHING);
+    ex = pci_data_to_memory(Sim_Addr_Space_Memory, buf, rxd.buf1, size);
+    if (ex != Sim_PE_No_Exception) {
+        log info, 1: "could not write data at address 0x%x",
+            rxd.buf1;
+        raise_interrupt(INT_RU);
+        set_rx_state(RX_SUSPENDED);
+        return;
+    }
+
+    // clear the ownership bit
+    rxd.status[RDES0_OWN] = 0;
+
+    // write the current descriptor to main memory
+    ex = write_descriptor(&rxd, csr.current_rx_address.val);
+    if (ex != Sim_PE_No_Exception) {
+        log info, 1: "could not write descriptor at address 0x%x",
+            csr.current_rx_address.val;
+        raise_interrupt(INT_RU);
+        set_rx_state(RX_SUSPENDED);
+        return;
+    }
+
+    compute_next_rx_descriptor(&rxd);
+    raise_interrupt(INT_RI);
+    set_rx_state(RX_WAITING);
+}

@@ -1,0 +1,1645 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+device generic_spi_flash;
+
+param desc = "512Kbit to 1Gbit Serial Flash Memory";
+param documentation = "The <class>" + classname + "</class> class "
+    + " implements the M25P05/10/20/40/80/16/32/64/128, N25Q256A/512A/00AA"
+    + " and W25Q80/16/32/64/128 BV/CV"
+    + " serial flash memories, accessed via the SPI Interface."
+    + " Different flash models using serial interface from different"
+    + " manufactures can be implemented by manually configure JEDEC ID,"
+    + " sector number and sector size attributes."
+    + "<ul>"
+    + "  <li>Unimplemented features:"
+    + "    <ul>"
+    + "      <li>operation waiting state</li>"
+    + "      <li>Non-8bit align SPI transfer</li>"
+    + "    </ul>"
+    + "  </li>"
+    + "  <li>4-byte address mode is implemented for Micron N25Q family.</li>"
+    + "</ul>";
+
+import "utility.dml";
+import "simics/devs/serial-peripheral-interface.dml";
+import "simics/model-iface/image.dml";
+import "simics/devs/signal.dml";
+import "simics/simulator-api.dml";
+
+is hard_reset;
+
+param ST_IDLE            = 0;
+param ST_READY           = 1;
+param ST_CMD             = 2;
+param ST_ADDRESS         = 3;
+param ST_DUMMY           = 4;
+param ST_EXECUTE         = 5;
+param ST_RDATA           = 6;
+param ST_TDATA           = 7;
+param ST_TERM            = 8;
+
+param FCMD_NOP           = 0x0;
+param FCMD_WRSR          = 0x1;
+param FCMD_PP            = 0x2;
+param FCMD_READ          = 0x3;
+param FCMD_WRDI          = 0x4;
+param FCMD_RDSR          = 0x5;
+param FCMD_WREN          = 0x6;
+param FCMD_PW            = 0xa;
+param FCMD_FREAD         = 0xb;
+param FCMD_SSE           = 0x20;
+param FCMD_FP_QUAD_I     = 0x32;  // windbond, infineon
+param FCMD_FP_QUAD_I_V2  = 0x38;  // macronix, infineon
+param FCMD_FREAD_DUAL_O  = 0x3b;
+param FCMD_FREAD_DUAL_IO = 0xbb;
+param FCMD_RDMID         = 0x90;
+param FCMD_RDID          = 0x9f;
+param FCMD_FP_DUAL_I     = 0xa2;
+param FCMD_RES           = 0xab;
+param FCMD_DP            = 0xb9;
+param FCMD_BE            = 0xc7;
+param FCMD_SE            = 0xd8;
+param FCMD_PE            = 0xdb;
+param FCMD_WRLR          = 0xe5;
+param FCMD_RDLR          = 0xe8;
+
+param FCMD_RDFSR         = 0x70;
+param FCMD_RDEAR         = 0xc8;
+param FCMD_WREAR         = 0xc5;
+
+param FCMD_WRBRV         = 0x17;  // issi
+param FCMD_WRBRNV        = 0x18;  // issi
+
+param FCMD_EN4B          = 0xb7;
+param FCMD_EX4B          = 0xe9;
+
+param FCMD_READ4         = 0x13;
+param FCMD_FREAD4        = 0xc;
+param FCMD_FREAD4_DUAL_O = 0x3c;
+
+// QUAD related commands
+param FCMD_ENQD   = 0x35;  // enable quad mode
+param FCMD_RSTQD  = 0xf5;  // reset quad mode
+param FCMD_FREAD_QUAD_O  = 0x6b;
+param FCMD_FREAD_QUAD_IO = 0xeb;
+param FCMD_FREAD4_QUAD_O = 0x6c;  // 4-byte address, 1-1-4
+param FCMD_FREAD4_QUAD_IO = 0xec;  // 4-byte address, 1-4-4
+param FCMD_WRENHV = 0x61;  // write enhanced volatile configuration register
+param FCMD_RDENHV = 0x65;  // read  enhanced volatile configuration register
+
+param FCMD_PP_4B         = 0x12;
+param FCMD_FP_4B_QUAD_I  = 0x34;
+
+param FCMD_SE_4B         = 0xdc;
+param FCMD_SSE_4B        = 0x21;
+
+param FCMD_EWSR  = 0x50;  // Enable Write Status Register
+param FCMD_CE    = 0x60;  // Chip erase, same as 0xC7
+param FCMD_DE    = 0xc4;  // Die Erase, same as Chip Erase 0x60 and 0xC7
+param FCMD_32BE  = 0x52;  // 32 Kbyte Block Erase
+                             // Note that 0xD8 could be 64Kbyte Block Erase
+param FCMD_32BE_4B = 0x5c;  // 32 Kbyte Block Erase 4-byte mode
+
+param FCMD_RSFDP = 0x5A;  // Read SFDP
+
+param NUM_OF_FCMDS  = 256;  // Maximum command number
+
+header %{
+    #include <simics/util/vect.h>
+    #include <simics/util/swabber.h>
+%}
+extern void VINIT(...);
+extern int VLEN(...);
+extern uint8* VVEC(...);
+extern void VRESIZE(...);
+extern void VRESIZE_FREE(...);
+
+/* Some example of different flash info from different manufactures:
+   {device ID, sector size, sector number, extended_id}
+
+   Spansion - Manufacture ID 0x01
+   http://www.spansion.com/Products/Pages/ProductFinder.aspx
+   S25FL004A:   { 0x0212, 64K,  8,   },
+   S25FL008A:   { 0x0213, 64K,  16,  },
+   S25FL016A:   { 0x0214, 64K,  32,  },
+   S25FL032A:   { 0x0215, 64K,  64,  },
+   S25FL032P:   { 0x0215, 64K,  64,  0x4D, },
+   S25FL064A:   { 0x0216, 64K,  128, },
+
+   Atmel - Manufacture ID 0x1f
+   http://www.atmel.com/products/memories/sflash/default.aspx
+   AT45DB011D:  { 0x2200, 32K,  4,   },
+   AT45DB021D:  { 0x2300, 32K,  8,   },
+   AT45DB041D:  { 0x2400, 64K,  8,   },
+   AT45DB081D:  { 0x2500, 64K,  16,  },
+   AT45DB161D:  { 0x2600, 128K, 16,  },
+   AT45DB321D:  { 0x2700, 64K,  64,  },
+
+   Micron - Manufacture ID 0x20
+   http://www.micron.com/products/nor-flash/serial-nor-flash
+   M25P05-A:    { 0x2010, 32K, 2,    },
+   M25P10-A:    { 0x2011, 32K, 4,    },
+   M25P20:      { 0x2012, 64K, 4,    },
+   M25P40:      { 0x2013, 64K, 8,    },
+   M25P80:      { 0x2014, 64K, 16,   },
+   M25P16:      { 0x2015, 64K, 32,   },
+   M25P32:      { 0x2016, 64K, 64,   },
+   M25P64:      { 0x2017, 64K, 128,  },
+   M25P128:     { 0x2018, 128K, 64,  },
+   N25Q256A:    { 0xbb19, 64K, 512,  },
+   N25Q512A:    { 0xbb20, 64K, 1024, },
+   N25Q00AA:    { 0xba21, 64K, 2048, },
+
+   Winbond - Manufacture ID 0xef
+   http://www.nexflash.com/hq/enu/ProductAndSales/ProductLines/FlashMemory/SerialFlash/
+   W25X05CL:    { 0x3010, 64K, 1,    },
+   W25X10CL:    { 0x3011, 64K, 2,    },
+   W25X20CL:    { 0x3012, 64K, 4,    },
+   W25X40CL:    { 0x3013, 64K, 8,    },
+   W25Q80BL:    { 0x4014, 64K, 16,   },
+   W25Q16CL:    { 0x4015, 64K, 32,   },
+   W25Q32CL:    { 0x4016, 64K, 64,   },
+   W25Q64CL:    { 0x4017, 64K, 128,  },
+
+   Macronix International - Manufacture ID 0xc2
+   http://www.macronix.com/
+   MX25L4005:   { 0x2013, 64K, 8,    },
+   MX25L8005:   { 0x2014, 64K, 16,   },
+   MX25L1605:   { 0x2015, 64K, 32,   },
+   MX25L3205:   { 0x2016, 64K, 64,   },
+   MX25L6405:   { 0x2017, 64K, 128,  },
+   MX25L1285:   { 0x2018, 64K, 256,  },
+*/
+
+attribute elec_signature is (uint64_attr) {
+    param documentation
+        = "Electronic Signature, has default value 0x13."
+        + " this is not the same as, or even a subset of, the JEDEC"
+        + " 16-bit Electronic Signature. this is for reason of backward"
+        + " compatibility, only, and should not be used for new designs."
+        + " It should be configured with value"
+        + " 0x05 for M25P05-A,"
+        + " 0x10 for M25P10-A,"
+        + " 0x11 for M25P20,"
+        + " 0x12 for M25P40,"
+        + " 0x13 for M25P80,"
+        + " 0x14 for M25P16,"
+        + " 0x15 for M25P32."
+        + " 0x16 for M25P64."
+        + " For all other devices not listed above, please check the"
+        + " respective hardware documentation.";
+}
+
+attribute JEDEC_signature {
+    param documentation
+        = "JEDEC standard signature. It should be configured in format like"
+        + " [0x20, 0x20, 0x15] for M25P16."
+        + " Please refer to the hardware documentation for the correct value.";
+    param type = "n|[iii]";
+    method set(attr_value_t val) throws {
+        if (SIM_attr_is_nil(val)) {
+            rdid_enabled = false;
+        } else {
+            rdid_enabled = true;
+            local int i;
+            for (i = 0; i < 3; i++)
+                jedec_id[i] = SIM_attr_integer(SIM_attr_list_item(val, i));
+        }
+    }
+    method get() -> (attr_value_t) {
+        if (rdid_enabled) {
+            return SIM_make_attr_list(3,
+                                     SIM_make_attr_uint64(jedec_id[0]),
+                                     SIM_make_attr_uint64(jedec_id[1]),
+                                     SIM_make_attr_uint64(jedec_id[2]));
+        } else {
+            return SIM_make_attr_nil();
+        }
+    }
+}
+
+attribute extended_id {
+    param documentation
+        = "Extended device identification. It is only implemented in some"
+        + " flash models. For those models, the two bytes are used to"
+        + " identify different devices. It should be configured like:"
+        + " [0x4d, 0x00] for S25FL032P."
+        + " Please refer to the hardware documentation for the correct value.";
+    param type = "n|[ii]";
+    method set(attr_value_t val) throws {
+        if (SIM_attr_is_nil(val)) {
+            exid_enabled = false;
+        } else {
+            exid_enabled = true;
+            local int i;
+            for (i = 3; i < 5; i++)
+                jedec_id[i] =
+                    SIM_attr_integer(SIM_attr_list_item(val, i - 3));
+        }
+    }
+    method get() -> (attr_value_t) {
+        if (exid_enabled) {
+            return SIM_make_attr_list(2,
+                                     SIM_make_attr_uint64(jedec_id[3]),
+                                     SIM_make_attr_uint64(jedec_id[4]));
+        } else
+            return SIM_make_attr_nil();
+    }
+}
+
+attribute sector_size {
+    param documentation
+        = "Bytes size for flash sector, has default value 0x10000(64 * 1024)."
+        + " Please refer to the hardware documentation for the correct value."
+        + " For example, 0x8000 for M25P05-A";
+    is power_of_two;
+}
+
+attribute sector_number {
+    param documentation
+        = "Sector number in the whole flash, has default value 16."
+        + " Please refer to the hardware documentation for the correct value.";
+    is power_of_two;
+}
+
+attribute sector_lock {
+    param documentation = "The SPM1 lock registers.";
+    param configuration = "optional";
+    param type = "d";
+
+    session uint8 vect buffer;
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_data(VLEN(buffer), VVEC(buffer));
+    }
+
+    method set(attr_value_t val) throws {
+        local size_t i;
+        local const uint8 *dat;
+
+        VRESIZE_FREE(buffer, SIM_attr_data_size(val));
+        dat = SIM_attr_data(val);
+        for (i = 0; i < SIM_attr_data_size(val); i++)
+            buffer[i] = dat[i];
+    }
+}
+
+attribute frdo_enabled {
+    param documentation
+        = "Enable DUAL OUTPUT FAST READ Command."
+        + " Please refer to the hardware documentation to set True.";
+    is bool_attr;
+}
+
+attribute frqo_enabled {
+    param documentation
+        = "Enable QUAD OUTPUT FAST READ Command."
+        + " Please refer to the hardware documentation to set True.";
+    is bool_attr;
+}
+
+attribute fpdi_enabled {
+    param documentation
+        = "Enable DUAL INPUT FAST PROGRAM Command."
+        + " Please refer to the hardware documentation to set True.";
+    is bool_attr;
+}
+
+attribute fpqi_enabled {
+    param documentation
+        = "Enable QUAD INPUT FAST PROGRAM Command."
+        + " Please refer to the hardware documentation to set True.";
+    is bool_attr;
+}
+
+attribute addr4b_enabled {
+    param documentation = "Enable 4-byte address mode.";
+    is bool_attr;
+}
+
+attribute dual_parallel_enabled {
+    param documentation
+        = "Device represents two instances in dual parallel mode.";
+    is bool_attr;
+
+    method set(attr_value_t val) throws {
+        local bool enabled = SIM_attr_boolean(val);
+        if (SIM_object_is_configured(dev.obj) && (this.val != enabled)) {
+            if (enabled)
+                sector_size.val = sector_size.val << 1;
+            else
+                sector_size.val = sector_size.val >> 1;
+        }
+        this.val = enabled;
+    }
+}
+
+attribute fcmd_counter[i < NUM_OF_FCMDS] {
+    param documentation = "Array of the commands statistic counters.";
+    is uint64_attr;
+}
+
+connect spi_master {
+    param documentation = "SPI master this device connected to.";
+    param configuration = "optional";
+    interface serial_peripheral_interface_master;
+
+    method set_master(conf_object_t *obj, const char *port) throws {
+        local attr_value_t val;
+        local set_error_t err;
+
+        if (obj) {
+            if (!port)
+                val = SIM_make_attr_object(obj);
+            else
+                val = SIM_make_attr_list(2, SIM_make_attr_object(obj),
+                                         SIM_make_attr_string(port));
+        } else
+            val = SIM_make_attr_nil();
+
+        err = set_attribute(val);
+        SIM_attr_free(&val);
+        if (err != Sim_Set_Ok)
+            throw;
+    }
+
+    method spi_response(int bits, dbuffer_t *payload) {
+        serial_peripheral_interface_master.spi_response(bits, payload);
+    }
+}
+
+connect mem_block {
+    param documentation
+        = "Connects to an <class>image</class> object which holding the data,"
+        + " the <attr>size</attr> of attached object should be equal to"
+        + " <attr>sector_number.val</attr> * <attr>sector_size.val</attr>.";
+    param configuration = "required";
+    is flash_image;
+}
+
+attribute pp_buffer {
+    param documentation = "buffer for holding page program data";
+    param configuration = "optional";
+    param type = "d|n";
+    session uint8 buf[512];
+
+    method set(attr_value_t val) throws {
+        if (SIM_attr_is_data(val) && SIM_attr_data_size(val) <= 512)
+            memcpy(&buf[0], SIM_attr_data(val), SIM_attr_data_size(val));
+        else
+            throw;
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_data(512, &buf[0]);
+    }
+
+    method prepare_program_page(uint64 addr) {
+        local uint16 page_size = dual_parallel_enabled.val ? 512 : 256;
+        local uint32 mask = dual_parallel_enabled.val ? ~0x1ff : ~0xff;
+        mem_block.read_flash(addr & mask, &buf[0], page_size);
+    }
+    method write_to_image(uint64 addr) {
+        local uint16 page_size = dual_parallel_enabled.val ? 512 : 256;
+        local uint32 mask = dual_parallel_enabled.val ? ~0x1ff : ~0xff;
+        mem_block.write_flash(addr & mask, &buf[0], page_size);
+    }
+}
+
+port WRITE_PROTECT {
+    implement signal {
+        method signal_raise() {
+            fcl.hwwp.val = 1;
+        }
+        method signal_lower() {
+            fcl.hwwp.val = 0;
+        }
+    }
+}
+
+port TOP_SECTOR_LOCK {
+    implement signal {
+        method signal_raise() {
+            fcl.htsl.val = 1;
+        }
+        method signal_lower() {
+            fcl.htsl.val = 0;
+        }
+    }
+}
+
+port HRESET {
+    implement signal {
+        method signal_raise() {
+            local int i;
+            for (i = 0; i < sector_number.val; i++)
+                sector_lock.buffer[i] = 0;
+            dev.hard_reset();
+        }
+        method signal_lower() {}
+    }
+}
+
+// spi slave interface function definitions
+implement serial_peripheral_interface_slave {
+    method connect_master(conf_object_t *master, const char *port,
+                          serial_peripheral_interface_flags_t flags) throws {
+        if (spi_master.obj)
+            disconnect_master(spi_master.obj);
+
+        spi_master.set_master(master, port);
+        log info, 3: "connect flash to master %s", SIM_object_name(master);
+    }
+
+    method disconnect_master(conf_object_t *master) throws {
+        if (!spi_master.obj)
+            return;
+
+        if (spi_master.obj != master) {
+            log error: "can not be disconnected from master device %s",
+                SIM_object_name(master);
+            throw;
+        } else {
+            spi_master.set_master(NULL, NULL);
+            log info, 3:
+                "disconnect flash from master %s", SIM_object_name(master);
+        }
+        fcl.clean_state();
+    }
+
+    method spi_request(int first, int last, int bits, dbuffer_t *payload) {
+        if (!spi_master.obj) {
+            log error: "flash is not selected, drops SPI request.";
+            return;
+        }
+        fcl.spi_request(first, last, bits, payload);
+    }
+}
+
+bank fcl {
+    param documentation = "Flash control logic";
+    param register_size = 1;
+
+    register status         is (unmapped) "status register";
+    register xmit_state     is (unmapped) "current state";
+    register hwwp           is (unmapped) "Hardware write protect register";
+    register htsl           is (unmapped) "Hardware Top Sector Lock";
+    register dp_mode        is (unmapped) "Deep Power-Down mode register";
+    register rd_bits size 4 is (unmapped) "Received data bits register";
+    register command size 1 is (rx_register) "command register";
+    register address size 4 is (rx_register) "address register";
+    register dummy   size 3 is (rx_register) "dummy bytes register";
+    register cmd_bits       is (unmapped) "Command bits length register";
+    register addr_bits      is (unmapped) "Address bits length register";
+    register dummy_bits     is (unmapped) "Dummy bits length register";
+    register rdid_bits      is (unmapped) "transferred RDID bits";
+    register addr_ext       is (unmapped) "Extended address register";
+    register prev_addr_mode is (unmapped) "Previous address mode";
+    register last_command   is (unmapped) "Last command register";
+
+    register status {
+        field SRWD @ [7] "Status Register Write Protect";
+        field QE @ [6]   "Quad enable bit";
+        field BP @ [5:2] "Block Protect Bits";
+        field WEL @ [1]  "Write Enable Latch Bit";
+        field WIP @ [0]  "Write In Progress Bit";
+    }
+    register command {
+        param bit_length = cmd_bits.val;
+    }
+    register address {
+        param bit_length = addr_bits.val;
+        method get_bit_size() -> (uint8) {
+            if (command.val == FCMD_RSFDP) {  // always in 3-byte mode
+                return 24;
+            } else {
+                return addr4b_enabled.val ? 32 : 24;
+            }
+        }
+        method ready() -> (bool) {
+            local uint8 bit_size = get_bit_size();
+            local bool ready = (bit_size == bit_length);
+            if (ready) {
+                // Fix SIMICS-15555
+                // No setting address more than 16Mb for SFDP command
+                if (!addr4b_enabled.val && addr_ext.val != 0 &&
+                    command.val != FCMD_RSFDP)
+                    this.val |= addr_ext.val << 24;
+
+                this.val &= sector_number.val * sector_size.val - 1;
+            }
+            return ready;
+        }
+    }
+    register dummy {
+        param bit_length = dummy_bits.val;
+        method get_bit_size() -> (uint8) {
+            return (command.val == FCMD_RES) ? 24 : 8;
+        }
+    }
+
+    method clean_state() {
+        xmit_state.val = ST_IDLE;
+        rd_bits.val = 0;
+        cmd_bits.val = 0;
+        addr_bits.val = 0;
+        dummy_bits.val = 0;
+        address.val = 0;
+        rdid_bits.val = 0;
+
+        // restore previous address mode after executing 4-byte address commands
+        switch (command.val) {
+        case FCMD_READ4:
+        case FCMD_FREAD4:
+        case FCMD_FREAD4_DUAL_O:
+        case FCMD_FREAD4_QUAD_O:
+        case FCMD_FREAD4_QUAD_IO:
+        case FCMD_PP_4B:
+        case FCMD_FP_4B_QUAD_I:
+        case FCMD_SE_4B:
+        case FCMD_SSE_4B:
+        case FCMD_32BE_4B:
+            addr4b_enabled.val = (prev_addr_mode.val == 1) ? true : false;
+        default:
+            // do nothing
+        }
+
+        //bug fix: should set WEL prior to every PP command
+        if (command.val == FCMD_PP
+            || (fpdi_enabled.val && command.val == FCMD_FP_DUAL_I)
+            || (fpqi_enabled.val && command.val == FCMD_FP_QUAD_I)
+            || (fpqi_enabled.val && command.val == FCMD_FP_QUAD_I_V2)
+            || command.val == FCMD_PP_4B
+            || (frqo_enabled.val && command.val == FCMD_FP_4B_QUAD_I))
+            fcl.status.WEL.val = 0;
+    }
+
+    method reset_all_cmd_counters() {
+        local uint16 cmd;
+        for (cmd = 0; cmd < NUM_OF_FCMDS; cmd++)
+            reset_cmd_counter(cmd);
+    }
+
+    method reset_cmd_counter(uint8 cmd) {
+        fcmd_counter[cmd].val = 0;
+    }
+
+    method spi_request(int first, int last, int bits, dbuffer_t *payload) {
+        if (cast((dbuffer_len(payload) * 8), int) < bits || bits < 0) {
+            log error:
+                "requires %d bits, but there is only %zd bytes in the payload",
+                bits, dbuffer_len(payload);
+            return;
+        }
+
+        log info, 4: "received SPI request, first=%d, last=%d, bits=%d",
+            first, last, bits;
+
+        if ((bits % 8) != 0) {
+            log unimpl:
+                "non-8bit aligned SPI transfer is unimplemented";
+            return;
+        }
+
+        if (first != 0) {
+            if (xmit_state.val != ST_IDLE) {
+                log spec_viol, 3: "Unexpected restart SPI sequence";
+                clean_state();
+            }
+            xmit_state.val = ST_READY;
+        }
+
+        local int rbits = 0;
+        if (bits > 0)
+            rbits = receive_data(bits, dbuffer_read_all(payload));
+
+        // Count command statistics
+        if (first != 0) {
+            fcmd_counter[command.val].val++;
+        }
+
+        if (rbits < bits) {
+            send_data(bits, rbits);
+        } else {
+            local dbuffer_t *data = new_dbuffer();
+            if (bits > 0)
+                dbuffer_append_value(data, 0x0, (bits + 7) / 8);
+            spi_master.spi_response(bits, payload);
+            dbuffer_free(data);
+        }
+
+        if (last != 0 || xmit_state.val == ST_TERM) {
+            log info, 3: "transferring with master is terminated";
+            if (rd_bits.val != 0)
+                pp_buffer.write_to_image(address.val);
+            clean_state();
+        }
+
+        last_command.val = command.val;
+    }
+
+    method send_data(int bits, int rbits) {
+        if ((xmit_state.val == ST_IDLE) || (xmit_state.val == ST_TERM)) {
+            log info, 4: "flash idle, ignoring %d remaining bits", bits - rbits;
+            return;
+        }
+
+        if (xmit_state.val != ST_TDATA) {
+            log spec_viol, 1: "flash is not ready for transmit data/status";
+            clean_state();
+            return;
+        }
+
+        local dbuffer_t *payload = new_dbuffer();
+        local int len = (bits - rbits) / 8;
+        dbuffer_append_value(payload, 0x0, rbits / 8);
+        if (command.val == FCMD_RDSR) {
+            local uint16 sdata = status.get();
+            log info, 4: "command \"RDSR\": status value 0x%x", sdata;
+            dbuffer_append_value(payload, sdata, len);
+        } else if (command.val == FCMD_READ || command.val == FCMD_FREAD
+                   || (frdo_enabled.val && command.val == FCMD_FREAD_DUAL_O)
+                   || (frdo_enabled.val && command.val == FCMD_FREAD_DUAL_IO)
+                   || (frqo_enabled.val && command.val == FCMD_FREAD_QUAD_O)
+                   || (frqo_enabled.val && command.val == FCMD_FREAD_QUAD_IO)
+                   || command.val == FCMD_READ4 || command.val == FCMD_FREAD4
+                   || (frdo_enabled.val && command.val == FCMD_FREAD4_DUAL_O)
+                   || (frqo_enabled.val && command.val == FCMD_FREAD4_QUAD_O)
+                   || (frqo_enabled.val && command.val == FCMD_FREAD4_QUAD_IO)) {
+            log info, 4: "command \"READ (0x%x)\": %d bytes from 0x%x",
+                command.val, len, address.val;
+            mem_block.read_flash(address.val,
+                                 dbuffer_append(payload, len),
+                                 len);
+            address.val += len;
+            address.val &= sector_number.val * sector_size.val - 1;
+        } else if (command.val == FCMD_RES) {
+            log info, 4:
+                "command \"RES\" and read electronic signature";
+            dbuffer_append_value(payload, elec_signature.val, len);
+        } else if (command.val == FCMD_RDID) {
+            local int rdid_len;
+            local int i;
+            local int bytes;
+            if (!exid_enabled) {
+                log info, 4: "command \"RDID\": %02x %02x %02x",
+                    jedec_id[0], jedec_id[1], jedec_id[2];
+                rdid_len = rdid_bits.val < 24 ? (24 - rdid_bits.val) / 8 : 0;
+            } else {
+                log info, 4: "command \"RDID\": %02x %02x %02x %02x %02x",
+                    jedec_id[0], jedec_id[1], jedec_id[2],
+                    jedec_id[3], jedec_id[4];
+                rdid_len = rdid_bits.val < 40 ? (40 - rdid_bits.val) / 8 : 0;
+            }
+            if (rdid_len != 0) {
+                bytes = (rdid_len > len ? len : rdid_len);
+                for (i = rdid_bits.val / 8; i < rdid_bits.val / 8 + bytes; i++)
+                    dbuffer_append_value(payload, jedec_id[i], 1);
+            }
+            if (len > rdid_len)
+                    dbuffer_append_value(payload, 0x0, len - rdid_len);
+            rdid_bits.val += len * 8;
+        } else if (command.val == FCMD_RDLR) {
+            log info, 4:
+                "command \"RDLR\" read lock register %d bytes from 0x%x",
+                len, address.val;
+            local int sector = address.val / sector_size.val;
+            dbuffer_append_value(payload, sector_lock.buffer[sector], len);
+        } else if (command.val == FCMD_RDFSR) {
+            local uint8 sdata;
+            sdata = 0x80; // program or erase controller ready
+            sdata |= addr4b_enabled.val ? 1 : 0;
+            log info, 4: "command \"RDFSR\": flag status value 0x%x", sdata;
+            dbuffer_append_value(payload, sdata, len);
+        } else if (command.val == FCMD_RDEAR) {
+            local uint8 sdata;
+            sdata = addr_ext.val;
+            log info, 4: "command \"RDEAR\": extended address value 0x%x",
+                sdata;
+            dbuffer_append_value(payload, sdata, len);
+        } else if (command.val == FCMD_RDMID) {
+            log info, 4: "command \"RDMID\", address = %d", address.val;
+            dbuffer_append_value(payload, jedec_id[0], 1);
+            dbuffer_append_value(payload, elec_signature.val, len - 1);
+        } else if (command.val == FCMD_RDENHV) {
+            local uint8 sdata = (frqo_enabled.val && fpqi_enabled.val) ? 0x00 : 0x80;
+            log info, 4: "command \"RDENHV\": value 0x%x", sdata;
+            dbuffer_append_value(payload, sdata, len);
+        } else if (command.val == FCMD_RSFDP) {
+            log info, 4: "command \"READ_SFDP\" %d bytes from 0x%x",
+                    len, address.val;
+            sfdp_data.fetch(address.val, dbuffer_append(payload, len), len);
+
+            address.val += len;
+        }
+
+        local int i;
+        local uint8 *data;
+        for (i = 0; i < len; i++) {
+            data = dbuffer_update(payload, i + rbits / 8, 1);
+            *data = reverse_bits8(*data);
+        }
+
+        spi_master.spi_response(bits, payload);
+        dbuffer_free(payload);
+    }
+
+    method process_received_data(const uint8* data, int start, int bits)
+        -> (int) {
+        local int rlen = (bits - start + 7) / 8;
+
+        local int rbits = 0;
+
+        // WRSR instruction right before EWSR allows alternate status register
+        // even when status.WEL.val is '0'
+        // WRBRV from ISSI does not require write enable
+        if (status.WEL.val == 0 && (last_command.val != FCMD_EWSR && command.val != FCMD_WRBRV)) {
+            log spec_viol, 2: "status/memory are write protected when WEL is 0";
+            xmit_state.val = ST_TERM;
+            return rbits;
+        }
+
+        if (command.val == FCMD_WRSR) {
+            local uint8 rdata = reverse_bits8(data[start/8]);
+            log info, 4: "command \"WRSR\" with value 0x%x", rdata;
+            if (status.SRWD.val == 0 || hwwp.val == 0 || last_command.val == FCMD_EWSR) {
+                status.SRWD.val = rdata[7];
+                status.QE.val = rdata[6];
+                if (sector_number.val <= 4)
+                    status.BP.val = rdata[3:2];
+                else if (sector_number.val > 128)
+                    status.BP.val = rdata[5:2];
+                else
+                    status.BP.val = rdata[4:2];
+            }
+            status.WEL.val = 0;
+            xmit_state.val = ST_TERM;
+            rbits = 8;
+        } else if (command.val == FCMD_WRLR) {
+            local uint8 rdata = reverse_bits8(data[start/8]);
+            local int sector = address.val / sector_size.val;
+            log info, 4: "command \"WRLR\" address 0x%x with value 0x%x",
+                address.val, rdata;
+            if (sector_lock.buffer[sector][1] == 0)
+                sector_lock.buffer[sector] = rdata;
+            else
+                log spec_viol, 2:
+                    "Sector %d lock register lock-down bit set, write ignored",
+                    sector;
+            status.WEL.val = 0;
+            xmit_state.val = ST_TERM;
+            rbits = 8;
+        } else if (command.val == FCMD_WREAR) {
+            local uint8 rdata = reverse_bits8(data[start/8]);
+            log info, 4: "command \"WREAR\" with value 0x%x", rdata;
+            addr_ext.val = rdata;
+            status.WEL.val = 0;
+            xmit_state.val = ST_TERM;
+            rbits = 8;
+        } else if (command.val == FCMD_WRBRV || command.val == FCMD_WRBRNV) {
+            local uint8 rdata = reverse_bits8(data[start/8]);
+            log info, 4: "command \"WRBRV\" with value 0x%x", rdata;
+            addr4b_enabled.val = rdata[7] == 1 ? true : false;
+            addr_ext.val = rdata[0];
+            xmit_state.val = ST_TERM;
+            rbits = 8;
+            if (command.val == FCMD_WRBRNV)
+                status.WEL.val = 0;
+        } else if (command.val == FCMD_WRENHV) {
+            local uint8 rdata = reverse_bits8(data[start/8]);
+            local bool quad_io = (rdata & 0x80) == 0x00;
+            frqo_enabled.val = quad_io;
+            fpqi_enabled.val = quad_io;
+            log info, 4: "%s QUAD I/O mode", quad_io ? "Enable" : "Disable";
+            status.WEL.val = 0;
+            xmit_state.val = ST_TERM;
+            rbits = 8;
+        } else if (rlen > 0) {
+            log info, 4: "command \"PROGRAM (0x%x)\": %d bytes to flash 0x%x",
+                command.val, rlen, address.val;
+
+            local bool is_protected = mem_block.sector_protected(address.val,
+                                                                 status.BP.val);
+            rbits = rlen * 8;
+            if (is_protected) {
+                log spec_viol, 2: "trying write to protected sector %d",
+                    address.val / sector_size.val;
+                return rbits;
+            }
+
+            if (command.val == FCMD_PW)
+                mem_block.erase_page(address.val, status.BP.val);
+
+            if (rd_bits.val == 0)
+                pp_buffer.prepare_program_page(address.val);
+
+            local int i;
+            local uint8 ddata;
+            local const uint8 *sdata = &data[start/8];
+            local uint32 addr = address.val + rd_bits.val / 8;
+            local uint32 mask = dual_parallel_enabled.val ? 0x1ff : 0xff;
+            for (i = 0; i < rlen; i++) {
+                ddata = reverse_bits8(sdata[i]);
+                pp_buffer.buf[(addr + i) & mask] &= ddata;
+            }
+            rd_bits.val += rlen * 8;
+        }
+        return rbits;
+    }
+
+    method receive_data(int bits, const uint8 *data) -> (int) {
+        local bool ready;
+        local bool completed = false;
+
+        local int rbits = 0;
+        if (xmit_state.val == ST_TDATA)
+            return rbits;
+
+        while (rbits < bits) {
+            local int hbits = 0;
+            switch (xmit_state.val) {
+                case ST_READY:
+                    xmit_state.val = ST_CMD;
+                    // FALLTHROUGH
+                case ST_CMD:
+                    hbits = command.receive_bits(data, rbits, bits);
+                    break;
+                case ST_ADDRESS:
+                    hbits = address.receive_bits(data, rbits, bits);
+                    if (dual_parallel_enabled.val && command.val != FCMD_RSFDP) {
+                        ready = address.ready();
+                        if (ready) {
+                            address.val = address.val << 1;
+                            address.val &= sector_number.val * sector_size.val - 1;
+                            log info, 4:
+                                "double address to 0x%x in dual parallel mode",
+                                address.val;
+                        }
+                    }
+                    break;
+                case ST_DUMMY:
+                    hbits = dummy.receive_bits(data, rbits, bits);
+                    break;
+                case ST_RDATA:
+                    hbits = process_received_data(data, rbits, bits);
+                    rbits += hbits;
+                    return rbits;
+                default:
+                    log spec_viol:
+                        "drops frame which is received at wrong state %d", xmit_state.val;
+                    //bug fix:
+                    //simulation traps into a endless loop for specific case
+                    hbits = bits - rbits;
+                    break;
+            }
+            rbits += hbits;
+            completed = switch_state(bits - rbits);
+            if (completed)
+                break;
+        }
+
+        if (xmit_state.val == ST_EXECUTE) {
+            execute_instruction(bits);
+            clean_state();
+        } else if (xmit_state.val == ST_TDATA) {
+            if (command.val == FCMD_RES)
+                dp_mode.val = 0;
+        }
+        return rbits;
+    }
+
+    method switch_state(int bits) -> (bool) {
+        local bool ready = false;
+        local bool completed = false;
+        switch (xmit_state.val) {
+        case ST_CMD:
+            ready = command.ready();
+            break;
+        case ST_ADDRESS:
+            ready = address.ready();
+            break;
+        case ST_DUMMY:
+            ready = dummy.ready();
+            break;
+        default: break;
+        }
+
+        if (ready)
+            completed = next_state(bits);
+        return completed;
+    }
+
+    method next_state(int bits) -> (bool) {
+        local bool completed = false;
+        switch (xmit_state.val) {
+        case ST_READY:
+        case ST_CMD:
+            if (command.val != FCMD_RES && dp_mode.val != 0) {
+                log spec_viol:
+                    "command 0x%x is not allowed for the deep power-down mode",
+                    command.val;
+                completed = true;
+                break;
+            }
+            if (command.val == FCMD_WREN || command.val == FCMD_WRDI
+                || command.val == FCMD_BE || command.val == FCMD_DP
+                || command.val == FCMD_EWSR
+                || command.val == FCMD_ENQD || command.val == FCMD_RSTQD
+                || command.val == FCMD_CE || command.val == FCMD_DE
+                || command.val == FCMD_EN4B || command.val == FCMD_EX4B) {
+                xmit_state.val = ST_EXECUTE;
+                completed = true;
+            } else if (command.val == FCMD_READ || command.val == FCMD_PP
+                || command.val == FCMD_FREAD || command.val == FCMD_SE
+                || command.val == FCMD_32BE || command.val == FCMD_RSFDP
+                || command.val == FCMD_SSE || command.val == FCMD_PE
+                || command.val == FCMD_PW || command.val == FCMD_RDLR
+                || command.val == FCMD_WRLR
+                || (frdo_enabled.val && command.val == FCMD_FREAD_DUAL_O)
+                || (frdo_enabled.val && command.val == FCMD_FREAD_DUAL_IO)
+                || (frqo_enabled.val && command.val == FCMD_FREAD_QUAD_O)
+                || (frqo_enabled.val && command.val == FCMD_FREAD_QUAD_IO)
+                || (fpdi_enabled.val && command.val == FCMD_FP_DUAL_I)
+                || (fpqi_enabled.val && command.val == FCMD_FP_QUAD_I)
+                || (fpqi_enabled.val && command.val == FCMD_FP_QUAD_I_V2)) {
+                xmit_state.val = ST_ADDRESS;
+            } else if (command.val == FCMD_READ4 || command.val == FCMD_FREAD4
+                || command.val == FCMD_FREAD4_DUAL_O
+                || command.val == FCMD_FREAD4_QUAD_O
+                || command.val == FCMD_FREAD4_QUAD_IO
+                || command.val == FCMD_PP_4B
+                || command.val == FCMD_FP_4B_QUAD_I
+                || command.val == FCMD_SE_4B || command.val == FCMD_SSE_4B
+                || command.val == FCMD_32BE_4B) {
+                xmit_state.val = ST_ADDRESS;
+                // save current address mode and switch to 4-byte address mode
+                prev_addr_mode.val = addr4b_enabled.val ? 1 : 0;
+                addr4b_enabled.val = true;
+            } else if (command.val == FCMD_RES) {
+                xmit_state.val = bits == 0 ? ST_EXECUTE : ST_DUMMY;
+            } else if (command.val == FCMD_WRSR || command.val == FCMD_WREAR
+                || command.val == FCMD_WRENHV || command.val == FCMD_WRBRV
+                || command.val == FCMD_WRBRNV) {
+                xmit_state.val = ST_RDATA;
+            } else if (command.val == FCMD_RDSR || command.val == FCMD_RDENHV
+                || ((command.val == FCMD_RDID || command.val == FCMD_RDMID)
+                    && rdid_enabled)
+                || ( command.val == FCMD_RDFSR) || command.val == FCMD_RDEAR) {
+                xmit_state.val = ST_TDATA;
+                completed = true;
+            } else if (command.val == FCMD_NOP) {
+                completed = true;
+            } else {
+                log spec_viol: "invalid instruction 0x%x", command.val;
+                completed = true;
+            }
+            break;
+        case ST_ADDRESS:
+            if (command.val == FCMD_FREAD || command.val == FCMD_FREAD4
+                || (frdo_enabled.val && command.val == FCMD_FREAD_DUAL_O)
+                || (frdo_enabled.val && command.val == FCMD_FREAD_DUAL_IO)
+                || (frqo_enabled.val && command.val == FCMD_FREAD_QUAD_O)
+                || (frqo_enabled.val && command.val == FCMD_FREAD_QUAD_IO)
+                || command.val == FCMD_RSFDP
+                || (frdo_enabled.val && command.val == FCMD_FREAD4_DUAL_O)
+                || (frqo_enabled.val && command.val == FCMD_FREAD4_QUAD_O)
+                || (frqo_enabled.val && command.val == FCMD_FREAD4_QUAD_IO)) {
+                xmit_state.val = ST_DUMMY;
+            } else if (command.val == FCMD_PP || command.val == FCMD_PW
+                || command.val == FCMD_WRLR
+                || (fpdi_enabled.val && command.val == FCMD_FP_DUAL_I)
+                || (fpqi_enabled.val && command.val == FCMD_FP_QUAD_I)
+                || (fpqi_enabled.val && command.val == FCMD_FP_QUAD_I_V2)
+                || command.val == FCMD_PP_4B
+                || (frqo_enabled.val && command.val == FCMD_FP_4B_QUAD_I)) {
+                xmit_state.val = ST_RDATA;
+            } else if (command.val == FCMD_SE || command.val == FCMD_SSE
+                || command.val == FCMD_PE || command.val == FCMD_32BE
+                || command.val == FCMD_SE_4B || command.val == FCMD_SSE_4B
+                || command.val == FCMD_32BE_4B) {
+                xmit_state.val = ST_EXECUTE;
+                completed = true;
+            } else {
+                xmit_state.val = ST_TDATA;
+                completed = true;
+            }
+            break;
+        case ST_DUMMY:
+            xmit_state.val = ST_TDATA;
+            // FALLTHROUGH
+        default:
+            completed = true;
+            break;
+        }
+        return completed;
+    }
+    method execute_instruction(int bits) {
+        switch (command.val) {
+        case FCMD_WREN:
+            log info, 4: "command \"WREN\" set WEL bit";
+            status.WEL.val = 1;
+            break;
+        case FCMD_WRDI:
+            log info, 4: "command \"WRDI\" reset WEL bit";
+            status.WEL.val = 0;
+            break;
+        case FCMD_SE:
+        case FCMD_SE_4B:
+            log info, 4: "command \"SE (0x%x)\" when WEL = %d",
+                command.val, status.WEL.val;
+            if (status.WEL.val == 1) {
+                mem_block.erase_sector(address.val, status.BP.val);
+                status.WEL.val = 0;
+            }
+            break;
+        case FCMD_SSE:
+        case FCMD_SSE_4B:
+            log info, 4: "command \"SSE (0x%x)\" when WEL = %d",
+                command.val, status.WEL.val;
+            if (status.WEL.val == 1) {
+                mem_block.erase_subsector(address.val, status.BP.val);
+                status.WEL.val = 0;
+            }
+            break;
+        case FCMD_PE:
+            log info, 4: "command \"PE\" when WEL = %d", status.WEL.val;
+            if (status.WEL.val == 1) {
+                mem_block.erase_page(address.val, status.BP.val);
+                status.WEL.val = 0;
+            }
+            break;
+        case FCMD_32BE:
+        case FCMD_32BE_4B:
+            log info, 4: "command \"32BE (0x%x)\" when WEL = %d",
+                command.val, status.WEL.val;
+            if (status.WEL.val == 1) {
+                mem_block.erase_block_32KB(address.val, status.BP.val);
+                status.WEL.val = 0;
+            }
+            break;
+        case FCMD_BE:
+        case FCMD_CE:
+        case FCMD_DE:
+            if (command.val == FCMD_CE && bits > 8) {
+                log spec_viol: "extra %d bits follow CE command", bits - 8;
+                break;
+            }
+            log info, 4: "command \"%s\" when WEL = %d",
+                (command.val == FCMD_BE) ? "BE" :
+                (command.val == FCMD_CE) ? "CE" : "DE", status.WEL.val;
+            if (status.WEL.val == 1) {
+                mem_block.bulk_erase(status.BP.val);
+                status.WEL.val = 0;
+            }
+            break;
+        case FCMD_DP:
+            if (bits > 8) {
+                log spec_viol: "extra %d bits follow DP command", bits - 8;
+                break;
+            }
+            log info, 4: "command \"DP\"";
+            dp_mode.val = 1;
+            break;
+        case FCMD_RES:
+            log info, 4: "command \"RES\"";
+            dp_mode.val = 0;
+            break;
+        case FCMD_EN4B:
+            log info, 4: "command \"EN4B\"";
+            addr4b_enabled.val = true;
+            break;
+        case FCMD_EX4B:
+            log info, 4: "command \"EX4B\"";
+            addr4b_enabled.val = false;
+            break;
+        case FCMD_ENQD:
+            log info, 4: "command \"ENQD\" when WEL = %d", status.WEL.val;
+            if (status.WEL.val == 0) {  // WE must not be executed
+                frqo_enabled.val = true;
+                fpqi_enabled.val = true;
+            }
+            break;
+        case FCMD_RSTQD:
+            log info, 4: "command \"RSTQD\" when WEL = %d", status.WEL.val;
+            if (status.WEL.val == 0) {  // WE must not be executed
+                frqo_enabled.val = false;
+                fpqi_enabled.val = false;
+            }
+            break;
+        case FCMD_EWSR:
+            log info, 4: "command \"EWSR\"";
+            // No need other actions
+            break;
+        }
+    }
+}
+
+session bool rdid_enabled;
+session bool exid_enabled;
+session uint8 jedec_id[5];
+method init() {
+    // initialize the param to make device work as M25P80
+    elec_signature.val = 0x13;
+    rdid_enabled   = false;
+    exid_enabled   = false;
+    sector_size.val    = 0x10000;
+    sector_number.val  = 16;
+    frdo_enabled.val   = false;
+    frqo_enabled.val   = false;
+    fpdi_enabled.val   = false;
+    fpqi_enabled.val   = false;
+    addr4b_enabled.val = false;
+    dual_parallel_enabled.val = false;
+
+    sfdp_init();
+
+    VINIT(sector_lock.buffer);
+}
+
+method post_init() {
+    if (VLEN(sector_lock.buffer) == 0) {
+        local int i;
+        VRESIZE(sector_lock.buffer, sector_number.val);
+        for (i = 0; i < sector_number.val; i++)
+            sector_lock.buffer[i] = 0;
+    } else if (VLEN(sector_lock.buffer) != sector_number.val) {
+        log error: "Invalid size of %s (%d), must be equal to %s (%d)",
+            sector_lock.qname, VLEN(sector_lock.buffer), sector_number.qname,
+            sector_number.val;
+        assert(false);
+    }
+
+    if (!SIM_is_restoring_state(dev.obj)) {
+        if (dual_parallel_enabled.val)
+            sector_size.val = sector_size.val << 1;
+        // Initialize sftp table from predefined values
+        SIM_require_object(mem_block.obj);
+        sfdp_post_init();
+    }
+}
+
+template power_of_two is (uint64_attr) {
+    method set(attr_value_t val) throws {
+        if (SIM_attr_is_integer(val)) {
+            local uint64 ival = SIM_attr_integer(val);
+            if (ival == 0 || (ival & (ival - 1)) != 0) {
+                log error:
+                    "invalid value 0x%x, it's not power-of-two", ival;
+                throw;
+            }
+            this.val = ival;
+        } else
+            throw;
+    }
+}
+
+template rx_register {
+    param bit_length;
+    is unmapped;
+    method get_bit_size() -> (uint8) default {
+        return size * 8;
+    }
+    method receive_bits(const uint8 *data,
+                        int start, int bits) -> (int) default {
+        local int rbits;
+        if (start >= bits) {
+            return 0;
+        }
+
+        local uint32 rdata = 0;
+        local uint8 bit_size = get_bit_size();
+        bits -= start;
+        rbits = (bits + bit_length) > bit_size ? bit_size - bit_length : bits;
+
+        local int rxbits = rbits;
+        while (rxbits > 0) {
+            local uint32 da = reverse_bits8(data[start / 8]);
+            rdata <<= 8;
+            rdata |= da;
+            start += 8;
+            rxbits -= 8;
+        }
+
+        if (bit_length == 0)
+            this.val = 0;
+
+        this.val <<= rbits;
+        this.val |= rdata;
+        bit_length += rbits;
+        log info, 4: "%s is updated to 0x%x", qname, this.val;
+        return rbits;
+    }
+    method ready() -> (bool) default {
+        return get_bit_size() == bit_length;
+    }
+}
+
+template flash_image is (connect) {
+    interface image;
+
+    method set(conf_object_t *obj) {
+        default(obj);
+        // flash contents is persistent
+        image.set_persistent();
+
+        if (SIM_class_has_attribute(SIM_object_class(obj), "cache_reads")) {
+            local attr_value_t val = SIM_make_attr_boolean(true);
+            SIM_set_attribute(obj, "cache_reads", &val);
+        }
+    }
+
+    // W25Qxx has two block erase commands: 32KB block erase (52h) and
+    // 64KB block erase (D8h), the later is same as normal sector erase.
+    method erase_block_32KB(uint64 start, uint4 bp) {
+        local bool is_protected = sector_protected(start, bp);
+        if (is_protected) {
+            log spec_viol, 2: "fails to erase protected 32KB flash block %d",
+                start / 32768;
+            return;
+        }
+        local uint64 mask = cast(sector_size.val, uint64) * (sector_number.val - 1);
+        image.fill(start & mask, 32768, 0xff);
+    }
+
+    method erase_sector(uint64 start, uint4 bp) {
+        local bool is_protected = sector_protected(start, bp);
+        if (is_protected) {
+            log spec_viol, 2: "fails to erase protected flash sector %d",
+                start / sector_size.val;
+            return;
+        }
+        local uint64 mask = cast(sector_size.val, uint64) * (sector_number.val - 1);
+        image.fill(start & mask, sector_size.val, 0xff);
+    }
+
+    method erase_subsector(uint64 start, uint4 bp) {
+        local bool is_protected = sector_protected(start, bp);
+        if (is_protected) {
+            log spec_viol, 2:
+                "fails to erase subsector %d in protected sector %d",
+                start / (sector_size.val / 16), start / sector_size.val;
+            return;
+        }
+        local uint64 mask = (cast(sector_size.val, uint64) / 16)
+                            * ((sector_number.val * 16) - 1);
+        image.fill(start & mask, (sector_size.val / 16), 0xff);
+    }
+    method erase_page(uint64 start, uint4 bp) {
+        local uint16 page_size = dual_parallel_enabled.val ? 512 : 256;
+        local uint32 mask = addr4b_enabled.val ? 0xffffff00 : 0xffff00;
+        mask &= (dual_parallel_enabled.val ? ~0x1ff : ~0xff);
+        if (sector_protected(start, bp)) {
+            log spec_viol, 2: "fails to erase page %d in protected sector %d",
+                start / page_size, start / sector_size.val;
+            return;
+        }
+        image.fill(start & mask, page_size, 0xff);
+    }
+
+    method bulk_erase(uint4 bp) {
+        if (bp != 0) {
+            log spec_viol, 2:
+                "BP bits is 0x%x, device is bulk erase protected", bp;
+            return;
+        }
+        image.fill(0, sector_number.val * sector_size.val, 0xff);
+    }
+
+    method sector_protected(uint64 addr, uint4 bp) -> (bool) {
+        local int sector = addr / sector_size.val;
+
+        // Hardware Top Sector Lock
+        if (fcl.htsl.val[0] && sector == (sector_number.val - 1)) {
+            return true;
+        }
+
+        if (sector_number.val == 2) {// For model with 2 sectors
+            return bp == 0x3;
+        }
+
+        // For all other flash models
+        // SPM1
+        if (sector_lock.buffer[sector][0]) {
+            return true;
+        }
+
+        local bool is_protected = false;
+        // SPM2
+        if (bp != 0) {
+            local uint16 range = 1 << (bp - 1);
+            // models with more than 128 sectors
+            // have different protected area logic
+            if (sector_number.val >= 128)
+                range <<= 1;
+            if (range >= sector_number.val) {
+                is_protected = true;
+            } else
+                is_protected = sector >= (sector_number.val - range);
+        }
+        return is_protected;
+    }
+
+    method write_flash(uint64 addr, void *from, int len) {
+        image.write(from, addr, len);
+    }
+
+    method read_flash(uint64 addr, void *to, int len) {
+        image.read(to, addr, len);
+    }
+}
+
+/*** SFDP tables ***/
+/* In order to add new SFDP table next steps should be performed in:
+ * 1. Set attribute 'sfdp_tables_num' to '2' (method sfdp_init());
+ * 2. Fill array 'sfdp_data_2' with dwords from new SFDP table;
+ * 3. Set length of new SFDP tables in dwords (method sfdp_init());
+ * 4. Set LSB and MSB values for sfdp_tables_revision[1] (method sfdp_init());
+ */
+param SFDP_TABLES_MAX = 2; // Maximum number of SFDP tables which are
+                               // currently defined (if zero SFDP is disabled)
+
+param SFDP_MAIN_HEADER_SIZE = 2; // Size in dwords of main sfdp header
+param SFDP_HEADER_SIZE = 2; // Number of dwords in header
+
+param SFDP_TABLES_OFFSET = SFDP_MAIN_HEADER_SIZE +
+                               SFDP_HEADER_SIZE * SFDP_TABLES_MAX;
+param SFDP_MEMORY_OFFSET = SFDP_TABLES_OFFSET + 1; // Offset of the memory
+param SFDP_TABLE_COUNT_MAX = 256; // Max available number of SFDP tables
+constant SFDP_TABLE_SIZE_MAX = 256; // Max size of SFDP table in dwords
+param SFDP_ADDRESS_BYTES_DWORD1_OFFSET = 17;
+param SFDP_3_BYTE_ONLY_ADDRESSING = 0x00;
+param SFDP_3_OR_4_BYTE_ADDRESSING = 0x01;
+param SFDP_4_BYTE_ONLY_ADDRESSING = 0x10;
+
+param SFDP_MINOR_REV = 8;
+param SFDP_MAJOR_REV = 1;
+
+param SFDP_ALIGN = 4; // alignment of data in bytes
+
+header %{
+    #define  SFDP_TABLE_SIZE_MAX 256
+    // Array allocated for table should have size of 256 DWORDS
+
+    // Basic JEDEC SFDP array
+    static const uint32 sfdp_data_1[SFDP_TABLE_SIZE_MAX] = {
+        0xff8020e5, //1
+        0x03ffffff, //2 Memory (decreased by one with according to JEDEC spec
+        0x6b08eb08, //3
+        0xbb083b08, //4
+        0xffffffee, //5
+        0xff00ffff, //6
+        0xff00ffff, //7
+        0xff00200c, //8
+        0xff00ff00, //9
+        0xffffffff, //10 
+        0xffffffff, //11 
+        0xffffffff, //12 
+        0xffffffff, //13 
+        0xffffffff, //14 
+        0xffffffff, //15 
+        0xffffffff, //16 
+        0xffffffff, //17 
+        0xffffffff, //18 
+        0xffffffff, //19 
+        0xffffffff, //20 
+        0xffffffff, //21 
+        0xffffffff, //22
+    };
+
+    static const uint32 sfdp_data_2[SFDP_TABLE_SIZE_MAX] = {
+        0x3C9B96F0,
+        0xE6E3C2FF,
+    };
+%}
+
+// Equal to sfdp_data_1 and sfdp_data_2 valid data length separately.
+param SFDP_TABLES_LENGTH0 = 22;
+param SFDP_TABLES_LENGTH1 = 0;  // not used
+
+extern const uint32 sfdp_data_1[SFDP_TABLE_SIZE_MAX];
+extern const uint32 sfdp_data_2[SFDP_TABLE_SIZE_MAX];
+
+attribute sfdp_flash_size is (uint64_attr) {
+    param documentation = "Size of flash memory which is stored in basic "
+        + "SFDT table.";
+    param configuration = "optional";
+}
+
+attribute sfdp_tables_num is (uint64_attr) {
+    param documentation = "Total number of SFPD tables.";
+    param configuration = "optional";
+}
+
+attribute sfdp_data {
+    param documentation = "Array for storing headers and data for "
+        + "sfdp tables.";
+    param configuration = "optional";
+    param type = "[i*]";
+    param max_length = SFDP_MAIN_HEADER_SIZE +
+                           (SFDP_HEADER_SIZE + SFDP_TABLE_SIZE_MAX) *
+                           SFDP_TABLES_MAX;
+    session uint32 length;
+    session layout "little-endian" {
+        uint32 dword;
+    } list[max_length];
+
+    method get() -> (attr_value_t) {
+        local uint32 i;
+        local attr_value_t attr = SIM_alloc_attr_list(length);
+        for (i = 0; i < length; i++) {
+            SIM_attr_list_set_item(&attr, i,
+                                   SIM_make_attr_int64(list[i].dword));
+        }
+        return attr;
+    }
+
+    method set(attr_value_t val) throws {
+        local int i;
+        length = SIM_attr_list_size(val);
+        if (length > max_length) {
+            log spec_viol: "Trying set too many elements to %s: length %d, "
+                + "max_length %d", qname, length, max_length;
+            throw;
+        }
+        for (i = 0; i < length; i++) {
+            list[i].dword = SIM_attr_integer(SIM_attr_list_item(val, i));
+        }
+    }
+
+    method append(uint32 x) {
+        log info, 4: "SFDP[%5d] = %08x", length, x;
+        if (length + 1 <= max_length) {
+            list[length].dword = x;
+            length += 1;
+        } else {
+            log spec_viol: "Trying append too many elements to %s: length %d, "
+                + "max_length %d", qname, length, max_length;
+            assert(false);
+        }
+    }
+
+    method set_item(uint32 x, uint32 offset) {
+        if (length <= offset) {
+            log spec_viol:
+                "Element: %s. Try to modify item %d out of boundary.",
+                qname, offset;
+            assert(false);
+        }
+        list[offset].dword = x;
+    }
+
+    method get_item(uint32 offset) -> (uint32) {
+        if (length <= offset) {
+            log spec_viol: "Element: %s. Try to get item %d out of boundary.",
+                qname, offset;
+            assert(false);
+        }
+        return list[offset].dword;
+    }
+
+    method fetch(uint32 offset, uint8 *dst_buf, uint32 len) {
+        if (offset + len > length * SFDP_ALIGN) {
+            log spec_viol: "Element: %s. Try to fetch item %d "
+                + "from out of boundary.", qname, offset;
+            // Fix [vlgnatyu]: Catching the exception when out-bound address
+            // is detected for SFDP. HW behavior is undefined according to
+            // specification. Any (zeros) value should be returned to avoid
+            // device timeout error.
+            memset(dst_buf, 0, len);
+        }
+
+        local const uint8 *sfdp_data = cast(list, uint8 *);
+        sfdp_data += offset;
+        memcpy(dst_buf, sfdp_data, len);
+    }
+
+    method clear() {
+        length = 0;
+    }
+}
+
+attribute sfdp_tables_revision [i < SFDP_TABLES_MAX] {
+    param documentation = "Revision of sfdp table [msb, lsb].";
+    param configuration = "optional";
+    param type = "[ii]";
+
+    session uint8 msb;
+    session uint8 lsb;
+
+    method set(attr_value_t val) throws {
+        msb = SIM_attr_integer(SIM_attr_list_item(val, 0));
+        lsb = SIM_attr_integer(SIM_attr_list_item(val, 1));
+    }
+
+    method get() -> (attr_value_t) {
+            return SIM_make_attr_list(2,
+                                      SIM_make_attr_int64(msb),
+                                      SIM_make_attr_int64(lsb));
+    }
+}
+
+// Update SFDP table for some params may be changed before finalize stage.
+method sfdp_post_init()
+{
+    sfdp_data.clear();
+
+    if (sfdp_tables_num.val == 0) {
+        local uint32 i;
+        // Fill entire table with 0xff
+        for (i = 0; i < SFDP_TABLES_OFFSET; i++) {
+            sfdp_data.append(0xffffffff);
+        }
+        return;
+    }
+
+    local int i;
+    local int j;
+    local uint32 table_data_offt = SFDP_TABLES_OFFSET;
+    local uint32 first_dword = 0;
+    local const uint32 *table_data[SFDP_TABLES_MAX];
+    table_data[0] = sfdp_data_1;
+    table_data[1] = sfdp_data_2;
+
+    local const uint32 src_header_i = 0;
+    local const uint32 src_data_i = SFDP_TABLES_OFFSET;
+
+    // Fills main SFDP header
+    sfdp_data.append(0x50444653); // append SFDP token
+    sfdp_data.append((0xff << 24)
+                             | ((sfdp_tables_num.val - 1) << 16)
+                             | (SFDP_MAJOR_REV << 8)
+                             | SFDP_MINOR_REV);
+
+    local uint8 sfdp_tables_length[SFDP_TABLES_MAX];
+    memset(sfdp_tables_length, 0, SFDP_TABLES_MAX);
+    if (SFDP_TABLES_MAX >= 2)
+        sfdp_tables_length[1] = SFDP_TABLES_LENGTH1;
+    if (SFDP_TABLES_MAX >= 1)
+        sfdp_tables_length[0] = SFDP_TABLES_LENGTH0;
+
+    // Fill headers
+    for (i = 0; i < SFDP_TABLES_MAX; i++) {
+        // First dword of header
+        sfdp_data.append((sfdp_tables_length[i] << 24)
+                                 | (SFDP_MAJOR_REV << 16)
+                                 | (SFDP_MINOR_REV << 8)
+                                 | (sfdp_tables_revision[i].lsb));
+
+        // Second dword of header
+        sfdp_data.append(((sfdp_tables_revision[i].msb) << 24)
+                                 | table_data_offt * SFDP_ALIGN);
+
+        // Update offset of table data
+        table_data_offt += sfdp_tables_length[i];
+    }
+
+    // Fill data
+    for (i = 0; i < SFDP_TABLES_MAX; i++) {
+        for (j = 0; j < sfdp_tables_length[i]; j++) {
+            sfdp_data.append(table_data[i][j]);
+        }
+    }
+
+    if (sfdp_flash_size.val > 0) {
+        sfdp_data.set_item(sfdp_flash_size.val - 1, SFDP_MEMORY_OFFSET);
+        // Should be increased by 1 with according to JESD216B
+        // not supported flash > 4Gib
+        if (sfdp_flash_size.val > 128 * 1 << 20) { // FIXME: here 128MB is compared
+            // Enable 4-byte addressing mode
+            first_dword = sfdp_data.get_item(SFDP_TABLES_OFFSET);
+            first_dword |=
+                SFDP_3_OR_4_BYTE_ADDRESSING << SFDP_ADDRESS_BYTES_DWORD1_OFFSET;
+            sfdp_data.set_item(first_dword, SFDP_TABLES_OFFSET);
+        }
+    } else {
+        sfdp_flash_size.val = sfdp_data_1[1] + 1; // Real size of flash in bits
+    }
+}
+
+method sfdp_init()
+{
+    sfdp_tables_num.val = 1;
+
+    // Initialize main SFDP
+    sfdp_tables_revision[0].lsb = 0;
+    sfdp_tables_revision[0].msb = 0xff;
+    sfdp_flash_size.val = 0x0;
+}
+
+method hard_reset() {
+    default();
+    fcl.clean_state();
+    fcl.reset_all_cmd_counters();
+}

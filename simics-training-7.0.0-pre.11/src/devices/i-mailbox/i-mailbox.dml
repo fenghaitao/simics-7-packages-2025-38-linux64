@@ -1,0 +1,266 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i_mailbox;
+
+param desc = "simple mailbox";
+
+param documentation = "Mailbox device to demonstrate deferred transactions.";
+
+param shared_mem_mailbox_base = 0x40000000;
+
+import "utility.dml";
+import "simics/devs/map-demap.dml";
+import "simics/devs/signal.dml";
+
+connect far_end is init_as_subobj {
+    param documentation = "Memory space into which the far end will be mapped.";
+    param classname = "memory-space";
+    interface map_demap;
+}
+
+connect phys_mem is map_target "Physical memory space.";
+connect irq      is signal_connect "IRQ signal." {
+    saved bool state;
+}
+
+attribute shared_mem_mailbox_base_attr is (pseudo_attr, read_only_attr) {
+    param type = "i";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_uint64(shared_mem_mailbox_base);
+    }
+}
+
+attribute irq_state_attr is (pseudo_attr, read_only_attr) {
+    param type = "b";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_boolean(irq.state);
+    }
+}
+
+attribute rsp_valid_attr is (pseudo_attr, read_only_attr) {
+    param type = "b";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_boolean(exchange_regs.valid_response);
+    }
+}
+
+attribute rsp_requested_attr is (pseudo_attr, read_only_attr) {
+    param type = "b";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_boolean(exchange_regs.requested_response);
+    }
+}
+
+bank c_regs {
+    register far_end_id size 4 @ 0x0000 is (read, write) "ID of far end" {
+        method set(uint64 value) {
+            default(value);
+            if (phys_mem.obj != NULL) {
+                far_end.map_demap.unmap(phys_mem.obj, NULL);
+                if (value != 0) {
+                    local map_info_t mapping =
+                        { .length = 0x8, .start = shared_mem_mailbox_base + (value - 1) * 0x8, ... };
+
+                    far_end.map_demap.map_simple(phys_mem.obj, NULL, mapping);
+                }
+            }
+        }
+    }
+    register exchange_reg size 8 @ 0x8 is (read, write) {
+        param configuration = "pseudo";
+        method set(uint64 value) {
+            exchange_regs.to_requester.set(value);
+        }
+        method write(uint64 value) {
+            exchange_regs.to_requester.write(value);
+        }
+        method get() -> (uint64) {
+            return exchange_regs.from_requester.get();
+        }
+        method read() -> (uint64) {
+            return exchange_regs.from_requester.read();
+        }
+    }
+}
+
+typedef struct {
+    exception_type_t t_return;
+    transaction_t *  t;  // transaction hitting the bank
+} defer_aux_t;
+
+bank f_regs {
+    param use_io_memory = false;
+    method transaction_access(transaction_t *t, uint64 offset, void *aux) -> (exception_type_t) {
+        local exception_type_t ex;
+
+        // Some counting
+        log info, 3 : "(bank) Captured incoming memory operation in transaction_access";
+
+        // Ignore incoming aux pointer
+        // Set up a new one
+        local defer_aux_t defer_info;
+        defer_info.t_return = Sim_PE_No_Exception;
+        defer_info.t = t;
+
+        // Do the usual stuff for the registers
+        // - Ensures side-effect reads work
+        // - Ensures inquiry works 
+        ex=default(t,offset, &defer_info);
+
+        if(ex==Sim_PE_No_Exception) {
+            // Return the value from the aux pointer
+            // as the underlying code might have a different idea
+            return defer_info.t_return;
+        } else {
+            // This should return the right thing for unmapped registers etc. 
+            // Immediately count the transaction as completed
+            return ex;
+        }
+    }
+
+    register exchange_reg size 8 @ 0x0000 is (read_register, write){
+        session transaction_t *t_def;
+        param configuration = "pseudo";
+        method set(uint64 value) {
+            exchange_regs.from_requester.set(value);
+        }
+        method write(uint64 value) {
+            exchange_regs.from_requester.write(value);
+        }
+        method get() -> (uint64) {
+            return exchange_regs.to_requester.get();
+        }
+        method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+            // The aux pointer is passed on from the bank 
+            if(aux!=NULL) {
+                // Pull out data
+                local defer_aux_t * daux = cast(aux, defer_aux_t *);
+
+                if ( exchange_regs.valid_response || !exchange_regs.requested_response) {
+                    // if we have a response or if we did not request one, we just return
+                    return exchange_regs.to_requester.read();
+                }
+                else {
+                    // Check if we are being called in the middle of an ongoing op
+                    if(t_def != NULL) {
+                        log info, 2 : "(%s) Access to register with outstanding transaction", this.qname;
+                        daux->t_return = Sim_PE_IO_Not_Taken;
+                        return 0;
+                    }
+
+                    local transaction_t *t = daux->t;
+                    t_def = SIM_defer_transaction(dev.obj, t);
+
+                    // Error in case deferring was not possible
+                    if (!t_def) {
+                        log info, 2 : "(%s) Transaction could not be deferred.", this.qname;
+                        daux->t_return = Sim_PE_Async_Required;
+                        return 0;
+                    }
+
+                    // Store the deferred transaction so we can complete it later 
+                    log info, 2 : "(%s) defer transaction.", this.qname;
+                    daux->t_return = Sim_PE_Deferred;
+
+                    // Return a dummy value; it does not really count anyway
+                    return 0;
+                }
+            } else {
+                // something is up, follow standard procedure
+                log info, 2 : "Unexpectedly, did not get defer aux data in %s.read_register()", this.qname;
+                return default(enabled_bytes, aux);
+            }
+        }
+    }
+}
+
+
+bank exchange_regs {
+    saved bool valid_response = true;
+    saved bool requested_response = false;
+    register from_requester size 8 is (unmapped, read, write) "Data eexchange register" {
+        method write(uint64 value) {
+            default(value);
+            log info, 3: "Got data. Raising IRQ";
+            irq.signal.signal_raise();
+            irq.state = true;
+            valid_response = false;
+            requested_response = true;
+        }
+        method read() -> (uint64) {
+            log info, 3: "Data retrieved. Lowering IRQ";
+            irq.signal.signal_lower();
+            irq.state = false;
+            return default();
+        }
+    }
+    register to_requester size 8 is (unmapped, read, write) "Data eexchange register" {
+        method read() -> (uint64) {
+            requested_response = false;
+            return default();
+        }
+        method write(uint64 value){
+            default(value);
+            if (f_regs.exchange_reg.t_def != NULL) {
+                log info, 2: "(%s) Completing read, returning %llx", this.qname, value;
+                SIM_set_transaction_value_le(f_regs.exchange_reg.t_def, value);
+                SIM_complete_transaction(f_regs.exchange_reg.t_def, Sim_PE_No_Exception);
+                f_regs.exchange_reg.t_def = NULL;
+                requested_response = false;
+            }
+            valid_response = true;
+        }
+    }
+
+}
+
+attribute saved_trans  {
+    param type = "i|n";
+    param internal = true;
+
+    method set(attr_value_t val) -> () throws {
+        if (!SIM_is_restoring_state(obj)) {
+            SIM_attribute_error("Can only be set during checkpoint restore");
+            throw;
+        }
+
+        // Check the incoming value
+        if (SIM_attr_is_nil(val)) {
+            // No outstanding transaction saved = set to null
+            f_regs.exchange_reg.t_def = NULL;
+        } else {
+            // Integer value == transaction ID == reconnect with transaction system
+            local int64 id = SIM_attr_integer(val);
+            local transaction_t *t = SIM_defer_transaction(dev.obj, NULL);
+            SIM_reconnect_transaction(t,id);
+            f_regs.exchange_reg.t_def = t;
+        }
+    }
+
+    method get() -> (attr_value_t) {
+        if (f_regs.exchange_reg.t_def != NULL){
+            // Return the transaction ID, converted from the transaction pointer
+            return SIM_make_attr_int64( SIM_get_transaction_id( f_regs.exchange_reg.t_def ) );
+        } else {
+            // No outstanding transaction -> return a Nil value
+            return SIM_make_attr_nil();
+        }
+    }
+}

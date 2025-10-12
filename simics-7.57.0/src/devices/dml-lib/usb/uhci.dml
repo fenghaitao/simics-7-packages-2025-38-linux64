@@ -1,0 +1,1391 @@
+/*
+  uhci.dml - USB UHCI common code
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+ * Devices that use this code must:
+ * 1. Define a base-address to usb_regs.
+ * 2. Define NUM_PORTS.
+ * 3. Call usb_uhci_init() from init()
+ */
+
+dml 1.2;
+
+import "io-memory.dml";
+import "pci/common.dml";
+import "usb/internal/host.dml";
+import "simics/util/hashtab.dml";
+
+is pci_device;
+
+header %{
+    static int uhci_get_max_pkt_len(int max_bitfield) {
+        return (max_bitfield == 0x7FF) ? 0 : (max_bitfield + 1);
+    }
+%}
+
+extern int  uhci_get_max_pkt_len(int max_bitfield);
+
+parameter use_4_2_api default false;
+
+parameter MAX_QHS_PER_FRAME = 32;
+parameter MAX_NUM_ENDPOINTS = 7;
+
+constant USB_UHCI_TD_PID_IN    = 0x69;
+constant USB_UHCI_TD_PID_OUT   = 0xE1;
+constant USB_UHCI_TD_PID_SETUP = 0x2D;
+
+constant USB_UHCI_State_None   = 0;
+constant USB_UHCI_State_Status = 1;
+
+constant USB_Status_Reg_USBINT  = 0; // USB Interrupt
+constant USB_Status_Reg_USBEINT = 1; // USB Error
+constant USB_Status_Reg_RD      = 2; // Resume Detect
+constant USB_Status_Reg_HSE     = 3; // Host System Error
+constant USB_Status_Reg_HCPE    = 4; // Host Controller Process Error
+constant USB_Status_Reg_HCH     = 5; // Host Controller Halted
+
+constant USB_UHCI_INT_IOC   = 1;
+constant USB_UHCI_INT_SPI   = 2;
+constant USB_UHCI_INT_HCPE  = 4;
+
+loggroup log_usb_common;
+
+struct usb_uhci_frame_list_pointer_t {
+    /* Frame List Link pointers always reference
+       memory objects that are 32-byte aligned.
+       (frame_list_pointer[4:0] is always 0) */
+    uint32 frame_list_pointer;
+    uint1  qhth_select;
+    uint1  terminate;
+}
+
+struct usb_uhci_transfer_descriptor_t {
+    uint32 link_ptr;
+    uint1  depth_breath_select;
+    uint1  qhtd_select;
+    uint1  terminate;
+    uint1  short_packet_detect;
+    uint2  count_errors;
+    uint1  low_speed_select;
+    uint1  isochronous_select;
+    uint1  interrupt_on_complete;
+    uint1  status_active;
+    uint1  status_stalled;
+    uint1  status_data_buffer_error;
+    uint1  status_babble_detected;
+    uint1  status_nak_received;
+    uint1  status_crc_time_out_error;
+    uint1  status_bit_stuff_error;
+    uint11 actual_length;
+    uint11 maximum_length;
+    uint1  data_toggle;
+    uint4  endpoint;
+    uint7  device_address;
+    uint8  packet_identification;
+    uint32 buffer_ptr;
+}
+
+struct usb_uhci_queue_head_t {
+    uint32 queue_head_link_ptr;
+    uint1  qh_qhtd_select;
+    uint1  qh_terminate;
+    uint32 queue_element_link_ptr;
+    uint1  qe_qhtd_select;
+    uint1  qe_terminate;
+}
+
+method usb_host_connect_device(int p) {
+    $usb_regs.port_status_control[p].CS = 1;
+    $usb_regs.port_status_control[p].CSC = 1;
+    $usb_ctrl.own_device[p] = 1;
+    if ($usb_regs.usb_command.EGSM) {
+        /* Resume Detected */
+        $usb_regs.usb_status[USB_Status_Reg_RD] = 1;
+        inline $usb_uhci_update_interrupt();
+    }
+}
+
+method usb_host_disconnect_device(int p) -> (int res) {
+    if ($usb_regs.port_status_control[p].CS == 1) {
+        $usb_regs.port_status_control[p].CS = 0;
+        $usb_regs.port_status_control[p].CSC = 1;
+    }
+    if ($usb_regs.port_status_control[p].PED == 1) {
+        $usb_regs.port_status_control[p].PED = 0;
+        $usb_regs.port_status_control[p].PEDC = 1;
+    }
+    $usb_ctrl.own_device[p] = 0;
+    res = 0;
+}
+
+bank usb_ctrl {
+    register pipe_state[$MAX_NUM_ENDPOINTS * $NUM_PORTS] is (unmapped);
+}
+
+method usb_uhci_init() {
+    ht_init_int_table(&$usb_uhci_ht);
+    $frame_list_polling_interval = 0.001;
+}
+
+method usb_uhci_get_td(uint32 addr) -> (usb_uhci_transfer_descriptor_t td) {
+    local uint32 dword[4];
+    local exception_type_t e;
+
+    call $pci_data_from_memory(Sim_Addr_Space_Memory, dword, addr, 16) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+
+    dword[0] = LOAD_LE32(&dword[0]);
+    dword[1] = LOAD_LE32(&dword[1]);
+    dword[2] = LOAD_LE32(&dword[2]);
+    dword[3] = LOAD_LE32(&dword[3]);
+
+    td.link_ptr[31:4]            = dword[0][31:4];
+    td.link_ptr[3:0]             = 0;
+    td.depth_breath_select       = dword[0][2:2];
+    td.qhtd_select               = dword[0][1:1];
+    td.terminate                 = dword[0][0:0];
+    td.short_packet_detect       = dword[1][29:29];
+    td.count_errors              = dword[1][28:27];
+    td.low_speed_select          = dword[1][26:26];
+    td.isochronous_select        = dword[1][25:25];
+    td.interrupt_on_complete     = dword[1][24:24];
+    td.status_active             = dword[1][23:23];
+    td.status_stalled            = dword[1][22:22];
+    td.status_data_buffer_error  = dword[1][21:21];
+    td.status_babble_detected    = dword[1][20:20];
+    td.status_nak_received       = dword[1][19:19];
+    td.status_crc_time_out_error = dword[1][18:18];
+    td.status_bit_stuff_error    = dword[1][17:17];
+    td.actual_length             = dword[1][10:0];
+    td.maximum_length            = dword[2][31:21];
+    td.data_toggle               = dword[2][19:19];
+    td.endpoint                  = dword[2][18:15];
+    td.device_address            = dword[2][14:8];
+    td.packet_identification     = dword[2][7:0];
+    td.buffer_ptr                = dword[3];
+}
+
+method usb_uhci_set_td(uint32 addr, usb_uhci_transfer_descriptor_t td) {
+    local uint32 dword[4];
+    local exception_type_t e;
+
+    dword[0][31:4]  = td.link_ptr[31:4];
+    dword[0][3:0]   = 0;
+    dword[0][2:2]   = td.depth_breath_select;
+    dword[0][1:1]   = td.qhtd_select;
+    dword[0][0:0]   = td.terminate;
+    dword[1][31:30] = 0;
+    dword[1][29:29] = td.short_packet_detect;
+    dword[1][28:27] = td.count_errors;
+    dword[1][26:26] = td.low_speed_select;
+    dword[1][25:25] = td.isochronous_select;
+    dword[1][24:24] = td.interrupt_on_complete;
+    dword[1][23:23] = td.status_active;
+    dword[1][22:22] = td.status_stalled;
+    dword[1][21:21] = td.status_data_buffer_error;
+    dword[1][20:20] = td.status_babble_detected;
+    dword[1][19:19] = td.status_nak_received;
+    dword[1][18:18] = td.status_crc_time_out_error;
+    dword[1][17:17] = td.status_bit_stuff_error;
+    dword[1][16:11] = 0;
+    dword[1][10:0]  = td.actual_length;
+    dword[2][31:21] = td.maximum_length;
+    dword[2][20:20] = 0;
+    dword[2][19:19] = td.data_toggle;
+    dword[2][18:15] = td.endpoint;
+    dword[2][14:8]  = td.device_address;
+    dword[2][7:0]   = td.packet_identification;
+    dword[3]        = td.buffer_ptr;
+
+    STORE_LE32(&dword[0], dword[0]);
+    STORE_LE32(&dword[1], dword[1]);
+    STORE_LE32(&dword[2], dword[2]);
+    STORE_LE32(&dword[3], dword[3]);
+
+    call $pci_data_to_memory(Sim_Addr_Space_Memory, dword, addr, 16) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+}
+
+method usb_uhci_print_td(usb_uhci_transfer_descriptor_t td, int log_level) {
+    log info, log_level, log_usb_common: "Transfer Descriptor:";
+    log info, log_level, log_usb_common: "  link_ptr                 : 0x%x", td.link_ptr;
+    log info, log_level, log_usb_common: "  depth_breath_select      : %d", td.depth_breath_select;
+    log info, log_level, log_usb_common: "  qhtd_select              : %d", td.qhtd_select;
+    log info, log_level, log_usb_common: "  terminate                : %d", td.terminate;
+    log info, log_level, log_usb_common: "  short_packet_detect      : %d", td.short_packet_detect;
+    log info, log_level, log_usb_common: "  count_errors             : %d", td.count_errors;
+    log info, log_level, log_usb_common: "  low_speed_select         : %d", td.low_speed_select;
+    log info, log_level, log_usb_common: "  isochronous_select       : %d", td.isochronous_select;
+    log info, log_level, log_usb_common: "  interrupt_on_complete    : %d", td.interrupt_on_complete;
+    log info, log_level, log_usb_common: "  status_active            : %d", td.status_active;
+    log info, log_level, log_usb_common: "  status_stalled           : %d", td.status_stalled;
+    log info, log_level, log_usb_common: "  status_data_buffer_error : %d", td.status_data_buffer_error;
+    log info, log_level, log_usb_common: "  status_babble_detected   : %d", td.status_babble_detected;
+    log info, log_level, log_usb_common: "  status_nak_received      : %d", td.status_nak_received;
+    log info, log_level, log_usb_common: "  status_crc_time_out_error: %d", td.status_crc_time_out_error;
+    log info, log_level, log_usb_common: "  status_bit_stuff_error   : %d", td.status_bit_stuff_error;
+    log info, log_level, log_usb_common: "  actual_length            : %d", td.actual_length;
+    log info, log_level, log_usb_common: "  maximum_length           : %d", td.maximum_length;
+    log info, log_level, log_usb_common: "  data_toggle              : %d", td.data_toggle;
+    log info, log_level, log_usb_common: "  endpoint                 : %d", td.endpoint;
+    log info, log_level, log_usb_common: "  device_address           : %d", td.device_address;
+    log info, log_level, log_usb_common: "  packet_identification    : 0x%x", td.packet_identification;
+    log info, log_level, log_usb_common: "  buffer_ptr               : 0x%x", td.buffer_ptr;
+}
+
+method usb_uhci_get_qh(uint32 addr) -> (usb_uhci_queue_head_t qh) {
+    local uint32 dword[2];
+    local exception_type_t e;
+
+    call $pci_data_from_memory(Sim_Addr_Space_Memory, dword, addr, 8) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+
+    dword[0] = LOAD_LE32(&dword[0]);
+    dword[1] = LOAD_LE32(&dword[1]);
+
+    qh.queue_head_link_ptr[31:4]    = dword[0][31:4];
+    qh.queue_head_link_ptr[3:0]     = 0;
+    qh.qh_qhtd_select               = dword[0][1];
+    qh.qh_terminate                 = dword[0][0];
+    qh.queue_element_link_ptr[31:4] = dword[1][31:4];
+    qh.queue_element_link_ptr[3:0]  = 0;
+    qh.qe_qhtd_select               = dword[1][1];
+    qh.qe_terminate                 = dword[1][0];
+}
+
+method usb_uhci_set_qh(uint32 addr, usb_uhci_queue_head_t qh) {
+    local uint32 dword[2];
+    local exception_type_t e;
+
+    dword[0][31:4] = qh.queue_head_link_ptr[31:4];
+    dword[0][3:0]  = 0;
+    dword[0][1]    = qh.qh_qhtd_select;
+    dword[0][0]    = qh.qh_terminate;
+    dword[1][31:4] = qh.queue_element_link_ptr[31:4];
+    dword[1][3:0]  = 0;
+    dword[1][1]    = qh.qe_qhtd_select;
+    dword[1][0]    = qh.qe_terminate;
+
+    STORE_LE32(&dword[0], dword[0]);
+    STORE_LE32(&dword[1], dword[1]);
+
+    call $pci_data_to_memory(Sim_Addr_Space_Memory, dword, addr, 8) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+}
+
+method usb_uhci_get_frame(uint32 addr)
+    -> (usb_uhci_frame_list_pointer_t frame) {
+    local uint32 dword;
+    local exception_type_t e;
+
+    call $pci_data_from_memory(Sim_Addr_Space_Memory, &dword, addr, 4) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+
+    dword = LOAD_LE32(&dword);
+
+    frame.frame_list_pointer[31:4] = dword[31:4];
+    frame.frame_list_pointer[3:0]  = 0;
+    frame.qhth_select              = dword[1];
+    frame.terminate                = dword[0];
+}
+
+method usb_uhci_get_control_request(usb_uhci_transfer_descriptor_t td)
+    -> (usb_device_request_t req) {
+    local uint16 word[4];
+    local exception_type_t e;
+
+    call $pci_data_from_memory(Sim_Addr_Space_Memory, word, td.buffer_ptr, 8) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+
+    word[0] = LOAD_LE16(&word[0]);
+    word[1] = LOAD_LE16(&word[1]);
+    word[2] = LOAD_LE16(&word[2]);
+    word[3] = LOAD_LE16(&word[3]);
+
+    req.bmRequestType    = word[0][7:0];
+    req.bRequest         = word[0][15:8];
+    req.wValue           = word[1];
+    req.wIndex           = word[2];
+    req.wLength          = word[3];
+}
+
+method usb_uhci_load_dbuffer(uint32 addr, dbuffer_t *buf, int size) {
+    local int i;
+    local exception_type_t e;
+
+    call $pci_data_from_memory(Sim_Addr_Space_Memory, dbuffer_append(buf, size),
+                               addr, size) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+}
+
+method usb_uhci_store_dbuffer(uint32 addr, dbuffer_t *buf, int buf_offset,
+                              int size) {
+    local int i;
+    local exception_type_t e;
+
+    call $pci_data_to_memory(Sim_Addr_Space_Memory,
+                             dbuffer_read(buf, buf_offset, size),
+                             addr, size) -> (e);
+    if (e != Sim_PE_No_Exception) // TODO: Update USB Command + Status regs and generate interrupt
+        log error, 1, log_usb_common: "USB host system error, PCI";    
+}
+
+method usb_uhci_update_interrupt() {
+    local uint8 pin_val;
+    inline $pci_config.interrupt_pin.get() -> (pin_val);
+
+    if (pin_val > 0 && pin_val < 5) {
+        if ($usb_regs.usb_status[USB_Status_Reg_USBINT] == 0 && 
+            $usb_regs.usb_status[USB_Status_Reg_HCPE] == 0 &&
+            ($usb_regs.usb_status[USB_Status_Reg_RD] & 
+             $usb_regs.usb_interrupt_enable.RI) == 0) {
+            call $pci_lower_interrupt_pin(pin_val-1);
+
+        } else {
+            call $pci_raise_interrupt_pin(pin_val-1);
+        }
+    }
+}
+
+method usb_uhci_reset_host(bool reset_ports) {
+    local int i;
+
+    log info, 2, log_usb_common: "resetting host";
+    call $usb_regs.usb_command.hard_reset();
+    call $usb_regs.usb_status.hard_reset();
+    call $usb_regs.usb_interrupt_enable.hard_reset();
+    call $usb_regs.frame_number.hard_reset();
+    call $usb_regs.frame_list_base_address.hard_reset();
+    call $usb_regs.start_of_frame_modify.hard_reset();
+    if (reset_ports) {
+        for (i = 0; i < $NUM_PORTS; i++)
+            call $usb_regs.port_status_control[i].hard_reset();
+    }
+}
+
+method usb_uhci_reset_device(int p) {
+    if ($usb_devices[p].obj) {
+        log info, 2, log_usb_common: "resetting device connected to port %d", p;
+        $usb_devices[p].usb_device.reset();
+        call $usb_ctrl.addr[p].hard_reset();
+    }
+}
+
+data uint8 uhci_interrupts;
+
+/*
+ * Take a list of OUT TDs and send them using the 'transfer'.
+ * Example: start_td = 1 and end_td = 2 if you want to handle
+ * td B and C in the TD list [A, B, C, D].
+ */
+method usb_uhci_send_out_data(
+    usb_transfer_t *transfer, int port, usb_uhci_queue_t *q_ptr,
+    int start_td, int end_td)
+    -> (usb_transfer_completion_t comp, int update_qh_idx) {
+    local int i;
+    local int acc_size = 0; // accumulated bytes to send
+
+    transfer->buf = new_dbuffer();
+
+    /*
+     * Search the list of TDs and allocate storage area for them.
+     */
+    for (i = start_td; i <= end_td; i++) {
+        local int size = uhci_get_max_pkt_len(q_ptr->tds[i].td.maximum_length);
+        inline $usb_uhci_load_dbuffer(q_ptr->tds[i].td.buffer_ptr, transfer->buf, size);
+        acc_size += size;
+        call $usb_uhci_print_td(q_ptr->tds[i].td, 3);
+    }
+
+    transfer->size      = acc_size;
+    transfer->direction = USB_Direction_Out;
+
+    /* OUT transfer. */
+    comp = $usb_devices[port].usb_device.submit_transfer(transfer);
+    if (transfer->status == USB_Status_Nak || transfer->status == USB_Status_Stall)
+        assert false; // TODO
+
+    /*
+     * Write back data to the TDs in the list.
+     */
+    for (i = start_td; i <= end_td; i++) {
+        q_ptr->tds[i].td.status_active = 0;
+        q_ptr->tds[i].td.actual_length = q_ptr->tds[i].td.maximum_length;
+        call $usb_uhci_set_td(q_ptr->tds[i].addr, q_ptr->tds[i].td);
+        if (q_ptr->tds[i].td.interrupt_on_complete == 1)
+            $uhci_interrupts |= USB_UHCI_INT_IOC;
+        update_qh_idx = i;
+    }
+    dbuffer_free(transfer->buf);
+}
+
+/*
+ * Take a list of IN TDs and send them using the transfer.
+ */
+method usb_uhci_send_in_data(usb_transfer_t *transfer, int port,
+                             usb_uhci_queue_t *q_ptr, int start_td, int end_td)
+    -> (usb_transfer_completion_t comp, int update_qh_idx) {
+    local int max_size; // maximum bytes to receive
+    local int ret_size; // bytes received from device
+    local int tot_size; // total accumulated bytes written to memory
+    local int i;
+    local int td_idx = start_td;
+    local bool is_setup = (start_td == 1); // SETUP begins with a PID_SETUP TD
+    local usb_device_request_t req;
+
+    update_qh_idx = -1;
+
+    /*
+     * Search the list of TDs starting with start_td to find the
+     * number of IN TDs for this transfer.
+     */
+    max_size = 0;
+
+    if (is_setup) {
+        if (q_ptr->tds[start_td - 1].td.packet_identification
+            == USB_UHCI_TD_PID_SETUP) {
+            inline $usb_uhci_get_control_request(q_ptr->tds[start_td - 1].td)
+                        -> (req);
+            if (req.bmRequestType[7] == 1) { // 1 - Direction: device to host
+                max_size = req.wLength;
+            }
+        }
+    } else {
+        for (i = start_td; i <= end_td; i++) {
+            if (q_ptr->tds[i].td.packet_identification != USB_UHCI_TD_PID_IN)
+                break;
+            max_size += uhci_get_max_pkt_len(q_ptr->tds[i].td.maximum_length);
+        }
+    }
+
+    if (max_size == 0) {
+        log info, 2, log_usb_common:
+            "computed IN-data length is 0 from transfer descriptors";
+        return;
+    }
+
+    transfer->size      = max_size;
+    transfer->buf       = new_dbuffer();
+    transfer->direction = USB_Direction_In;
+
+    /* IN transfer. */
+    comp = $usb_devices[port].usb_device.submit_transfer(transfer);
+    if (transfer->status == USB_Status_Nak || transfer->status == USB_Status_Stall ||
+        comp != USB_Transfer_Completed)
+        return;
+
+    ret_size = dbuffer_len(transfer->buf);
+    log info, 4, log_usb_common: "received %d bytes from USB device", ret_size;
+    if (ret_size > max_size) {
+        log info, 2, log_usb_common:
+            "USB device returned too much data (size = %d, requested = %d) - throwing away some",
+            ret_size, max_size;
+        ret_size = max_size;
+    }
+
+    if (is_setup) {
+        // Length of such string descriptors is not determined
+        max_size = ret_size;
+    } else {
+        if (ret_size < max_size) {
+            log info, 2, log_usb_common:
+                "USB device returned less data (size = %d, requested = %d)",
+                ret_size, max_size;
+        }
+    }
+
+    /*
+     * Write back data to the TDs in the list.
+     */
+    tot_size = 0;
+    while (td_idx <= end_td) {
+        local int td_size; // actual size save for this td
+        local int max_len; // maximum size td can handle
+
+        call $usb_uhci_print_td(q_ptr->tds[td_idx].td, 3);
+
+        if (q_ptr->tds[td_idx].td.packet_identification != USB_UHCI_TD_PID_IN) {
+            log info, 3, log_usb_common: "%d-th TD at 0x%x is not an IN packet",
+                td_idx, q_ptr->tds[td_idx].addr;
+            if (!is_setup && tot_size < ret_size) {
+                log info, 2, log_usb_common: 
+                    "saved %d bytes of data is less than received %d",
+                    tot_size, ret_size;
+            }
+            update_qh_idx = td_idx - 1;
+            break;
+        }
+
+        // TODO should we really deactivate if we do not write any data?
+        q_ptr->tds[td_idx].td.status_active = 0;
+        max_len = uhci_get_max_pkt_len(q_ptr->tds[td_idx].td.maximum_length);
+        td_size = max_len;
+        if (td_size > ret_size)
+            td_size = ret_size;
+        ret_size -= td_size;
+        q_ptr->tds[td_idx].td.actual_length = td_size == 0 ? 0x7ff : td_size - 1;
+        if (td_size > 0)
+            inline $usb_uhci_store_dbuffer(q_ptr->tds[td_idx].td.buffer_ptr, transfer->buf,
+                                           tot_size, td_size);
+        call $usb_uhci_set_td(q_ptr->tds[td_idx].addr, q_ptr->tds[td_idx].td);
+        tot_size += td_size;
+
+        update_qh_idx = td_idx;
+
+        /* IOC */
+        if (q_ptr->tds[td_idx].td.interrupt_on_complete == 1)
+            $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+        /* SPI */
+        if (q_ptr->tds[td_idx].td.short_packet_detect && (td_size < max_len)) {
+            update_qh_idx = td_idx - 1;
+            $uhci_interrupts |= USB_UHCI_INT_SPI;
+            break;
+        }
+
+        td_idx++;
+    }
+
+    dbuffer_free(transfer->buf);
+}
+
+/*
+ * Handle all TDs associated with a port and endpoint. We make
+ * the assumption that each endpoint only can handle one USB
+ * transfer at a time to not confuse the USB device.
+ *
+ * Each port and endpoint has an own set of TDs that make up
+ * the transfer. The number of TDs and the type is defined by
+ * the USB UHCI standard.
+ */
+method usb_uhci_handle_queue(int port, int endpoint) {
+    local usb_transfer_t transfer;
+    local usb_transfer_completion_t comp;
+    local int update_qh_idx = -1;
+    local usb_uhci_queue_t *q_ptr = &$usb_uhci_queue[port][endpoint];
+
+    $uhci_interrupts = 0;
+
+    if (q_ptr->tds[0].td.isochronous_select) {
+        log error, 1, log_usb_common: "isochronous transfers are not supported";
+        assert false;
+    }
+
+    switch (q_ptr->tds[0].td.packet_identification) {
+
+    case USB_UHCI_TD_PID_SETUP:
+
+        /* A setup transfer consist of more than one TD. */
+        assert q_ptr->num_tds > 1;
+
+        /* Common for all control transfers. */
+        transfer.function_address = q_ptr->tds[0].td.device_address;
+        transfer.endpoint_number  = q_ptr->tds[0].td.endpoint;
+        transfer.type             = USB_Type_Control;
+        transfer.status           = USB_Status_Undef;
+
+        assert q_ptr->tds[0].td.maximum_length + 1 == 8;
+        /*
+         * Parse the control request structure in the first TD
+         * (the setup TD) and save it to the transfer structure.
+         */
+        inline $usb_uhci_get_control_request(q_ptr->tds[0].td) -> (transfer.u.control_request);
+
+        /*
+         * Control Transfer Without Data
+         */
+        if (q_ptr->tds[1].td.maximum_length == 0x7ff) {
+
+            log info, 3, log_usb_common: "Control Transfer Without Data: 0x%x", q_ptr->tds[0].addr;
+            call $usb_uhci_print_td(q_ptr->tds[0].td, 3);
+            call $usb_uhci_print_td(q_ptr->tds[1].td, 3);
+
+            transfer.size             = 0;
+            transfer.buf              = new_dbuffer();
+            transfer.direction        = USB_Direction_None;
+
+            comp = $usb_devices[port].usb_device.submit_transfer(&transfer);
+            if (transfer.status == USB_Status_Nak || transfer.status == USB_Status_Stall)
+                assert false; // TODO
+
+            /* The first TD is the setup transfer descriptor */
+            q_ptr->tds[0].td.status_active = 0;
+            q_ptr->tds[0].td.actual_length = 7;
+            call $usb_uhci_set_td(q_ptr->tds[0].addr, q_ptr->tds[0].td);
+
+            /* The second TD is the status transfer descriptor */
+            assert q_ptr->tds[1].td.maximum_length == 0x7ff;
+            q_ptr->tds[1].td.status_active = 0;
+            q_ptr->tds[1].td.actual_length = 0x7ff;
+            call $usb_uhci_set_td(q_ptr->tds[1].addr, q_ptr->tds[1].td);
+
+            /* IOC */
+            if (q_ptr->tds[0].td.interrupt_on_complete == 1 ||
+                q_ptr->tds[1].td.interrupt_on_complete == 1)
+                $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+            if (transfer.u.control_request.bRequest == 5) {
+                log info, 3, log_usb_common: "address for device connected to port %d changed to %d",
+                    port, transfer.u.control_request.wValue;
+                inline $usb_set_device_address(port, transfer.u.control_request.wValue);
+            }
+
+            update_qh_idx = 1;
+            dbuffer_free(transfer.buf);
+        }
+        /*
+         * Control Transfer With IN-Data
+         */
+        else if (transfer.u.control_request.bmRequestType[7] == 1) {
+            local int max_size; // maximum bytes to receive
+            local int ret_size; // bytes received from device
+            local int tot_size; // total accumulated bytes written to memory
+            local int i;
+
+            log info, 3, log_usb_common: "Control Transfer With IN-Data: 0x%x", q_ptr->tds[0].addr;
+            call $usb_uhci_print_td(q_ptr->tds[0].td, 3);
+
+            /* Send all TDs containing IN data. */
+            call $usb_uhci_send_in_data(&transfer, port, q_ptr, 1, q_ptr->num_tds - 2) -> (comp, update_qh_idx);
+
+            if (   transfer.status == USB_Status_Nak
+                || comp != USB_Transfer_Completed) {
+                log unimpl, 1, log_usb_common:
+                "Device replied with NAK";
+            }
+
+            /*  UHCI specification 4.1.5 STALLED */
+            if (transfer.status == USB_Status_Stall) {
+                log info, 2, log_usb_common: "Device replied with STALL";
+                q_ptr->tds[0].td.status_active = 0;
+                q_ptr->tds[0].td.status_stalled = 1;
+                q_ptr->tds[0].td.actual_length = 0x7ff;
+                call $usb_uhci_set_td(q_ptr->tds[0].addr, q_ptr->tds[0].td);
+                $usb_ctrl.pipe_state[port * $MAX_NUM_ENDPOINTS + endpoint] =
+                    USB_UHCI_State_None;
+                if (q_ptr->tds[0].td.interrupt_on_complete == 1)
+                    $uhci_interrupts |= USB_UHCI_INT_IOC;
+                update_qh_idx = 0;
+                break;
+            }
+
+            /*
+             * write back setup transfer descriptor
+             */
+            q_ptr->tds[0].td.status_active = 0;
+            q_ptr->tds[0].td.actual_length = 7;
+            call $usb_uhci_set_td(q_ptr->tds[0].addr, q_ptr->tds[0].td);
+
+            /* IOC */
+            if (q_ptr->tds[0].td.interrupt_on_complete == 1)
+                $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+            if (update_qh_idx == q_ptr->num_tds - 2) {
+                /*
+                 * write back status transfer descriptor when no SPI
+                 */
+                assert q_ptr->num_tds > 0;
+                call $usb_uhci_print_td(q_ptr->tds[q_ptr->num_tds - 1].td, 3);
+
+                assert q_ptr->tds[q_ptr->num_tds - 1].td.maximum_length == 0x7ff;
+                q_ptr->tds[q_ptr->num_tds - 1].td.status_active = 0;
+                q_ptr->tds[q_ptr->num_tds - 1].td.actual_length = 0x7ff;
+                call $usb_uhci_set_td(q_ptr->tds[q_ptr->num_tds - 1].addr, q_ptr->tds[q_ptr->num_tds - 1].td);
+
+                if (q_ptr->tds[q_ptr->num_tds - 1].td.interrupt_on_complete == 1)
+                    $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+                update_qh_idx = q_ptr->num_tds - 1;
+                assert update_qh_idx >= 0;
+            } else {
+                /*
+                 * Next TD is a status TD of OUT type. Make sure it is parsed correctly
+                 * by setting the status to status.
+                 */
+                $usb_ctrl.pipe_state[port * $MAX_NUM_ENDPOINTS + endpoint] = USB_UHCI_State_Status;
+            }
+        /*
+         * Control Transfer With OUT-Data
+         */
+        } else {
+            log info, 3, log_usb_common: "Control Transfer With OUT-Data: 0x%x", q_ptr->tds[0].addr;
+            call $usb_uhci_print_td(q_ptr->tds[0].td, 3);
+
+            call $usb_uhci_send_out_data(&transfer, port, q_ptr, 1, q_ptr->num_tds - 2) -> (comp, update_qh_idx);
+
+            if (transfer.status == USB_Status_Nak || transfer.status == USB_Status_Stall ||
+                comp != USB_Transfer_Completed)
+                assert false; // TODO raise interrupt
+
+            /*
+             * write back setup transfer descriptor
+             */
+            q_ptr->tds[0].td.status_active = 0;
+            q_ptr->tds[0].td.actual_length = 7;
+            call $usb_uhci_set_td(q_ptr->tds[0].addr, q_ptr->tds[0].td);
+
+            /*
+             * write back status transfer descriptor
+             */
+            assert q_ptr->num_tds > 0;
+            call $usb_uhci_print_td(q_ptr->tds[q_ptr->num_tds - 1].td, 3);
+
+            assert q_ptr->tds[q_ptr->num_tds - 1].td.maximum_length == 0x7ff;
+            q_ptr->tds[q_ptr->num_tds - 1].td.status_active = 0;
+            q_ptr->tds[q_ptr->num_tds - 1].td.actual_length = 0x7ff;
+            call $usb_uhci_set_td(q_ptr->tds[q_ptr->num_tds - 1].addr, q_ptr->tds[q_ptr->num_tds - 1].td);
+
+            if (q_ptr->tds[q_ptr->num_tds - 1].td.interrupt_on_complete == 1)
+                $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+            update_qh_idx = q_ptr->num_tds - 1;
+            assert update_qh_idx >= 0;
+        }
+
+        break;
+
+    case USB_UHCI_TD_PID_IN:
+
+        switch ($usb_ctrl.pipe_state[port * $MAX_NUM_ENDPOINTS + endpoint]) {
+        case USB_UHCI_State_None:
+
+            log info, 3, log_usb_common: "sending Bulk/Interrupt In transfer";
+
+            transfer.function_address = q_ptr->tds[0].td.device_address;
+            transfer.endpoint_number  = q_ptr->tds[0].td.endpoint;
+            transfer.type             = USB_Type_Bulk; // could also be interrupt
+            transfer.status           = USB_Status_Undef;
+
+            call $usb_uhci_send_in_data(&transfer, port, q_ptr, 0, q_ptr->num_tds - 1) -> (comp, update_qh_idx);
+            if (transfer.status == USB_Status_Nak || transfer.status == USB_Status_Stall ||
+                comp != USB_Transfer_Completed)
+                assert false; // TODO
+
+            break;
+        case USB_UHCI_State_Status:
+
+            /*
+             * The is a TD for the Status stage of a transfer. We do not
+             * need to send this transfer to the device as the transfer
+             * is already handled.
+             */
+
+            /*
+             * TODO, we should not update this TD when supporting transfers
+             * that does not complete at once.
+             */
+
+            assert q_ptr->tds[0].td.maximum_length == 0x7ff;
+            q_ptr->tds[0].td.status_active = 0;
+            q_ptr->tds[0].td.actual_length = 0x7ff;
+            call $usb_uhci_set_td(q_ptr->tds[0].addr, q_ptr->tds[0].td);
+            $usb_ctrl.pipe_state[port * $MAX_NUM_ENDPOINTS + endpoint] = USB_UHCI_State_None;
+
+            if (q_ptr->tds[0].td.interrupt_on_complete == 1)
+                $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+            update_qh_idx = 0;
+
+            break;
+        default:
+            assert false;
+        }
+
+        break;
+    case USB_UHCI_TD_PID_OUT:
+
+        switch ($usb_ctrl.pipe_state[port * $MAX_NUM_ENDPOINTS + endpoint]) {
+        case USB_UHCI_State_None:
+
+            log info, 3, log_usb_common: "sending Bulk/Interrupt Out transfer";
+
+            transfer.function_address = q_ptr->tds[0].td.device_address;
+            transfer.endpoint_number  = q_ptr->tds[0].td.endpoint;
+            transfer.type             = USB_Type_Bulk; // could also be interrupt
+            transfer.status           = USB_Status_Undef;
+
+            call $usb_uhci_send_out_data(&transfer, port, q_ptr, 0, q_ptr->num_tds - 1)
+                -> (comp, update_qh_idx);
+            if (transfer.status == USB_Status_Nak || transfer.status == USB_Status_Stall ||
+                comp != USB_Transfer_Completed)
+                assert false; // TODO
+
+        break;
+        case USB_UHCI_State_Status:
+
+            /*
+             * The is a TD for the Status stage of a transfer. We do not
+             * need to send this transfer to the device as the transfer
+             * is already handled.
+             */
+
+            /*
+             * TODO, we should not update this TD when supporting transfers
+             * that does not complete at once.
+             */
+
+            assert q_ptr->tds[0].td.maximum_length == 0x7ff;
+            q_ptr->tds[0].td.status_active = 0;
+            q_ptr->tds[0].td.actual_length = 0x7ff;
+            call $usb_uhci_set_td(q_ptr->tds[0].addr, q_ptr->tds[0].td);
+            $usb_ctrl.pipe_state[port * $MAX_NUM_ENDPOINTS + endpoint] = USB_UHCI_State_None;
+
+            if (q_ptr->tds[0].td.interrupt_on_complete == 1)
+                $uhci_interrupts |= USB_UHCI_INT_IOC;
+
+            update_qh_idx = 0;
+
+            break;
+        default:
+            assert false;
+        }
+
+        break;
+    default:
+        assert false;
+    }
+
+    /* check new interrupts */
+    if ($uhci_interrupts > 0) {
+        log info, 3, log_usb_common: "interrupt status bits set 0x%x", $uhci_interrupts;
+        if ((($uhci_interrupts & USB_UHCI_INT_IOC) > 0) && $usb_regs.usb_interrupt_enable.IOC ||
+            (($uhci_interrupts & USB_UHCI_INT_SPI) > 0) && $usb_regs.usb_interrupt_enable.SPI)
+            $usb_regs.usb_status[USB_Status_Reg_USBINT] = 1;
+    }
+
+    /*
+     * update queue head descriptor
+     */
+    if (update_qh_idx >= 0) {
+        assert update_qh_idx >= 0;
+        q_ptr->qh.queue_element_link_ptr = q_ptr->tds[update_qh_idx].td.link_ptr;
+        q_ptr->qh.qe_qhtd_select         = q_ptr->tds[update_qh_idx].td.qhtd_select;
+        q_ptr->qh.qe_terminate           = q_ptr->tds[update_qh_idx].td.terminate;
+        inline $usb_uhci_set_qh(q_ptr->context, q_ptr->qh);
+    }
+
+    q_ptr->num_tds = 0;
+}
+
+/*
+ * Iterate over all TDs.
+ */
+method usb_uhci_empty_queues() {
+    local int p;
+    local int e;
+
+    for (p = 0; p < $NUM_PORTS; p++) {
+        for (e = 0; e < $MAX_NUM_ENDPOINTS; e++) {
+            if ($usb_uhci_queue[p][e].num_tds > 0)
+                call $usb_uhci_handle_queue(p, e);
+        }
+    }
+}
+
+struct usb_uhci_queue_t {
+    int num_tds;
+    /*
+     * USB specification limits the number of data
+     * payloads to 32 per frame. And we need one TD
+     * for the setup stage and one for the status stage.
+     */
+    struct {
+        uint32 addr;
+        usb_uhci_transfer_descriptor_t td;
+    } tds[256]; // TODO do something better
+    uint32 context;
+    usb_uhci_queue_head_t qh;
+}
+
+/*
+ * usb_uhci_queue is used temporary storage for new TDs.
+ * The TDs are ordered per port and endpoint. We make the
+ * assumption that each endpoint only can handle one USB
+ * transfer at a time to not confuse the USB device.
+ */
+data usb_uhci_queue_t usb_uhci_queue[$NUM_PORTS][$MAX_NUM_ENDPOINTS];
+
+/*
+ * usb_uhci_ht is a hash table. New TDs are inserted in the
+ * hash table. The key is the physical address for the TD.
+ * The hash table does not require checkpointing.
+ */
+data ht_int_table_t usb_uhci_ht;
+
+/*
+ * active_context is 0 if there is no active context. active_context
+ * is the physical address to the queue head descriptor of the current
+ * context if there is one active. This is according to the USB UHCI
+ * standard.
+ */
+data uint32 active_context;
+
+/*
+ * trailing_queue_addr is the address of the trailing queue linked
+ * to a queue which has the same destination device and endpoint as
+ * that queue. Due to the using of a static array of 'usb_uhci_queue_t'
+ * to record the search result of TDs in a queue head, only one linked
+ * list of TDs can be recorded and handled in a pass of searching.
+ * So it needs this static variable to remember the trailing queue
+ * when there're more than one linked lists of TDs in a queue head.
+ */
+data uint32 trailing_queue_addr;
+
+/*
+ * This method searches for new TDs and inserts them in the in the
+ * usb_uhci_queue data structure. The reason for searching for TDs
+ * and storing them in a temporary data structure is to simplify the
+ * handling of the TDs as the structure of linked TDs list are quite
+ * complex and is recursive. The TDs physical address is added to
+ * the usb_uhci_ht to make sure a TD is not added to usb_uhci_queue
+ * twice.
+ */
+method search_tds(uint32 addr, bool is_qh) {
+    static usb_uhci_queue_head_t active_qh;
+    static int queue_head_count = 0;
+    static uint8 dummy;
+
+    if (is_qh) { // Try to find all TDs in this QH
+        inline $usb_uhci_get_qh(addr) -> (active_qh);
+        local uint1 next_qe_term = active_qh.qe_terminate;
+        local uint1 next_qh_term = active_qh.qh_terminate;
+        local uint32 next_qe_addr = active_qh.queue_element_link_ptr;
+        local uint32 next_qh_addr = active_qh.queue_head_link_ptr;
+
+        if (ht_lookup_int(&$usb_uhci_ht, addr) != NULL) {
+            if ((next_qe_term == 0 && next_qe_addr > 0)
+                || (next_qh_term == 0 && next_qh_addr > 0))
+                log info, 4, log_usb_common:
+                    "QH at 0x%x has already been handled", addr;
+            return;
+        }
+        ht_insert_int(&$usb_uhci_ht, addr, &dummy);
+
+        $active_context = addr;
+        if (next_qe_term == 0 && next_qe_addr > 0) {
+            /* vertical access */
+            call $search_tds(next_qe_addr, active_qh.qe_qhtd_select);
+        }
+        if (next_qh_term == 0 && next_qh_addr > 0) {
+            /* horizontal access */
+            $active_context = 0;
+            call $search_tds(next_qh_addr, active_qh.qh_qhtd_select);
+        }
+    } else {
+        local usb_uhci_transfer_descriptor_t td;
+
+        inline $usb_uhci_get_td(addr) -> (td);
+        if (ht_lookup_int(&$usb_uhci_ht, addr) != NULL) {
+            if (td.status_active == 1)
+                log info, 2, log_usb_common:
+                    "TD at 0x%x has already been handled", addr;
+            return;
+        }
+        ht_insert_int(&$usb_uhci_ht, addr, &dummy);
+
+        log info, 4, log_usb_common: "handling transfer descriptor at 0x%x, context 0x%x",
+            addr, $active_context;
+
+        if (td.status_active == 1 && td.isochronous_select == 0) { // TODO we do not handle isochronous
+            local int p;
+            local usb_uhci_queue_t *q_ptr;
+
+            inline $usb_ehci_uhci_address_to_port(td.device_address) -> (p);
+            if (p == -1) {
+                log info, 2, log_usb_common: "could not map device address %d to any port, generating an error",
+                    td.device_address;
+                td.status_crc_time_out_error = 1;
+                td.count_errors = 0;
+                td.status_active = 0;
+                td.status_stalled = 1;
+                call $usb_uhci_set_td(addr, td);
+                if ($usb_regs.usb_interrupt_enable.TCRCI) {
+                    log info, 3: "raise TCRCI interrupt";
+                    $usb_regs.usb_status[USB_Status_Reg_USBEINT] = 1;
+
+                }
+                $active_context = 0;
+                return;
+            }
+
+            q_ptr = &$usb_uhci_queue[p][td.endpoint];
+            if (q_ptr->num_tds > 0 && q_ptr->context != $active_context) {
+                log info, 2, log_usb_common:
+                    "current context 0x%x is not that 0x%x of endpoint %d",
+                    $active_context, q_ptr->context, td.endpoint;
+                return; // endpoint already used
+            }
+
+            if (q_ptr->num_tds == 255) {
+                log info, 3, log_usb_common: "maximum number of TDs reached";
+                return;
+            }
+
+            q_ptr->tds[q_ptr->num_tds].addr = addr;
+            q_ptr->tds[q_ptr->num_tds].td = td;
+            if (q_ptr->num_tds == 0) {
+                q_ptr->context = $active_context;
+                q_ptr->qh = active_qh;
+            }
+            q_ptr->num_tds++;
+            assert q_ptr->num_tds < 256;
+
+            if (td.terminate == 0 && td.link_ptr > 0 && td.qhtd_select == 1) {
+                // Register a new search for this trailing QH
+                $trailing_queue_addr = td.link_ptr;
+                log info, 3, log_usb_common:
+                    "start a new search for QH at 0x%x", td.link_ptr;
+                return;
+            }
+        }
+
+        if (td.terminate == 0 && td.link_ptr > 0 &&
+            (($active_context > 0 && td.status_active == 1) || $active_context == 0))
+            call $search_tds(td.link_ptr, td.qhtd_select);
+    }
+    $active_context = 0;
+}
+
+method usb_uhci_polling_new_frame() {
+    call $usb_uhci_handle_list();
+    /*
+     * Update frame number. This method is only access from the frame polling event.
+     */
+    $usb_regs.frame_number = ($usb_regs.frame_number + 1) & 0x7FF;
+    // call interrupt handling for previous frame
+    inline $usb_uhci_update_interrupt();
+}
+
+/*
+ * Traverse the frame list and find new descriptors.
+ * Search all entries in the frame list when polling
+ * is disabled. Search only one entry when polling is
+ * enabled. The frame number will be updated after each
+ * polling access when polling is enabled.
+ */
+method usb_uhci_handle_list() {
+    local int curr_idx;
+    local int start_idx = $usb_regs.frame_number & 0x3FF;
+    local usb_uhci_frame_list_pointer_t frame;
+    local int i;
+    local uint1 curr_select;
+    local uint32 curr_addr;
+
+    /* Make sure host controller is enabled */
+    if ($usb_regs.usb_command.RC == 0)
+        return;
+
+    /* Make sure host controller is not in Global Suspend mode */
+    if ($usb_regs.usb_command.EGSM == 1)
+        return;
+
+    log info, 4, log_usb_common: "scanning frame list";
+
+    curr_idx = start_idx;
+    while (true) {
+        /* get frame list entry */
+        call $usb_uhci_get_frame($usb_regs.frame_list_base_address + curr_idx * 4) -> (frame);
+        if (!frame.terminate) {
+            /* we found a valid entry */
+            log info, 4, log_usb_common: "valid frame index %d", curr_idx;
+            curr_addr = frame.frame_list_pointer;
+            curr_select = frame.qhth_select;
+            while (curr_addr != 0) {
+                ht_clear_int_table(&$usb_uhci_ht, false);
+                $active_context = 0;
+                $trailing_queue_addr = 0;
+                /* find new TDs */
+                call $search_tds(frame.frame_list_pointer, frame.qhth_select);
+                /* empty queues and send found TDs to device */
+                inline $usb_uhci_empty_queues();
+                curr_addr = $trailing_queue_addr;
+                curr_select = 1;
+            }
+        }
+
+        if ($frame_list_polling_enabled)
+            break;
+
+        /* next frame pointer */
+        curr_idx = (curr_idx + 1) & 0x3FF;
+        if (curr_idx == start_idx)
+            break;
+    }
+}
+
+event frame_update {
+    parameter timebase = "seconds";
+
+    method event(data) {
+        call $usb_uhci_polling_new_frame();
+        inline $frame_update.post($frame_list_polling_interval, NULL);
+    }
+}
+
+attribute frame_list_polling_interval {
+    parameter documentation = "The frame list polling interval in seconds, default is 0.001.";
+    parameter allocate_type = "double";
+}
+
+attribute frame_list_polling_enabled {
+    parameter documentation = "Poll the frame list in 1ms intervals.";
+    parameter configuration = "optional";
+    parameter allocate_type = "bool";
+
+    method after_set() {
+        if (SIM_object_is_configured($dev.obj))
+            call $update();
+    }
+
+    method update() {
+        if (!$this)
+            inline $frame_update.remove(NULL);
+        else {
+            local bool en;
+            inline $frame_update.posted(NULL) -> (en);
+            if (!en)
+                inline $frame_update.post($frame_list_polling_interval, NULL);
+        }
+    }
+}
+
+attribute frame_list_rescan {
+    parameter documentation = "Force the USB host to rescan all frame descriptors to find new transfers.";
+    parameter type = "i";
+    parameter configuration = "pseudo";
+
+    method set(attr_value_t attr) {
+        if ($usb_regs.usb_command.RC) {
+            /* Run mode */
+            local bool polling_enabled = $frame_list_polling_enabled;
+            $frame_list_polling_enabled = false;
+            log info, 1, log_usb_common: "rescanning the frame list";
+            call $usb_uhci_handle_list();
+            $frame_list_polling_enabled = polling_enabled;
+        } else {
+            /* Stop mode */
+            log info, 1, log_usb_common: "can not update the frame list in stop mode";
+        }
+    }
+}
+
+attribute last_frame_update {
+    parameter documentation = "Time for last frame update.";
+    parameter type = "f";
+    parameter configuration = "optional";
+    parameter allocate_type = "double";
+}
+
+/*
+ * USB UHCI registers according to the standard.
+ */
+bank usb_regs {
+    parameter function = 1;
+    parameter byte_order = "little-endian";
+    parameter partial = true;
+
+    register usb_command                     size 2 @ 0x00;
+    register usb_status                      size 2 @ 0x02;
+    register usb_interrupt_enable            size 2 @ 0x04;
+    register frame_number                    size 2 @ 0x06;
+    register frame_list_base_address         size 4 @ 0x08;
+    register start_of_frame_modify           size 1 @ 0x0C;
+    register port_status_control[$NUM_PORTS] size 2 @ 0x10 + $i * 2;
+    register unused_port[8 - $NUM_PORTS]     size 2 @ 0x10 + $NUM_PORTS * 2 + $i * 2;
+}
+
+template write_1_unimplemented {
+    method write(value) {
+        if (value == 1)
+            log unimpl, 1, Register_Write: "unimplemented write to %s%s",
+                $qname, defined $desc ? " (" + $desc + ")" : "";
+    }
+}
+
+/*
+ * USB UHCI registers according to the standard.
+ */
+bank usb_regs {
+
+    register usb_command {
+        field MAXP    [7:7];
+        field CF      [6:6];
+        field SWDBG   [5:5] is (write_1_unimplemented);
+        field FGR     [4:4] is (write_1_unimplemented);
+        field EGSM    [3:3];
+        field GRESET  [2:2] {
+            method write(value) {
+                /* reconnect devices when GRESET is lowered */
+                if ($this && !value) {
+                    local int i;
+                    for (i = 0; i < $NUM_PORTS; i++) {
+                        if ($usb_devices[i].obj) {
+                            $usb_regs.port_status_control[i].CS = 1;
+                            $usb_regs.port_status_control[i].CSC = 1;
+                        }
+                    }
+                }
+                $this = value;
+            }
+        }
+        field HCRESET [1:1] {
+            method write(value) {
+                $this = value;
+                if ($this) {
+                    local int i;
+
+                    log info, 2, log_usb_common: "host controller reset";
+                    call $usb_uhci_reset_host(false);
+                    /* The usb-uhci standard says that we should wait
+                     * 64 bit times, but we do everything at once.
+                     */
+                    for (i = 0; i < $NUM_PORTS; i++) {
+                        if ($usb_regs.port_status_control[i].CS == 1) {
+                            $usb_regs.port_status_control[i].CS = 0;
+                            $usb_regs.port_status_control[i].CSC = 1;
+                        }
+                        if ($usb_regs.port_status_control[i].PED == 1) {
+                            $usb_regs.port_status_control[i].PED = 0;
+                            $usb_regs.port_status_control[i].PEDC = 1;
+                        }
+                        $port_status_control[i].S = 0;
+                        $port_status_control[i].PR = 0;
+                        $port_status_control[i].LSDA = 0;
+                        $port_status_control[i].RD = 0;
+                        $port_status_control[i].LS = 0;
+                        /* virtual reconnect */
+                        if ($usb_devices[i].obj) {
+                            $usb_regs.port_status_control[i].CS = 1;
+                            $usb_regs.port_status_control[i].CSC = 1;
+                        }
+                    $this = 0;
+                    }
+                }
+            }
+        }
+        field RC      [0:0] {
+            method write(value) {
+                local uint1 old = $this;
+                $this = value;
+                if (value == 1 && old == 0) {
+                    log info, 2, log_usb_common: "host controller enabled (Run)";
+                    $usb_regs.usb_status[USB_Status_Reg_HCH] = 0;
+                    if (!$frame_list_polling_enabled)
+                        call $usb_uhci_handle_list();
+                } else if (value == 0 && old == 1) {
+                    log info, 2, log_usb_common: "host controller disabled (Stop)";
+                    $usb_regs.usb_status[USB_Status_Reg_HCH] = 1;
+                }
+            }
+        }
+        method after_write(generic_transaction_t *memop) {
+            if ($GRESET) {
+                local int i;
+                log info, 2, log_usb_common: "global reset";
+                for (i = 0; i < $NUM_PORTS; i++)
+                    call $usb_uhci_reset_device(i);
+                call $usb_uhci_reset_host(true);
+                $GRESET = 1;
+            }
+        }
+    }
+    register usb_status is (write_1_clears) {
+        method after_read(generic_transaction_t *memop) {
+            if (!$frame_list_polling_enabled)
+                call $usb_uhci_handle_list();
+        }
+        method after_write(generic_transaction_t *memop) {
+            inline $usb_uhci_update_interrupt();
+        }
+    }
+    register usb_interrupt_enable {
+        field SPI   [3:3] "Short packet interrupt enable";
+        field IOC   [2:2] "Interrupt on complete enable";
+        field RI    [1:1] "Resume interrupt enable";
+        field TCRCI [0:0] "Timeout/CRC interrupt enable";
+    }
+    register frame_number {
+        method read() -> (value) {
+            if ($frame_list_polling_enabled) {
+                value = $this;
+            }
+            else {
+                local double curr_time;
+                curr_time = SIM_time($dev.obj);
+                $this = ($this + (cast(((curr_time - $last_frame_update) * 1000), int) % 1024)) & 0x7FF;
+                $last_frame_update = curr_time;
+                value = $this;
+            }
+        }
+        method write(value) {
+            if ($usb_regs.usb_status[USB_Status_Reg_HCH] == 0) {
+                log info, 2, log_usb_common: "it is forbidden to set frame_number when it's running";
+                return;
+            }
+            $this = value;
+        }
+    }
+    register frame_list_base_address;
+    register start_of_frame_modify;
+    register port_status_control[$NUM_PORTS] {
+        field S    [12:12];
+        field PR   [9:9] {
+            method write(value) {
+                if ($this == 0 && value == 1)
+                    call $usb_uhci_reset_device($i);
+                $this = value;
+            }
+        }
+        field LSDA [8:8] is (read_only);
+        /* Changed to silent_constant because linux writes to it */
+        field RES  [7:7] is (silent_constant) { 
+            parameter value = 1;
+        }
+        field RD   [6:6];
+        field LS   [5:4] is (read_only);
+        field PEDC [3:3] is (write_1_clears);
+        field PED  [2:2];
+        field CSC  [1:1] is (write_1_clears);
+        field CS   [0:0] is (read_only);
+    }
+    register unused_port[8 - $NUM_PORTS] is (constant) {
+        parameter value = 0;
+    }
+}
+
+method usb_uhci_post_init default {}
+
+method post_init {
+    if ($frame_list_polling_enabled) {
+        // Do the delayed call to update now that we have the clock object
+        local conf_object_t *clock = SIM_object_clock($dev.obj);
+        if (clock) {
+            SIM_require_object(clock);
+            call $frame_list_polling_enabled.update;
+        } else {
+            log error:
+                "Device does not have a queue but needs to post and event.";
+        }
+    }
+
+    call $usb_uhci_post_init;
+}

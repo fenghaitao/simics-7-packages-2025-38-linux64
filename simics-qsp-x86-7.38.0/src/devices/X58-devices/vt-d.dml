@@ -1,0 +1,1069 @@
+/*
+  vt-d.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "pcie/common.dml";
+import "simics/devs/apic.dml";
+import "simics/devs/memory-space.dml";
+import "simics/devs/pci.dml";
+import "simics/devs/translator.dml";
+
+param limitations = "<ul>"
+    + "<li>Intel&reg; VT-d fault compression for primary fault"
+    + " logging is not implemented.</li>"
+    + "<li>Intel&reg; VT-d remapping unit does not cache any DMA"
+    + " or interrupt lookups.</li>"
+    + "</ul>";
+
+param IOTLB_OFFSET default 0x20;
+param FRCD_OFFSET default 0x10;
+param FRCD_NUM default 8;
+
+is hreset;
+
+loggroup Translation;
+loggroup Interrupt;
+loggroup Invalidation;
+
+attribute use_vtd_interrupt_decoding is bool_attr {
+    param documentation = "Use VT-d address decoding to obtain handles"
+        + " when remapping interrupts, rather than x58 decoding";
+}
+
+connect apic_bus "APIC bus to handle interrupts" {
+    interface apic_bus;
+    method interrupt(apic_destination_mode_t dm,
+                     apic_delivery_mode_t dlm,
+                     int lvl,
+                     apic_trigger_mode_t tm,
+                     uint8 vector,
+                     uint8 dest) {
+
+        if (this.obj == NULL) {
+            log error, 1, Interrupt:
+                "no apic_bus connected, cannot generate interrupt";
+            return;
+        }
+
+        log info, 3, Interrupt:
+            "send interrupt to apic bus (vector %x, destination %x)",
+            vector, dest;
+        log info, 4, Interrupt: "  destination mode %x", dm;
+        log info, 4, Interrupt: "  delivery mode %x", dlm;
+        log info, 4, Interrupt: "  level assert %x", lvl;
+        log info, 4, Interrupt: "  trigger mode %x", tm;
+
+        apic_bus.interrupt(dm, dlm, lvl, tm, vector, dest);
+    }
+}
+
+connect memory_space is map_target "Physical Memory";
+
+param FAULT_ROOT_PRESENT        = 0x1;
+param FAULT_CONTEXT_PRESENT     = 0x2;
+param FAULT_CONTEXT_INVALID     = 0x3;
+param FAULT_ADDRESS_MAX         = 0x4;
+param FAULT_WRITE               = 0x5;
+param FAULT_READ                = 0x6;
+param FAULT_PAGE_ADDR           = 0x7;
+param FAULT_ROOT_ADDR           = 0x8;
+param FAULT_CONTEXT_ADDR        = 0x9;
+param FAULT_ROOT_RESERVED       = 0xA;
+param FAULT_CONTEXT_RESERVED    = 0xB;
+param FAULT_PAGE_RESERVED       = 0xC;
+param FAULT_TRANSLATION_BLOCKED = 0xD;
+param FAULT_INT_RESERVED        = 0x20;
+param FAULT_INT_IDX_MAX         = 0x21;
+param FAULT_INT_PRESENT         = 0x22;
+param FAULT_INT_TABLE           = 0x23;
+param FAULT_INT_ENTRY_RESERVED  = 0x24;
+param FAULT_INT_BLOCKED         = 0x25;
+param FAULT_INT_ENTRY_BLOCK     = 0x26;
+
+typedef layout "little-endian" {
+    // DML does not allow more than 64 bits, SIMICS-8881
+    bitfields 64 {
+        uint1  p   @ [0:0];
+        uint52 ctp @ [63:12];
+    } low;
+    bitfields 64 {
+    } high;
+} root_entry_t;
+
+typedef layout "little-endian" {
+    // DML does not allow more than 64 bits, SIMICS-8881
+    bitfields 64 {
+        uint1  p   @ [0:0];
+        uint1  fpd @ [1:1];
+        uint2  t   @ [3:2];
+        uint1  eh  @ [4:4];
+        uint1  alh @ [5:5];
+        uint52 asr @ [63:12];
+    } low;
+    bitfields 64 {
+        uint3  aw  @ [2:0];
+        uint16 did @ [23:8];
+    } high;
+} context_entry_t;
+
+typedef bitfields 64 {
+    uint1  r      @ [0:0];
+    uint1  w      @ [1:1];
+    uint1  sp     @ [7:7];
+    uint1  snp    @ [11:11];
+    uint40 addr   @ [51:12];
+    uint1  tm     @ [62:62];
+} page_table_entry_t;
+
+typedef layout "little-endian" {
+    bitfields 64 {
+        uint1 p      @ [0:0];
+        uint1 fpd    @ [1:1];
+        uint1 dm     @ [2:2];
+        uint1 rh     @ [3:3];
+        uint1 tm     @ [4:4];
+        uint3 dlm    @ [7:5];
+        uint4 avail  @ [11:8];
+        uint8 vector @ [23:16];
+        uint32 dst   @ [63:32];
+    } low;
+    bitfields 64 {
+        uint16 sid @ [15:0];
+        uint2  sq  @ [17:16];
+        uint2  svt @ [19:18]; // X58 says 20:18, VT-d says 19:18
+    } high;
+} interrupt_table_entry_t;
+
+typedef bitfields 64 {
+    uint4 type          @ [3:0];
+    uint1 interrupt     @ [4:4];
+    uint1 status_write  @ [5:5];
+    uint32 status_data  @ [63:32];
+} invalidation_desc_low_t;
+
+bank vtd {
+    is function_mapped_bank;
+    param function = 0;
+
+    register ver      size 4 @ 0x00 "Version";
+    register cap      size 8 @ 0x08 "Capability";
+    register ecap     size 8 @ 0x10 "Extended Capability";
+    register gcmd     size 4 @ 0x18 "Global Command";
+    register gsts     size 4 @ 0x1C "Global Status";
+    register rtaddr   size 8 @ 0x20 "Root-Entry Table Address";
+    register ccmd     size 8 @ 0x28 "Context Command";
+    register fsts     size 4 @ 0x34 "Fault Status";
+    register fectl    size 4 @ 0x38 "Fault Event Control";
+    register fedata   size 4 @ 0x3C "Fault Event Data";
+    register feaddr   size 8 @ 0x40 "Fault Event Address";
+    register aflog    size 8 @ 0x58 "Advanced Fault Log";
+    register pmem     size 4 @ 0x64 "Protected Memory Enable";
+    register plmbase  size 4 @ 0x68 "Protected Low-Memory Base";
+    register plmlimit size 4 @ 0x6C "Protected Low-Memory Limit";
+    register phmbase  size 8 @ 0x70 "Protected High-Memory Base";
+    register phmlimit size 8 @ 0x78 "Protected High-Memory Limit";
+    register iqh      size 8 @ 0x80 "Invalidation Queue Head";
+    register iqt      size 8 @ 0x88 "Invalidation Queue Tail";
+    register iqa      size 8 @ 0x90 "Invalidation Queue Address";
+    register ics      size 4 @ 0x9C "Invalidation Completion Status";
+    register iectl    size 4 @ 0xA0 "Invalidation Event Control";
+    register iedata   size 4 @ 0xA4 "Invalidation Event Data";
+    register ieaddr   size 8 @ 0xA8 "Invalidation Event Address";
+    register irta     size 8 @ 0xB8 "Interrupt Remapping Table Address";
+    register iva      size 8 @ IOTLB_OFFSET * 16 "Invalidate Address";
+    register iotlb    size 8 @ IOTLB_OFFSET * 16 + 0x08 "IOTLB Invalidate";
+    group frcd[i < FRCD_NUM] {
+        param offs = (FRCD_OFFSET * 16) + i * 16;
+        register lo size 8 @ offs + 0 "Fault Record (lower 8 bytes)";
+        register hi size 8 @ offs + 8 "Fault Record (upper 8 bytes)";
+    }
+
+    register next_fault_idx size 8 is unmapped
+        "Next fault recording register index.";
+}
+
+method memory_read(void *buffer, uint64 address, uint64 size)
+    -> (exception_type_t) {
+    if (memory_space.obj == NULL) {
+        log error: "no memory_space connected, can not read memory";
+        return Sim_PE_IO_Not_Taken;
+    }
+
+    return memory_space.memory_space.access_simple(
+        this.obj, address, buffer, size, Sim_RW_Read, Sim_Endian_Host_From_LE);
+}
+
+method memory_write(void *buffer, uint64 address, uint64 size)
+    -> (exception_type_t) {
+    if (memory_space.obj == NULL) {
+        log error: "no memory_space connected, can not write memory";
+        return Sim_PE_IO_Not_Taken;
+    }
+
+    return memory_space.memory_space.access_simple(
+        this.obj, address, buffer, size, Sim_RW_Write, Sim_Endian_Host_From_LE);
+}
+
+port interrupt is init {
+    session map_target_t *map_target;
+    method init() {
+        map_target = SIM_new_map_target(this.obj, NULL, NULL);
+    }
+    implement transaction {
+        method issue(transaction_t *t, uint64 addr) -> (exception_type_t) {
+            local uint64 value = SIM_get_transaction_value_le(t);
+            local uint16 req_id = ATOM_get_transaction_pcie_requester_id(t);
+            if (vtd.gsts.ires.val == 0 || req_id == 0) {
+                generate_interrupt(addr, value);
+                return Sim_PE_No_Exception;
+            }
+
+            /* Bit 4 determines if it is compatible or remappable format
+               according to VT-d manual. Bit 4 is LSB in the interrupt
+               handle according to the X58 manual.
+
+               If use_vtd_interrupt_decoding is set, decode according to
+               VT-d, otherwise follow X58.
+
+               Also note that vtd.gsts.cfis should be checked to determine
+               how to handle compatibility format interrupt requests.
+            */
+
+            local uint32 ihandle;
+            if (use_vtd_interrupt_decoding.val)
+                ihandle = addr[19:5] + (addr[2] << 15);
+            else
+                ihandle = addr[19:4];
+
+            if (addr[3])  // sub-handle valid
+                ihandle += value[15:0];
+
+            local interrupt_table_entry_t ientry;
+            local uint8 fault_code;
+            try {
+                local int table_entries = 2 << vtd.irta.sz.val;
+                if (ihandle >= table_entries) {
+                    log info, 2, Interrupt: "interrupt handle %d too big,"
+                        + " (%d entries)", ihandle, table_entries;
+                    fault_code = FAULT_INT_IDX_MAX;
+                    throw;
+                }
+
+                if (vtd.gsts.irtps.val == 0) {
+                    log info, 2, Interrupt:
+                        "remapping interrupt table address not set";
+                    fault_code = FAULT_INT_TABLE;
+                    throw;
+                }
+
+                log info, 3, Interrupt: "looking up interrupt entry: table"
+                    + " pointer 0x%x, interrupt handle %d",
+                    vtd.irta_prg.val, ihandle;
+                local uint64 iaddr = vtd.irta_prg.val + ihandle * 16;
+                if (memory_read(&ientry, iaddr, 16) != Sim_PE_No_Exception) {
+                    log info, 2, Interrupt:
+                        "interrupt entry read error @ 0x%x", iaddr;
+                    fault_code = FAULT_INT_TABLE;
+                    throw;
+                }
+
+                log info, 3, Interrupt:
+                    "interrupt entry: low 0x%016x, high 0x%016x",
+                    ientry.low, ientry.high;
+
+                if (ientry.low.p == 0) {
+                    log info, 2, Interrupt: "no interrupt entry for handle %d",
+                        ihandle;
+                    if (ientry.low.fpd == 0)
+                        fault_code = FAULT_INT_PRESENT;
+                    throw;
+                }
+
+                if (!interrupt_entry_valid(ientry, req_id)) {
+                    log info, 2, Interrupt: "validation failed for handle %d,"
+                        + " SID: 0x%x, request ID: 0x%x",
+                        ihandle, ientry.high.sid, req_id;
+                    if (ientry.low.fpd == 0)
+                        fault_code = FAULT_INT_ENTRY_BLOCK;
+                    throw;
+                }
+            } catch {
+                if (fault_code > 0) {
+                    local uint64 fault_info = ihandle << 48;
+                    local pcie_at_t at = ATOM_get_transaction_pcie_at(t);
+                    generate_fault(0, at, fault_code, req_id, fault_info);
+                }
+                return Sim_PE_IO_Not_Taken;
+            }
+
+            local uint8 dest;
+            if (vtd.ecap.eim.val == 0) {
+                /* We assume that bits [15:8] contain the APIC destination ID
+                   and that bits [7:0] are reserved. */
+                dest = ientry.low.dst[15:8];
+            } else {
+                log unimpl, 1, Interrupt: "extended interrupt mode enabled,"
+                    + " handling large destination IDs not supported";
+                dest = ientry.low.dst[7:0];
+            }
+
+            local uint1 level_assert = 1;
+            local uint8 vector = ientry.low.vector;
+
+            apic_bus.interrupt(ientry.low.dm,
+                               ientry.low.dlm,
+                               level_assert,
+                               ientry.low.tm,
+                               vector, dest);
+            return Sim_PE_No_Exception;
+        }
+    }
+}
+
+method interrupt_entry_valid(interrupt_table_entry_t ientry,
+                             uint16 rid) -> (bool) {
+    local uint16 sid = ientry.high.sid;
+    if (ientry.high.svt == 0) {
+        // no validation
+        return true;
+    } else if (ientry.high.svt == 1) {
+        // validate using SID and SQ
+        if (ientry.high.sq == 0x0)
+            return (sid[15:0] == rid[15:0]);
+        else if (ientry.high.sq == 0x1)
+            return ((sid[15:3] == rid[15:3]) && (sid[1:0] == rid[1:0]));
+        else if (ientry.high.sq == 0x2)
+            return ((sid[15:3] == rid[15:3]) && (sid[0] == rid[0]));
+        else
+            return (sid[15:3] == rid[15:3]);
+    } else if (ientry.high.svt == 2) {
+        // validate rid[15:8] is within Startbus# and Endbus#
+        local uint8 start_bus = sid[15:8];
+        local uint8 end_bus = sid[7:0];
+        return ((rid[15:8] >= start_bus) && (rid[15:8] <= end_bus));
+    } else {
+        // reserved
+        return false;
+    }
+}
+
+method fault_condition_active() -> (bool) {
+    /* Fault Interrupts should not be signaled if we already have an active
+       fault condition. To protect from reentrancy, this method is used to get
+       the current state, after which fsts or ics can be modified, and finally
+       an interrupt can be signaled, if needed */
+    return vtd.fsts.any_fault || vtd.ics.iwc.val;
+}
+
+inline method generate_fault(inline type, inline addr_type, inline reason,
+                             inline sid, inline info) {
+    /* Primary Fault Logging, Advanced not supported by hardware */
+    /* It is unclear if hardware supports compression, therefore we do not
+       implement it. */
+    local uint64 i = vtd.next_fault_idx.val;
+
+    if (vtd.fsts.pfo.val != 0) {
+        log info, 4: "fault overflow, can not generate fault";
+        return;
+    }
+
+    if (vtd.frcd[i].hi.f.val != 0) {
+        vtd.fsts.pfo.val = 1;
+        log info, 4: "fault overflow, can not generate fault";
+        return;
+    }
+
+    local bool was_active = fault_condition_active();
+
+    log info, 4: "generate fault, reason 0x%x, frcd[%d]", reason, i;
+
+    vtd.valid_frcds[i] = 1;
+    vtd.frcd[i].hi.f.val = 1;
+    vtd.frcd[i].hi.t.val = type;
+    vtd.frcd[i].hi.at.val = addr_type;
+    vtd.frcd[i].hi.fr.val = reason;
+    vtd.frcd[i].hi.sid.val = sid;
+    vtd.frcd[i].lo.val = info;
+
+    if (vtd.fsts.ppf.val == 0) {
+        vtd.fsts.ppf.val = 1;
+        vtd.fsts.fri.val = i;
+    }
+
+    if (!was_active)
+        vtd.fectl.set_pending();
+
+    vtd.next_fault_idx.val = (i + 1) % FRCD_NUM;
+}
+
+method generate_iqe_fault() {
+    local bool was_active = fault_condition_active();
+    vtd.fsts.iqe.val = 1;
+    if (!was_active)
+        vtd.fectl.set_pending();
+}
+
+method protected_region(uint64 addr, translation_t *txl) -> (bool) {
+    log info, 3, Translation:
+        "check address 0x%016x against protected regions", addr;
+    log info, 3, Translation: "     plmbase: 0x%016x", vtd.plmbase.val;
+    log info, 3, Translation: "     plmlimit 0x%016x", vtd.plmlimit.val;
+    log info, 3, Translation: "     phmbase: 0x%016x", vtd.phmbase.val;
+    log info, 3, Translation: "     phmlimit 0x%016x", vtd.phmlimit.val;
+    if (vtd.pmem.prs.val == 1) {
+        if (vtd.cap.plmr.val == 1 && vtd.plmbase.val <= vtd.plmlimit.val) {
+            if (addr < vtd.plmbase.val) {
+                log info, 3, Translation: "address is below low region";
+                txl->size = vtd.plmbase.val;
+                return false;
+            }
+            if (addr <= vtd.plmlimit.val) {
+                log info, 3, Translation: "address is inside low region";
+                txl->base = vtd.plmbase.val;
+                txl->size = vtd.plmlimit.val - txl->base + 1;
+                return true;
+            }
+            txl->base = vtd.plmlimit.val;
+        }
+        if (vtd.cap.phmr.val == 1 && vtd.phmbase.val <= vtd.phmlimit.val) {
+            if (addr < vtd.phmbase.val) {
+                log info, 3, Translation: "address is between regions";
+                txl->size = vtd.phmbase.val - txl->base;
+                return false;
+            }
+            if (addr <= vtd.phmlimit.val) {
+                log info, 3, Translation: "address is inside high region";
+                txl->base = vtd.phmbase.val;
+                txl->size = vtd.phmlimit.val - txl->base + 1;
+                return true;
+            } else {
+                log info, 3, Translation: "address is above high region";
+                txl->base = vtd.phmlimit.val;
+                txl->size = 0xffffffffffffffff - txl->base + 1;
+            }
+        }
+    }
+    return false;
+}
+
+implement transaction_translator {
+    method translate(uint64 addr,
+                     access_t access,
+                     transaction_t *t,
+                     exception_type_t (*callback)(translation_t translation,
+                                                  transaction_t *transaction,
+                                                  cbdata_call_t cbdata),
+                     cbdata_register_t cbdata) -> (exception_type_t) {
+        local pcie_type_t type = ATOM_get_transaction_pcie_type(t);
+        local pcie_at_t at = ATOM_get_transaction_pcie_at(t);
+        local uint16 sid = ATOM_get_transaction_pcie_requester_id(t);
+        local uint8 bus_id = sid[15:8];
+        local uint8 dev_id = sid[7:0];
+
+        log info, 3, Translation:
+            "VT-d translation request from %02x:%02x.%d address 0x%x",
+            bus_id, dev_id[7:3], dev_id[2:0], addr;
+
+        local translation_t txl;
+
+        if (addr >= 0xfee00000 && addr <= 0xfeefffff) {
+            txl.base = 0xfee00000;
+            txl.start = 0xfee00000;
+            txl.size = 0x100000;
+            txl.target = interrupt.map_target;
+            return callback(txl, t, cbdata);
+        }
+
+        if (type != PCIE_Type_Mem) {
+            log info, 3, Translation:
+                "transaction is '%s', not Memory, blocked",
+                pcie_type_name(type);
+            return callback(txl, t, cbdata);
+        }
+
+        if (protected_region(addr, &txl)) {
+            log info, 3, Translation: "address 0x%x is protected, blocked",
+                addr;
+            return callback(txl, t, cbdata);
+        }
+
+        if (vtd.gsts.tes.val == 0) {
+            log info, 3, Translation:
+                "translation disabled, pass-through to 0x%x", addr;
+            txl.target = memory_space.map_target;
+            return callback(txl, t, cbdata);
+        }
+
+        local bool is_read = (access & Sim_Access_Read) == Sim_Access_Read;
+        local bool is_write = (access & Sim_Access_Write) == Sim_Access_Write;
+        if (!is_read && !is_write) {
+            log info, 3, Translation: "invalid access type requested, blocked";
+            return callback(txl, t, cbdata);
+        }
+
+        local uint8 fault_code;
+        local uint64 fault_info;
+        try {
+            if (vtd.gsts.rtps.val == 0) {
+                log info, 2, Translation: "root entry table address not set";
+                fault_code = FAULT_ROOT_ADDR;
+                throw;
+            }
+
+            local root_entry_t rentry;
+            local uint64 raddr = vtd.rtaddr.latched + (bus_id * 16);
+            if (memory_read(&rentry, raddr, 16) != Sim_PE_No_Exception) {
+                log info, 2, Translation:
+                    "root entry lookup error (address 0x%llx)", raddr;
+                fault_code = FAULT_ROOT_ADDR;
+                throw;
+            }
+
+            log info, 3, Translation:
+                "fetched root entry 0x%016llx:0x%016llx @ 0x%llx",
+                rentry.high, rentry.low, raddr;
+            if (rentry.low.p == 0) {
+                log info, 2, Translation: "root entry not present for bus %02x",
+                    bus_id;
+                fault_code = FAULT_ROOT_PRESENT;
+                throw;
+            }
+
+            local context_entry_t centry;
+            local uint64 c_ptr = rentry.low.ctp << 12;
+            local uint64 caddr = c_ptr + (dev_id * 16);
+            fault_info = c_ptr;
+            if (memory_read(&centry, caddr, 16) != Sim_PE_No_Exception) {
+                log info, 2, Translation:
+                    "context entry lookup error (address 0x%llx)", caddr;
+                fault_code = FAULT_CONTEXT_ADDR;
+                throw;
+            }
+
+            log info, 4, Translation:
+                "fetched context entry 0x%016llx:0x%016llx @ 0x%llx",
+                centry.high, centry.low, caddr;
+            if (centry.low.p == 0) {
+                log info, 2, Translation:
+                    "context entry not present (%02x:%02x.%d)",
+                    bus_id, dev_id[5:3], dev_id[2:0];
+                if (centry.low.fpd == 0)
+                    fault_code = FAULT_CONTEXT_PRESENT;
+                throw;
+            }
+
+            if (centry.low.t == 0x3) {
+                log info, 2, Translation:
+                    "context entry, translation type 0x3 is reserved";
+                if (centry.low.fpd == 0)
+                    fault_code = FAULT_CONTEXT_INVALID;
+                throw;
+            }
+            if (centry.low.t == 0x2) {
+                log info, 2, Translation:
+                    "translation pass through set in context entry";
+                txl.target = memory_space.map_target;
+                return callback(txl, t, cbdata);
+            }
+            /* Translation will be done when centry.low.t == 0x0 or 0x1 */
+
+            if (centry.high.aw != 0x2) {
+                log unimpl, 1, Translation: "only 4-level walks supported";
+                if (centry.low.fpd == 0)
+                    fault_code = FAULT_CONTEXT_INVALID;
+                throw;
+            }
+
+            if (!(vtd.cap.sllps.val == 0 && vtd.cap.sagaw.val == 0x4)) {
+                log unimpl, 1, Translation:
+                    "only super pages and 4-level walks supported";
+                if (centry.low.fpd == 0)
+                    fault_code = FAULT_CONTEXT_INVALID;
+                throw;
+            }
+
+            if (addr[63:vtd.cap.mgaw.val + 1] != 0) {
+                log info, 2, Translation:
+                    "address exceeds the maximum guest address width";
+                if (centry.low.fpd == 0)
+                    fault_code = FAULT_ADDRESS_MAX;
+                throw;
+            }
+
+            local uint64 t_ptr = centry.low.asr << 12;
+            local uint8 levels = centry.high.aw + 2;
+            fault_info = t_ptr;
+            for (local int l = 0; l < levels; ++l) {
+                local page_table_entry_t pentry;
+                local uint64 paddr =
+                    t_ptr + ((addr >> (levels - l) * 9) & 0xff8);
+                if (memory_read(&pentry, paddr, 8) != Sim_PE_No_Exception) {
+                    log info, 2, Translation: "page entry @ 0x%x, read error",
+                        paddr;
+                    if (centry.low.fpd == 0)
+                        fault_code = FAULT_PAGE_ADDR;
+                    throw;
+                }
+                log info, 4, Translation: "page entry 0x%016x @ 0x%x",
+                    pentry, paddr;
+                if (pentry.sp == 1 && vtd.cap.sllps.val == 0) {
+                    log info, 2, Translation:
+                        "page table %d has SP set but Super Pages disabled", l;
+                    if (centry.low.fpd == 0)
+                        fault_code = FAULT_PAGE_RESERVED;
+                    throw;
+                }
+
+                if (is_read && pentry.r == 0) {
+                    log info, 2, Translation:
+                        "page table %d read protected, blocked", l;
+                    if (centry.low.fpd == 0)
+                        fault_code = FAULT_READ;
+                    throw;
+                }
+
+                if (is_write && pentry.w == 0 &&
+                    (vtd.cap.zlr.val == 0 || SIM_transaction_size(t) > 0)) {
+                    log info, 2, Translation:
+                        "page table %d write protected, blocked", l;
+                    if (centry.low.fpd == 0)
+                        fault_code = FAULT_WRITE;
+                    throw;
+                }
+
+                t_ptr = pentry.addr << 12;
+            }
+
+            txl.base = addr & ~0xfff;
+            txl.start = t_ptr;
+            txl.size = 1 << 12;
+            txl.target = memory_space.map_target;
+        } catch {
+            if (fault_code > 0)
+                generate_fault(is_read, at, fault_code, sid, fault_info);
+        }
+        log info, 3, Translation: "translation complete for 0x%x", addr;
+        log info, 3, Translation: "  base:  0x%016x", txl.base;
+        log info, 3, Translation: "  start: 0x%016x", txl.start;
+        log info, 3, Translation: "  size:  0x%x", txl.size;
+        log info, 3, Translation: "  target: %s",
+            txl.target ? "Memory" : "Terminated";
+        return callback(txl, t, cbdata);
+    }
+}
+
+implement translation_flush {
+    method flush_range(uint64 base, uint64 size, access_t access,
+                        const map_target_t *default_target) -> (bool) {
+        // Writing this method correctly for all combinations of applicable
+        // parameters (dev id, bus id, etc) is not feasible. The implementation
+        // for the transaction translator is too complex and we thus enforce a
+        // a call to SIM_translation_changed() by returning false here
+        return false;
+    }
+}
+
+typedef bitfields 64 {
+    uint32 mua  @ [63:32];  // Message Upper Address
+    uint12 fee  @ [31:20];  // Must be 0xFEE
+    uint8  did  @ [19:12];  // Destination ID
+    uint1  dm   @ [2:2];    // Destination Mode
+} iaddr_t;
+
+typedef bitfields 32 {
+    uint1 tm     @ [15:15];  // Trigger Mode
+    uint1 lvl    @ [14:14];  // Level Assert
+    uint3 dlm    @ [10:8];   // Delivery Mode
+    uint8 vector @ [7:0];    // Vector
+} idata_t;
+
+
+method generate_interrupt(iaddr_t iaddr, idata_t idata) -> (bool) {
+    if (iaddr.fee != 0xFEE) {
+        log info, 2: "invalid Message Address 0x%x, not 0xFEExxxxx", iaddr;
+        return false;
+    }
+    if (iaddr.mua != 0)
+        log unimpl: "message Upper Address not implemented";
+
+    apic_bus.interrupt(iaddr.dm,
+                       idata.dlm,
+                       idata.lvl,
+                       idata.tm,
+                       idata.vector,
+                       iaddr.did);
+    return true;
+}
+
+bank vtd {
+    register ver;
+    register cap is read_only {
+        field drd    @ [55]    "Read Draining";
+        field dwd    @ [54]    "Write Draining";
+        field mamv   @ [53:48] "Maximum Address Mask Value";
+        field nfr    @ [47:40] "Number of Fault Record Registers";
+        field psi    @ [39]    "Page Selective Invalidation";
+        field sllps  @ [37:34] "Second Level Large Page Support";
+        field fro    @ [33:24] "Fault Recording Register Offset";
+        field dep    @ [23]    "Deprecated";
+        field zlr    @ [22]    "Zero Length Reads";
+        field mgaw   @ [21:16] "Maximum Guest Address Width";
+        field sagaw  @ [12:8]  "Supported Adjusted Guest Address Widths";
+        field cm     @ [7]     "Caching Mode";
+        field phmr   @ [6]     "Protected High Memory Region";
+        field plmr   @ [5]     "Protected Low Memory Region";
+        field rwbf   @ [4]     "Required Write-Buffer Flushing";
+        field afl    @ [3]     "Advanced Fault Loggin";
+        field nd     @ [2:0]   "Number of Domains Supported";
+    }
+
+    register ecap is read_only {
+        field mhmv  @ [23:20] "Maximum Handle Mask Value";
+        field iro   @ [17:8]  "IOTLB Register Offset";
+        field sc    @ [7]     "Snoop Control";
+        field pt    @ [6]     "Pass Through";
+        field dep   @ [5]     "Deprecated";
+        field eim   @ [4]     "Extended Interrupt Mode";
+        field ir    @ [3]     "Interrupt Remapping Support";
+        field dt    @ [2]     "Device-TLB Support";
+        field qi    @ [1]     "Queued Invalidation Support";
+        field c     @ [0]     "Page-Walk Coherency";
+    }
+
+    register gcmd is (read_zero) {
+        field te    @ [31]                 "Translation Enable";
+        field srtp  @ [30] is write_1_only "Set Root Table Pointer";
+        field sfl   @ [29] is unimpl       "Set Fault log";
+        field eafl  @ [28] is unimpl       "Enable Advanced Fault logging";
+        field wbf   @ [27] is ignore_write "Write Buffer Flush";
+        field qie   @ [26]                 "Queued Invalidation Enable";
+        field ire   @ [25]                 "Interrupt Remapping Enable";
+        field sirtp @ [24] is write_1_only "Set Interrupt Remap Table Pointer";
+        field cfi   @ [23] is unimpl       "Compatibility Format Interrupt";
+        method write_register(uint64 value, uint64 bytes, void *aux) {
+            default(value, bytes, aux);
+            gsts.set(this.val);
+
+            if (wbf.val && cap.rwbf.val == 0)
+                log spec_viol: "write buffer flush command not supported";
+
+            if (srtp.val)
+                rtaddr.latched = rtaddr.val;
+            if (sirtp.val)
+                irta_prg.val = irta.irta.val << 12;
+
+            if (qie.val)
+                invalidation_queue.handle();
+            else
+                vtd.iqh.val = 0;
+        }
+    }
+
+    register gsts is (read_only) {
+        field tes    @ [31] "Translation Enable Status";
+        field rtps   @ [30] "Root Table Pointer Status";
+        field fls    @ [29] "Fault Log Status";
+        field afls   @ [28] "Advanced Fault Logging Status";
+        field wbfs   @ [27] "Write Buffer Flush Status";
+        field qies   @ [26] "Queued Invalidation Status";
+        field ires   @ [25] "Interrupt Remapping Status";
+        field irtps  @ [24] "Interrupt Remap Table Pointer Status";
+        field cfis   @ [23] "Compatibility Format Interrupt Status";
+    }
+
+    register rtaddr {
+        saved uint64 latched;  // value latched when gcmd.srtp is written
+        field rta @ [63:12]           "Root Table Address";
+        field ttm @ [11:10] is unimpl "Translation Table Mode";
+    }
+
+    register irta_prg size 8 is (unmapped);
+    register irta {
+        field irta  @ [63:12] {
+            is read;
+            method read() -> (uint64) {
+                local uint64 value;
+                value = irta_prg.val[63:12];
+                return value;
+            }
+        }
+        field eime  @ [11];
+        field sz    @ [3:0];
+    }
+
+    register ccmd {
+        field icc   @ [63]    "Invalidate Context-Cache";
+        field cirg  @ [62:61] "Invalidation Request Granularity";
+        field caig  @ [60:59] is (read_only) "Actual Invalidation Granularity";
+        field fm    @ [33:32] "Function Mask";
+        field sid   @ [31:16] "Source ID";
+        field did   @ [15:0]  "Domain ID";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (icc.val != 0) {
+                icc.val = 0;
+                caig.val = cirg.val;
+            }
+            SIM_translation_changed(dev.obj);
+        }
+    }
+
+    register fsts {
+        param any_fault = read_register(0xff, NULL) > 0;  // read lower byte
+        field fri  @ [15:8] is (ignore_write) "Fault Record Index";
+        field ite  @ [6] is (write_1_clears) "Invalidation Time-out Error";
+        field ice  @ [5] is (write_1_clears) "Invalidation Complete Error";
+        field iqe  @ [4] is (write_1_clears) "Invalidation Queue Error";
+        field apf  @ [3] is (write_1_clears) "Advanced Pending Fault";
+        field afo  @ [2] is (write_1_clears) "Advanced Fault Overflow";
+        field ppf  @ [1] is (read)           "Primary Pending Fault" {
+            method read() -> (uint64) {
+                return valid_frcds == 0 ? 0 : 1;
+            }
+        }
+        field pfo  @ [0] is (write_1_clears) "Primary Pending Overflow";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (!fault_condition_active())
+                fectl.ip.val = 0;
+        }
+    }
+
+    register fectl  is interrupt_ctl;
+    register iectl  is interrupt_ctl;
+
+    register aflog is unimpl;
+
+    register pmem {
+        field epm @ [31] is write "Enable Protected Memory" {
+            method write(uint64 value) {
+                prs.val = value;
+            }
+        }
+        field prs  @ [0] is (ignore_write) "Protected Region Status";
+    }
+
+    register plmbase  is pxm;
+    register plmlimit is pxm;
+    register phmbase  is pxm;
+    register phmlimit is pxm;
+
+    register iqh {
+        field qh @ [18:4] "Queue Head";
+        method write_register(uint64 value, uint64 bytes, void *aux) {
+            if (ecap.qi.val) {
+                default(value, bytes, aux);
+                invalidation_queue.handle();
+            }
+        }
+    }
+    register iqt {
+        field qt @ [18:4] "Queue Tail";
+        method write_register(uint64 value, uint64 bytes, void *aux) {
+            if (ecap.qi.val) {
+                default(value, bytes, aux);
+                invalidation_queue.handle();
+            }
+        }
+    }
+
+    register iqa {
+        param addr = iqa.val << iqa.lsb;
+        field iqa @ [63:12] "Invalidation Queue Base Address";
+        field dw  @ [11] is unimpl "Descriptor Width";
+        field qs  @ [2:0]   "Queue Size";
+        method write_register(uint64 value, uint64 bytes, void *aux) {
+            if (ecap.qi.val) {
+                default(value, bytes, aux);
+                invalidation_queue.handle();
+            }
+        }
+    }
+
+    register ics {
+        field iwc  @ [31] is write "Invalidation Wait Descriptor Complete" {
+            method write(uint64 value) {
+                if (this.val && value == 1) {
+                    this.val = 0;
+                    iectl.ip.val = 0;
+                }
+            }
+        }
+    }
+
+    group invalidation_queue {
+        param size = 1 << (iqa.qs.val + 8);
+        param head = iqh.qh.val % size;
+        param tail = iqt.qt.val % size;
+        param addr = iqa.addr + (head % size) * 0x10;
+        session const char* type_name[9] = {
+            "", "Context Cache", "IOTLB", "Device-IOTLB", "Interrupt Entry",
+            "Wait", "PASID-IOTLB", "PASID", "PASID-Device-IOTLB"};
+        method handle() {
+            SIM_translation_changed(dev.obj);
+            while (true) {
+                if (gsts.qies.val == 0)
+                    break;
+                if (head == tail)
+                    break;
+                if (fsts.iqe.val == 1 || fsts.ite.val == 1)
+                    break;
+
+                local invalidation_desc_low_t desc;
+                local exception_type_t ex = memory_read(&desc, addr, 8);
+                if (ex != Sim_PE_No_Exception) {
+                    log info, 2, Invalidation:
+                        "Invalidation Descriptor read fail (0x%08x)", addr;
+                    generate_iqe_fault();
+                    break;
+                }
+                if (desc.type == 0 || desc.type > 8) {
+                    log spec_viol, 1, Invalidation:
+                        "Invalidation Descriptor invalid type (%d)", desc.type;
+                    generate_iqe_fault();
+                    break;
+                }
+                log info, 3, Invalidation: "%s Invalidation 0x%08x",
+                    type_name[desc.type], desc;
+                if (desc.type == 5) {
+                    if (desc.status_write) {
+                        local uint64 status_addr;
+                        memory_read(&status_addr, addr + 8, 8);
+                        local uint32 status_data = desc.status_data;
+                        ex = memory_write(&status_data, status_addr & ~3, 2);
+                        if (ex != Sim_PE_No_Exception) {
+                            log info, 2, Invalidation:
+                                "IWD status write fail (%08x)", status_addr;
+                            generate_iqe_fault();
+                            break;
+                        }
+                    }
+                    if (desc.interrupt) {
+                        if (ics.iwc.val == 0) {
+                            ics.iwc.val = 1;
+                            if (iectl.im.val == 0)
+                                iectl.interrupt();
+                            else
+                                iectl.ip.val = 1;
+                        }
+                    }
+                }
+                iqh.qh.val = (iqh.qh.val + 1) % size;  // advance head
+            }
+        }
+    }
+
+    saved uint64 valid_frcds;
+    group frcd[i < FRCD_NUM] {
+        register hi {
+            field f   @ [63] is (write_1_clears) "Fault";
+            field t   @ [62] "Type";
+            field at  @ [61:60] "Address Type";
+            field fr  @ [39:32] "Fault Reason";
+            field sid  @ [15:0] "Source Identifier";
+
+            method write_register(uint64 value, uint64 bytes, void *aux) {
+                default(value, bytes, aux);
+                valid_frcds[i] = f.val;
+                if (!fault_condition_active())
+                    fectl.ip.val = 0;
+            }
+        }
+    }
+
+    register iotlb {
+        field ivt   @ [63];
+        field iirg  @ [61:60];
+        field iaig  @ [58:57];
+        field dr    @ [49];
+        field dw    @ [48];
+        field did   @ [47:32];
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (ivt.val != 0) {
+                ivt.val = 0;
+                iaig.val = iirg.val;
+            }
+            SIM_translation_changed(dev.obj);
+        }
+    }
+}
+
+template pxm is register {
+    param is_base = name == "phmbase" || name == "plmbase";
+    param supported = size == 8 #? cap.phmr.val #: cap.plmr.val;
+
+    field addr {
+        param documentation = is_base #? "Base Address" #: "Limit Address";
+        param msb = parent.bitsize - 1;
+        param lsb default is_base #? 20 #: 24;
+    }
+    field res @ [addr.lsb - 1:0] is (ignore_write, read_zero) "Reserved" {
+        param init_val = is_base #? 0 #: -1;
+    }
+
+    method write_register(uint64 value, uint64 bytes, void *aux) {
+        if (supported == 0) {
+            log spec_viol:
+                "writing %s, protected memory region not supported", qname;
+            return;
+        }
+        if (pmem.prs.val != 0)
+            log spec_viol:
+                "writing %s, protected memory regions enabled", qname;
+        default(value, bytes, aux);
+    }
+}
+
+template interrupt_ctl {
+    field im @ [31] is write {
+        param init_val default 1;
+        method write(uint64 value) {
+            if (this.val != value) {
+                this.val = value;
+                if (!this.val && ip.val)
+                    interrupt();
+            }
+        }
+    }
+    field ip @ [30] is (ignore_write);
+
+    method set_pending() {
+        ip.val = 1;
+        if (im.val == 0)
+            interrupt();
+        else
+            log info, 4: "interrupt masked, not signaled";
+    }
+
+    method interrupt() {
+        local uint64 iaddr;
+        local uint64 idata;
+        try {
+            idata = bank.get(offset + 4, 4);
+            iaddr = bank.get(offset + 8, 8);
+            if (generate_interrupt(iaddr, idata))
+                ip.val = 0;
+        } catch {
+            log error: "%s: unexpected exception when raising interrupt", qname;
+        }
+    }
+}
+

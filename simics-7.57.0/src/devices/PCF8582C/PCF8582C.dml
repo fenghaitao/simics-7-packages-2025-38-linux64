@@ -1,0 +1,279 @@
+/*
+  PCF8582C.dml - 256 x 8 bit CMOS EEPROMs with i2c bus interface
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device PCF8582C;
+parameter desc = "model of PCF8582C 256x8-bit EEPROM";
+parameter documentation = "The <class>PCF8582C</class> class implements the "
+    + "functionality of a Philips 256 x 8 bit CMOS EEPROM "
+    + "with an I2C interface.";
+
+constant Op_none          = 0;
+constant Op_addressing    = 1;
+constant Op_addressing_hi = 2;
+constant Op_addressing_lo = 3;
+constant Op_writing       = 4;
+constant Op_reading       = 5;
+
+import "simics/devs/i2c.dml";
+import "simics/model-iface/image.dml";
+import "simple-i2c-slave.dml";
+
+connect i2c_bus {
+    parameter documentation
+        = "The I2C bus to which this device is connected.";
+    parameter configuration = "optional";
+    interface i2c_bus;
+}
+
+connect image {
+    parameter documentation 
+        = "Image that will hold the memory contents.";
+    parameter configuration = "required";
+    interface image;
+}
+
+attribute address {
+    parameter documentation
+        = "7-bit address to be used on the I2C bus.";
+    parameter allocate_type = "uint8";
+}
+
+attribute address_mask {
+    parameter documentation
+        = "Address mask to be used (together with the <i>address</i> attribute)"
+        + " when the device registers with the bus.";
+    parameter allocate_type = "uint32";
+}
+
+attribute address_bits {
+    parameter documentation
+        = "Number of address bits (8 or 16) in the eeprom.";
+    parameter allocate_type = "uint8";
+}
+
+attribute i2c_state {
+    parameter documentation
+        = "Current I2C state.";
+    parameter type = "s";
+    data int val;
+
+    method get() -> (attr_value_t value) {
+        switch($val) {
+        case I2C_idle:
+            value = SIM_make_attr_string("I2C Idle");
+            break;
+        case I2C_master_transmit:
+            value = SIM_make_attr_string("I2C Master Transmit");
+            break;
+        case I2C_master_receive:
+            value = SIM_make_attr_string("I2C Master Receive");
+            break;
+        case I2C_slave_transmit:
+            value = SIM_make_attr_string("I2C Slave Transmit");
+            break;
+        case I2C_slave_receive:
+            value = SIM_make_attr_string("I2C Slave Receive");
+            break;
+        default:
+            assert false;
+            break;
+        }
+    }
+
+    method set(attr_value_t value) {
+        local const char* string = SIM_attr_string(value);
+        if (strcmp(string, "I2C Idle") == 0)
+            $val = I2C_idle;
+        else if (strcmp(string, "I2C Master Transmit") == 0)
+            $val = I2C_master_transmit;
+        else if (strcmp(string, "I2C Master Receive") == 0)
+            $val = I2C_master_receive;
+        else if (strcmp(string, "I2C Slave Transmit") == 0)
+            $val = I2C_slave_transmit;
+        else if (strcmp(string, "I2C Slave Receive") == 0)
+            $val = I2C_slave_receive;
+        else
+            assert false;
+    }
+}
+
+attribute operation {
+    parameter documentation
+        = "Current operation performed.";
+    parameter type = "s";
+    data int val;
+
+    method get() -> (attr_value_t value) {
+        switch($val) {
+        case Op_none:
+            value = SIM_make_attr_string("None");
+            break;
+        case Op_addressing:
+            value = SIM_make_attr_string("Addressing");
+            break;
+        case Op_addressing_hi:
+            value = SIM_make_attr_string("Addressing Hi");
+            break;
+        case Op_addressing_lo:
+            value = SIM_make_attr_string("Addressing Low");
+            break;
+        case Op_writing:
+            value = SIM_make_attr_string("Writing");
+            break;
+        case Op_reading:
+            value = SIM_make_attr_string("Reading");
+            break;
+        default:
+            assert false;
+        }
+    }
+
+    method set(attr_value_t value) {
+        local const char* string = SIM_attr_string(value);
+        if (strcmp(string, "None") == 0)
+            $val = Op_none;
+        else if (strcmp(string, "Addressing") == 0)
+            $val = Op_addressing;
+        else if (strcmp(string, "Addressing Hi") == 0)
+            $val = Op_addressing_hi;
+        else if (strcmp(string, "Addressing Low") == 0)
+            $val = Op_addressing_lo;
+        else if (strcmp(string, "Writing") == 0)
+            $val = Op_writing;
+        else if (strcmp(string, "Reading") == 0)
+            $val = Op_reading;
+        else
+            assert false;
+    }
+}
+
+attribute memory_address {
+    parameter documentation
+        = "Current memory address.";
+    parameter allocate_type = "uint32";
+}
+
+is simple_i2c_slave;
+// I2C methods for i2c_link_v2
+method i2c_start_request_read() -> (i2c_status_t ack) {
+    log info, 2: "set state: slave/transmit";
+    $operation.val = Op_reading;
+    $i2c_state.val = I2C_slave_transmit;
+    ack = 0;
+}
+
+method i2c_start_request_write() -> (i2c_status_t ack) {
+    log info, 2: "set state: slave/receive";
+    if ($address_bits == 16)
+        $operation.val = Op_addressing_hi;
+    else
+        $operation.val = Op_addressing;
+    $i2c_state.val = I2C_slave_receive;
+    ack = 0;
+}
+
+method i2c_read_request() -> (uint8 value) {
+    value = 0;
+
+    // sanity check
+    if ($i2c_state.val != I2C_slave_transmit || $operation.val != Op_reading) {
+        log error: "write requested in invalid state (%d/%d)",
+            $i2c_state.val, $operation.val;
+        return;
+    }
+
+    local int addr = $memory_address;
+    local int ret;
+    inline $check_size(addr) -> (ret);
+    if (ret == 0)
+        return;
+
+    // read from image object
+    $image.image.read(&value, addr, 1);
+    log info, 2: "read data 0x%x from 0x%x", value, addr;
+
+    $memory_address += 1;
+}
+
+method i2c_write_request(uint8 value) -> (i2c_status_t ack) {
+    // sanity check
+    if ($i2c_state.val != I2C_slave_receive) {
+        log error: "write requested in invalid state (%d)", $i2c_state.val;
+        return;
+    }
+
+    switch($operation.val) {
+    case Op_addressing:
+        $memory_address = value;
+        log info, 2: "setting memory address to 0x%x", value;
+        $operation.val = Op_writing;
+        break;
+    case Op_addressing_hi:
+        $memory_address = value << 8;
+        log info, 2: "setting high byte of memory_address: 0x%x", value;
+        $operation.val = Op_addressing_lo;
+        break;
+    case Op_addressing_lo:
+        $memory_address |= value;
+        log info, 2: "setting memory address: 0x%x", $memory_address;
+        $operation.val = Op_writing;
+        break;
+    case Op_writing:
+    case Op_none:
+        log info, 2: "write data 0x%x", value;
+
+        local int ret;
+        inline $check_size($memory_address) -> (ret);
+        if (ret == 0)
+            return;
+
+        local uint8 page[8192];
+        memset(page, 0, sizeof page);
+        page[0] = value;
+        $image.image.write(page, $memory_address, 1);
+        $memory_address += 1;
+        break;
+    }
+    ack = 0;
+}
+
+method i2c_stop_request() {
+    $i2c_state.val = I2C_idle;
+}
+
+method get_slave_address() -> (bool enable, uint8 addr) {
+    enable = true;
+    addr = $address;
+}
+
+method check_size(int addr) -> (int ret) {
+    ret = 0;
+
+    local uint64 size = $image.image.size();
+    if (addr < size) {
+        ret = 1;
+        return;
+    }
+
+    log spec_viol: "Address out of range: 0x%x >= 0x%x",
+        addr, size;
+}
+
+method post_init() {
+    call $i2c_register_address($address);
+    $image.image.set_persistent();
+}

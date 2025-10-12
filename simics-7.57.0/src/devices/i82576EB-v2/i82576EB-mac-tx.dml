@@ -1,0 +1,80 @@
+/*
+  i82576EB-mac-tx.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+attribute context is (advanced_context_attr);
+
+bank csr {
+    group tx_queue [$NUM_TRANSMIT_QUEUES] {
+        is tx_desc_queue;
+        parameter BA = 0xe000 + $i * 0x40;
+    }
+
+    group tx_queue_alias [4] {
+        is tx_desc_queue_alias;
+        parameter BA = 0x03800 + $i * 0x100;
+        parameter reggroup = $tx_queue;
+    }
+
+    register tctl_ext @ 0x00404 "Transmit Control Extended";
+    register txpbs @ 0x03404 "TX packet buffer size";
+    register dtxswc @ 0x03500 "DMA TX switch control";
+    register dtxctl @ 0x03590 "DMA TX control";
+
+    register tctl {
+        field en[1] is (read_write) "Transmit Enable" {
+            method write(value) {
+                if (value == 0 && $this == 1) {
+                    $this = 0;
+                    log "info", 2: "disable MAC transceiver";
+                } else if ($this == 0 && value == 1) {
+                    $this = 1;
+                    log "info", 2: "enable MAC transceiver";
+                    call $transmit();
+                }
+            }
+        }
+        field psp[3] is (read_write) "Pad Short Packets" {
+            parameter hard_reset_value = 1;  // NOTE: real reset value is 0
+        }
+        field ct[11:4] is (read_write) "Collision Threshold" {
+            parameter hard_reset_value = 0xf; // NOTE: real reset value is 0
+        }
+        field bst[21:12] is (read_write) "Back-Off Slot Time" {
+            parameter hard_reset_value = 0x40; // NOTE: real reset value is 0
+        }
+        field swxoff[22] is (unimplemented) "Software XOFF Transmission";
+        // reserved[23]
+        field rtlc[24]   is (unimplemented) "Re-transmit on Late Collision";
+        // reserved[31:25]
+    }
+
+    register tctl_ext {
+        field cold[19:10] is (read_write) "Collision Distance" {
+            parameter hard_reset_value = 0x42;
+        }
+    }
+
+    register txpbs {
+        field pbsize[5:0] is (unimplemented) "Packet Buffer Size" {
+            parameter hard_reset_value = 0x28;
+        }
+    }
+
+    register dtxswc is (unimplemented);
+    register dtxctl is (unimplemented);
+
+}

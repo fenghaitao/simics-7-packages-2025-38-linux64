@@ -1,0 +1,130 @@
+/*
+  ich-sata-f5.dml - Integrated Serial ATA host controller
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "sata-common.dml";
+
+bank pci_config {
+    parameter base_address_registers =
+        ["pcmd_bar", "pcnl_bar", "scmd_bar", "scnl_bar", "bar", "sidpba"];
+
+    register sidpba @ 0x24 is (io_base_address) {
+        parameter desc = "SATA Index Data Pair Base Address";
+        parameter map_func = $sidp.function;
+        parameter size_bits = 4;
+    }
+
+    register capabilities_ptr {
+        parameter value = 0x70;
+    }
+    register map is (read_only);
+    register pcs is (silent_unimplemented);
+
+    register atc is (reserved);
+    register ats is (reserved);
+
+    method update_device_id() {
+        if ($ich9_mobile)
+            $device_id = 0x292d;
+        else if ($ich9_desktop)
+            $device_id = 0x2926;
+        else if ($ich10_consumer)
+            $device_id = 0x3A26;
+        else if ($ich10_corporate)
+            $device_id = 0x3A06;
+        else
+            error;
+    }
+
+    method update_class_code() -> () {
+        $class_code = 0x01 << 16 | 0x01 << 8 | 0x85;
+    }
+
+    register interrupt_pin {
+        method get()->(value) {
+            value = $chipset_config.int_register.read(0x3100)[23:20];
+        }
+        method set(value) {
+            local typeof(value) current_value;            
+            inline $get()->(current_value);            
+            if (value != current_value) {
+                log "error", 1, PCI_config: "%s is a read-only alias for d31p.sip2 in %s",
+                    $qname, $chipset_config.qname;
+            }
+        }
+        method read()->(value) {
+            inline $get()->(value);
+        }
+    }
+
+    method update_config() {
+        call $pci_config.update_all_mappings();
+        call $pci_config.update_device_id();
+        call $pci_config.update_class_code();
+    }
+
+    method bus_reset() {
+        log "info", 2, PCI_config: "Bus reset";
+        call $dev.soft_reset();
+        call $pci_config.update_config();
+    }
+}
+
+bank sidp {
+    parameter valid_port_index_values = [0, 2];
+
+    register sdata {
+        method read_sata_register(memop, pidx, ridx) -> (value) {
+            local uint32 offset;
+            inline $get_offset() -> (offset);
+            inline $sata.read(memop, offset, 4) -> (value);
+        }
+        method write_sata_register(memop, value, pidx, ridx) {
+            local uint32 offset;
+            inline $get_offset() -> (offset);
+            inline $sata.write(memop, offset, 4, value);
+        }
+        method get_offset() -> (offset) {
+            assert($sindex.pidx == 0 || $sindex.pidx == 2);
+            assert($sindex.ridx < 3);
+            // 00h = Primary Master (Port 4)
+            // 02h = Secondary Master (Port 5)
+            offset = (($sindex.pidx == 0) ? 0 : 12)
+                   + $sindex.ridx * 4;
+        }
+    }
+}
+
+bank sata {
+    parameter desc = "serial ATA registers";
+    parameter mappable = false;
+    parameter byte_order = "little-endian";
+    parameter register_size = 4;
+
+    group ch[2] {
+        parameter g_offset = $i * 12;
+        is sata_superset_registers;
+    }
+}
+
+method init() {
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state($dev.obj)) {
+        call $pci_config.update_config();
+    }
+}

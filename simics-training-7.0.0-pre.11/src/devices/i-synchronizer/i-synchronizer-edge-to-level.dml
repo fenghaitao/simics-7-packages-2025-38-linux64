@@ -1,0 +1,65 @@
+/*
+  © 2024 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device i_synchronizer_e2l;
+
+param desc = "device to convert edge to level interrupt";
+
+param documentation = "Take an edge triggered IRQ and turn it into a level IRQ.";
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+
+port edge_in "incoming IRQ signal" {
+    implement signal {
+        method signal_raise() {
+            if (!level_out.state) {
+                log info, 2 : "Got edge IRQ. Raise level IRQ.";
+                level_out.state = true;
+                level_out.signal.signal_raise();
+            } else {
+                log info, 2 : "Got edge IRQ, but IRQ already raised.";
+            }
+        }
+        method signal_lower() {
+        }
+    }
+}
+
+connect level_out is signal_connect "IRQ signal." {
+    saved bool state;
+}
+
+attribute irq_state_attr is (pseudo_attr, read_only_attr) {
+    param type = "b";
+    param internal = true;
+    method get() -> (attr_value_t) {
+        return SIM_make_attr_boolean(level_out.state);
+    }
+}
+
+bank regs {
+    register clear_irq size 4 @ 0x0000 is (write) "Write to clear IRQ" {
+        method write(uint64 value) {
+            if (level_out.state) {
+                log info, 2 : "Lowering IRQ.";
+                level_out.state = false;
+                level_out.signal.signal_lower();
+            } else {
+                log info, 2 : "Clearing already lowered IRQ.";
+            }
+        }
+    }
+}

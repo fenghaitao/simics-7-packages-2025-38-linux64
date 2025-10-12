@@ -1,0 +1,62 @@
+/*
+  i210-mac-pcie.dml
+
+  © 2013 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+bank csr {
+    /* --------------------------------------------------------------
+       PCIe REGISTERS
+       -------------------------------------------------------------- */
+
+    register gcr          @ 0x05b00 "PCIe Control";
+    register gscl_1       @ 0x05b10 "PCIe Statistics Control #1";
+    register gscl_2       @ 0x05b14 "PCIe Statistics Control #2";
+    register gscl_3       @ 0x05b18 "PCIe Statistics Control #3";
+    register gscl_4       @ 0x05b1c "PCIe Statistics Control #4";
+    register gscn_0       @ 0x05b20 "PCIe Counter #0";
+    register gscn_1       @ 0x05b24 "PCIe Counter #1";
+    register gscn_2       @ 0x05b28 "PCIe Counter #2";
+    register gscn_3       @ 0x05b2c "PCIe Counter #3";
+    register factps       @ 0x05b30 "Function Action and Power State to MNG";
+    register gioanactl0   @ 0x05b34 "Serdes/CCM/PCIe CSR";
+    register gioanactl1   @ 0x05b38 "Serdes/CCM/PCIe CSR";
+    register gioanactl2   @ 0x05b3c "Serdes/CCM/PCIe CSR";
+    register gioanactl3   @ 0x05b40 "Serdes/CCM/PCIe CSR";
+    register gioanactlall @ 0x05b44 "Serdes/CCM/PCIe CSR";
+    register ccmctl       @ 0x05b48 "Serdes/CCM/PCIe CSR";
+    register scctl        @ 0x05b4c "Serdes/CCM/PCIe CSR";
+    register swsm         @ 0x05b50 "Software Semaphore";
+    register fwsm         @ 0x05b54 "Firmware Semaphore";
+
+    register gcr is (unimpl);
+    register gscl_1 is (unimpl);
+    register gscl_2 is (unimpl);
+    register gscl_3 is (unimpl);
+    register gscl_4 is (unimpl);
+    register gscn_0 is (unimpl);
+    register gscn_1 is (unimpl);
+    register gscn_2 is (unimpl);
+    register gscn_3 is (unimpl);
+    register factps is (unimpl);
+    register gioanactl0 is (unimpl);
+    register gioanactl1 is (unimpl);
+    register gioanactl2 is (unimpl);
+    register gioanactl3 is (unimpl);
+    register gioanactlall is (unimpl);
+    register ccmctl is (unimpl);
+    register scctl is (unimpl);
+    register swsm is (unimpl);
+    register fwsm is (unimpl);
+}

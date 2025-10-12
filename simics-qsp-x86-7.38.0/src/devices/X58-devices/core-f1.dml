@@ -1,0 +1,58 @@
+/*
+
+  core-f1.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "x58-common.dml";
+
+bank f1 is cfg_with_caps {
+    param desc =  "GPIO and scratchpad registers";
+    param function = 1;
+
+    register device_id { param init_val = 0x3422; }
+
+    register sr[i < 24]  size 4 @ 0x7c + i * 4  is sticky "Scratch Pad";
+    register cwr[i < 24] size 4                 is relay  "Conditional Write";
+    register ir[i < 24]  size 4 @ 0x140 + i * 4 is relay  "Increment";
+    register txtlock     size 1 @ 0x240         is unimpl "TXT Lock";
+    register txtlockbp   size 1 @ 0x244         is unimpl "TXT Lock Bypass";
+
+
+    register cwr[i < 24] {
+        /* The CW register sequence skips 4 bytes between index 8 and 9, to
+           avoid offset 0x100, because that's a reserved address in PCIe */
+        param offset = 0xdc + i * 4 + (i > 8 ? 4 : 0);
+        method read() -> (uint64) {
+            return sr[i].val;
+        }
+        method write(uint64 val) {
+            if (sr[i].val == 0)
+                sr[i].val = val;
+        }
+    }
+    register ir[i < 24] {
+        method read() -> (uint64) {
+            return sr[i].val++;
+        }
+        method write(uint64 value) {
+            read();
+        }
+    }
+}
+
+template relay is (read, write, register) {
+    param configuration = "none";
+}

@@ -1,0 +1,551 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+#if (dev.simics_api_version != "6") {
+    error "This library is deprecated, please use the new library dml-lib/pcie/*";
+}
+
+/* Type 0 Configuration for SR-IOV virtual functions */
+template pci_config_type_0_vf is (_pci_config_generic, _pci_config_type_0) {
+     // without function number set
+
+    param pf_bank;  // associated PF bank
+    param vf_num;  // 1-indexed ID number (per PF)
+
+    // Virtual functions are detected by 0xFFFFF
+    register vendor_id { param init_val = 0xFFFF; }
+    register device_id { param init_val = 0xFFFF; }
+
+    // Virtual functions have their bars in SR-IOV capabilities regs in PF */
+    register base_address_0 @ 0x10 is (no_base_address_32);
+    register base_address_1 @ 0x14 is (no_base_address_32);
+    register base_address_2 @ 0x18 is (no_base_address_32);
+    register base_address_3 @ 0x1c is (no_base_address_32);
+    register base_address_4 @ 0x20 is (no_base_address_32);
+    register base_address_5 @ 0x24 is (no_base_address_32);
+
+    // read-only/read-zero, not applicable for VFs
+    register cardbus_cis_ptr is (read_zero);
+    register interrupt_line is (read_zero);
+    register interrupt_pin is (read_zero);
+
+    // fields not writable in VFs (except bus_master)
+    register command is _pci_config_generic_command_reg {
+        param io_bit_implemented  = false; // io_space_enable
+        param mem_bit_implemented = false; // memory_space_enable
+        param m_bit_implemented = true;    // bus_master_enable
+        param id_bit_implemented  = false; // interrupt_disable
+    }
+
+    register bus_address {
+        method update() {
+            if (this.val == this.init_val) {
+                assert vf_num > 0;
+                local uint16 offset;
+                offset = pf_bank.sriov_first_vf_offset.get();
+                local uint16 stride;
+                stride = pf_bank.sriov_vf_stride.get();
+                local uint16 rid = offset + (vf_num - 1) * stride;
+                pf_bank.bus_address.update();
+                this.val = pf_bank.bus_address.val + (rid << 12);
+            }
+        }
+    }
+}
+
+// SR-IOV capability and templates for virtual functions and BARs
+template defining_pcie_sriov_capability_v1 is (bank, soft_reset, _qname) {
+    param sriov_offset;
+    param sriov_next_ptr;
+    param sriov_supported_page_size_mask;
+    param sriov_vfs;
+    param sriov_vf_bars;
+    param sriov_pf0_bank;  // for ARICH
+
+    register sriov_capability_header    size 4 @ (sriov_offset + 0x0) {
+        param documentation = "Capability Header";
+    }
+    register sriov_capabilities         size 4 @ (sriov_offset + 0x4) {
+        param documentation = "SR-IOV Capabilities";
+    }
+    register sriov_control              size 2 @ (sriov_offset + 0x8) {
+        param documentation = "SR-IOV Control";
+    }
+    register sriov_status               size 2 @ (sriov_offset + 0xa) {
+        param documentation = "SR-IOV Status";
+    }
+    register sriov_initial_vfs          size 2 @ (sriov_offset + 0xc) {
+        param documentation = "InitialVFs";
+    }
+    register sriov_total_vfs            size 2 @ (sriov_offset + 0xe) {
+        param documentation =  "TotalVFs";
+    }
+    register sriov_num_vfs              size 2 @ (sriov_offset + 0x10) {
+        param documentation = "NumVFs";
+    }
+    register sriov_func_dep_link        size 1 @ (sriov_offset + 0x12) {
+        param documentation = "Function Dependency Link";
+    }
+    register sriov_first_vf_offset      size 2 @ (sriov_offset + 0x14) {
+        param documentation = "First VF Offset."
+            + " Users of SR-IOV template must implement get() method and"
+            + " update the offset according to num_vfs register and"
+            + " control:arich field.";
+    }
+    register sriov_vf_stride            size 2 @ (sriov_offset + 0x16) {
+        param documentation = "VF Stride."
+            + " Users of SR-IOV template must implement get() method and"
+            + " update the stride according to num_vfs register and"
+            + " control:arich field.";
+    }
+    register sriov_vf_device_id         size 2 @ (sriov_offset + 0x1a) {
+        param documentation = "VF Device ID";
+    }
+    register sriov_supported_page_sizes size 4 @ (sriov_offset + 0x1c) {
+        param documentation = "Supported Page Sizes";
+    }
+    register sriov_system_page_size     size 4 @ (sriov_offset + 0x20) {
+        param documentation = "System Page Size";
+    }
+    register sriov_vf_migration_state_offset  size 4 @ (sriov_offset + 0x3c) {
+        param documentation = "VF Migration State Array Offset";
+    }
+
+    register sriov_capability_header {
+        field id        @ [15:0]  is (constant) "Capability ID" {
+            param init_val = 0x10;
+        }
+        field version   @ [19:16] is (constant) "Capability Version" {
+            param init_val = 0x1;
+        }
+        field next_ptr  @ [31:20] is read_only "Next Capability Offset" {
+            param init_val = sriov_next_ptr;
+        }
+    }
+    register sriov_capabilities {
+        field vfmc    @ [0:0]   is (constant) "VF Migration Capable";
+        field arichp  @ [20:1]  is (constant) "ARI Capable Hierarchy Preserved" {
+            // must be set, indicates that ari_capable_hierarchy bit is sticky
+            param init_val = 0x1;
+        }
+        field vfmimn  @ [31:21] is (constant) {
+            param documentation = "VF Migration Interrupt Message Number";
+        }
+    }
+    register sriov_control {
+        session bool bits_updated;
+
+        field vfe  @ [0:0] is write "VF Enable" {
+            method get_cspace_map_iface()
+                -> (conf_object_t *,
+                    const map_demap_interface_t *) /* cspace, map_iface */ {
+                local conf_object_t *cspace;
+                local const map_demap_interface_t *map_iface;
+                /// TODO: in 4.8, we should extend the pci_bus interface to
+                /// support port-mapping so we don't need to operate directly
+                /// on the conf-space obj
+                cspace = pci_bus.pci_bus.configuration_space();
+                map_iface = SIM_c_get_interface(cspace, "map_demap");
+                return (cspace, map_iface);
+            }
+
+            method map_vfs() {
+                if (pci_bus.obj == NULL) {
+                    log info, 2, PCI_config: "Attempt to map VFs"
+                        + " with the PCI bus disconnected";
+                    return;
+                }
+                bank.bus_address.update();
+                local int pf_rid = bank.bus_address.val >> 12;
+
+                if (sriov_pf0_bank.sriov_control.arich.get() == 0) {
+                    // When device is _not_ in an ARI Capable Hierarchy, the
+                    // number of available functions on the first bus are
+                    // restricted to 8 _including_ the PFs. First_VF_Offset and
+                    // VF_Stride should be updated by model to allocate the VFs
+                    // on the second/next bus, or else this is a model error
+                    local uint16 offset;
+                    offset = sriov_first_vf_offset.get();
+                    local uint16 stride;
+                    stride = sriov_vf_stride.get();
+                    if (pf_rid[2:0] + offset + (sriov_num_vfs.val - 1) * stride > 8
+                        && pf_rid[2:0] + offset < 0x100 ) {
+                        log error, 1, PCI_config:
+                            "SR-IOV model does not support %d enabled VFs"
+                            + " unless ARI Capable Hierarchy bit has been set"
+                            + " (as First VF Offset=0x%04x"
+                            + " and VF Stride=0x%04x)",
+                            sriov_num_vfs.val, offset, stride;
+                    }
+                }
+
+                local conf_object_t *cspace;
+                local const map_demap_interface_t *map_iface;
+                (cspace, map_iface) = get_cspace_map_iface();
+
+                local int i;
+                for (i = 0; i < sriov_num_vfs.val; i++) {
+                    assert sriov_vfs[i].vf_num > 0;
+                    if (sriov_vfs[i].vf_num <= sriov_num_vfs.val) { // vf_num is 1-indexed
+                        local map_info_t info;
+                        memset(&info, 0, sizeoftype(map_info_t));
+                        local uint16 offset;
+                        offset = sriov_first_vf_offset.get();
+                        local uint16 stride;
+                        stride = sriov_vf_stride.get();
+                        local int rid = pf_rid + offset
+                            + (sriov_vfs[i].vf_num - 1) * stride;
+                        info.base = rid << 12;
+                        info.length = 4096;
+                        info.start = 0;
+
+                        map_iface->map_simple(cspace, dev.obj, sriov_vfs[i].qname, info);
+                    }
+                }
+            }
+
+            method unmap_vfs() {
+                if (pci_bus.obj == NULL) {
+                    log info, 2, PCI_config: "Attempt to unmap VFs"
+                        + " with the PCI bus disconnected";
+                    return;
+                }
+
+                local conf_object_t *cspace;
+                local const map_demap_interface_t *map_iface;
+                (cspace, map_iface) = get_cspace_map_iface();
+
+                local int i;
+                for (i = 0; i < sriov_num_vfs.val; i++) {
+                    assert sriov_vfs[i].vf_num > 0;
+                    if (sriov_vfs[i].vf_num <= sriov_num_vfs.val) { // vf_num is 1-indexed
+                        map_iface->unmap(cspace, dev.obj, sriov_vfs[i].qname);
+                    }
+                }
+            }
+
+            method write(uint64 value) {
+                // map or unmap the VFs from configuration space, the memory
+                // space mappings will be updated by after_write() as they also
+                // depends on vfmse bit
+                if (this.get() == 0 && value == 1) {
+                    map_vfs();
+                } else if (this.get() == 1 && value == 0) {
+                    unmap_vfs();
+                }
+                if (this.get() != value)
+                    bits_updated = true;
+                this.set(value);
+            }
+        }
+        field vfme   @ [1:1] is (constant) "VF Migration Enable";
+        field vfmie  @ [2:2] is (constant) "VF Migration Interrupt Enable";
+        field vfmse  @ [3:3] is (write) "VF Memory Space Enable" {
+            method write(uint64 value) {
+                if (this.get() != value)
+                    bits_updated = true;
+                this.set(value);
+            }
+        }
+        field arich  @ [4:4] is (write) "ARI Capable Hierarchy" {
+            param limitations
+                = "ARI Capable Hierarchy bit can only be set when all VFs are"
+                + " disabled, but model only test the VF Enable bit of PF0";
+
+            method write(uint64 value) {
+                if (this.get() != value) {
+                    if (bank.name != sriov_pf0_bank.name) {
+                        log spec_viol, 1, PCI_config:
+                            "'ARI Capable Hierarchy' bit can only be modified"
+                            + " in PF0.";
+                    } else if (vfe.get() != 0) {
+                        log spec_viol, 1, PCI_config:
+                            "'ARI Capable Hierarchy' bit cannot be set when"
+                            + " 'VF Enable' bit is already set.";
+                    } else {
+                        if (this.get() == 0 && value == 1) {
+                            log info, 4, PCI_config:
+                                "'ARI Capable Hierarchy' bit set, device now"
+                                + " supports up to 256 functions on the bus"
+                                + " captured by PF0";
+                        }
+                    }
+                    this.set(value);
+                }
+            }
+        }
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *user) {
+            bits_updated = false;
+            default(value, enabled_bytes, user);
+            if (bits_updated) {
+                update_vf_mappings();
+            }
+        }
+
+
+        method update_vf_mappings() {
+            log info, 3, PCI_config: "Updating SRIOV VF mappings";
+
+            foreach reg in (each base_address in (bank)) {
+                if (reg.mapped) {
+                    #foreach name in (sriov_vf_bars) {
+                        if (strcmp(reg.name, name) == 0)
+                            reg.update_mapping();
+                    }
+                }
+            }
+        }
+    }
+
+    method soft_reset() {
+        // invoked on bus_reset
+        sriov_control.vfe.write(0);  // unmaps VFs
+        sriov_control.update_vf_mappings(); // unmaps VF BARs
+        default();
+    }
+    register sriov_status {
+        field vfms  @ [0:0] is write_1_clears "VF Migration Status";
+    }
+    register sriov_initial_vfs is (read_only, read) {
+        method read() -> (uint64) {
+            return sriov_total_vfs.get();
+        }
+    }
+    register sriov_total_vfs is (read_only);
+    register sriov_num_vfs is (write) {
+        method write(uint64 value) {
+            if (sriov_control.vfe.get() != 0) {
+                log spec_viol, 1, PCI_config:
+                    "NumVFs cannot be set when 'VF Enable' bit is set";
+            } else {
+                this.set(value);
+                if (value > sriov_total_vfs.get()) {
+                    log spec_viol, 1, PCI_config:
+                        "NumVFs cannot be greater than TotalVFs,"
+                        + " value truncated to %d", sriov_total_vfs.get();
+                    this.set(sriov_total_vfs.get());
+                }
+            }
+        }
+    }
+    register sriov_func_dep_link is (read_only);
+    register sriov_first_vf_offset is (read_only) {
+        param configuration = "pseudo";
+    }
+    register sriov_vf_stride is (read_only) {
+        param configuration = "pseudo";
+    }
+    register sriov_vf_device_id is (read_only);
+    register sriov_supported_page_sizes is (constant) {
+        param init_val = sriov_supported_page_size_mask;
+    }
+    register sriov_system_page_size is (write) {
+        param init_val = 0x1;
+
+        method write(uint64 value) {
+            if (value == 0) {
+                log spec_viol, 1, PCI_config:
+                    "'System Page Size' cannot be set to 0,"
+                    + " results are undefined";
+            } else if (!is_power_of_2(value)) {
+                log spec_viol, 1, PCI_config:
+                    "Setting multiple bits in 'System Page Size' is undefined";
+            } else if ((value & sriov_supported_page_size_mask) == 0) {
+                log spec_viol, 1, PCI_config:
+                    "'System Page Size' does not support value %#x", value;
+            } else if (sriov_control.vfe.get() != 0) {
+                log spec_viol, 1, PCI_config:
+                    "'System Page Size' cannot be set when"
+                    + " 'VF Enable' bit is set";
+            } else {
+                this.val = value;
+            }
+        }
+
+        method size_bits() -> (int) {
+            local int bits;
+            bits = log2_64(this.val << 12);
+            return bits;
+        }
+    }
+    register sriov_vf_migration_state_offset is (read_only);
+}
+
+template _vf_bar_common is (base_address, memory_base_address_generic) {
+    // unused, required by inherited templates
+    param map_func = -1;
+    param map_bank; // name of bank to map in memory space
+
+    method pci_bar_size_bits() -> (int) {
+        local int bits;
+        local int page_bits;
+        page_bits = sriov_system_page_size.size_bits();
+        bits = (page_bits > size_bits) ? page_bits : size_bits;
+        return bits;
+    }
+
+    method vf_pci_mapping_enabled() -> (bool) default {
+        local bool enabled;
+        enabled = (sriov_control.vfe.get() == 1
+                   && sriov_control.vfmse.get() == 1);
+        return enabled;
+    }
+
+    method pci_mapping_enabled() -> (bool) {
+        return vf_pci_mapping_enabled();
+    }
+
+    method vf_update_mapping() default {
+        // customized function, as VFs depend on vfmse and not command.mem
+        this.remove_map();
+
+        if (pci_mapping_enabled()) {
+            this.add_map();
+        }
+    }
+
+    method update_mapping() {
+        vf_update_mapping();
+    }
+
+    method get_mspace_map_iface() -> (conf_object_t *,
+                                      const map_demap_interface_t *) /* mspace, map_iface */ {
+        local conf_object_t *mspace;
+        local const map_demap_interface_t *map_iface;
+        /// TODO: in 4.8, we should extend the pci_bus interface to support
+        /// port-mapping so we don't need to operate directly on the
+        /// memory-space obj
+        mspace = pci_bus.pci_bus.memory_space();
+        map_iface = SIM_c_get_interface(mspace, "map_demap");
+        return (mspace, map_iface);
+    }
+
+    method _vf_obj(int i) -> (conf_object_t *) {
+        local strbuf_t name = sb_newf("bank.%s[%d]", map_bank, i);
+        local conf_object_t *obj = SIM_object_descendant(dev.obj,
+                                                         sb_str(&name));
+        if (obj == NULL) {
+            sb_fmt(&name, "port.%s[%d]", map_bank, i);
+            obj = SIM_object_descendant(dev.obj, sb_str(&name));
+        }
+        assert obj != NULL;
+        sb_free(&name);
+        return obj;
+    }
+
+    method vf_remove_map() default {
+        // customized function, as all VF mappings must be removed
+        if (pci_bus.obj == NULL) {
+            log info, 2, PCI_config: "Attempt to unmap VF"
+                + " with the PCI bus disconnected";
+            return;
+        }
+
+        local conf_object_t *mspace;
+        local const map_demap_interface_t *map_iface;
+        (mspace, map_iface) = get_mspace_map_iface();
+
+        local int i;
+        for (i = 0; i < sriov_total_vfs.val; i++) {
+            local conf_object_t *vf_obj = _vf_obj(i);
+            log info, 3, PCI_config:
+                "Removing SRIOV VF mapping for %s (%s)",
+                qname, SIM_object_name(vf_obj);
+            map_iface->unmap(mspace, vf_obj, NULL);
+        }
+    }
+
+    method remove_map() {
+        vf_remove_map();
+    }
+
+    method vf_add_map() default {
+        // customized function, as all VFs must be mapped
+        if (pci_bus.obj == NULL) {
+            log info, 2, PCI_config: "Attempt to add VF mapping"
+                + " with the PCI bus disconnected";
+            return;
+        }
+
+        local conf_object_t *mspace;
+        local const map_demap_interface_t *map_iface;
+        (mspace, map_iface) = get_mspace_map_iface();
+
+        // add this new mapping
+        local map_info_t info;
+        memset(&info, 0, sizeoftype(map_info_t));
+        info.base = pci_mapping_base();
+        info.length = pci_mapping_length();
+
+        local int i;
+        for (i = 0; i < sriov_num_vfs.val; i++, info.base+=info.length) {
+            if (info.base == 0)
+                log info, 3, PCI_config: "Zero %s mapping", qname;
+
+            local conf_object_t *vf_obj = _vf_obj(i);
+            log info, 3, PCI_config:
+                "New SRIOV VF mapping for %s (%s): base = %#x, length = %#x",
+                qname, SIM_object_name(vf_obj), info.base, info.length;
+
+            map_iface->map_simple(mspace, vf_obj, NULL, info);
+        }
+    }
+
+    method add_map() {
+        vf_add_map();
+    }
+}
+
+template vf_bar_64 {
+    is _vf_bar_common;
+    is memory_base_address_64;
+}
+
+template vf_bar_32 {
+    is _vf_bar_common;
+    is memory_base_address_32;
+}
+
+template bar_port {
+    /* This is more or less a copy of how the bank template (dml-builtins.dml)
+       implements the io_memory interface. This is required in order to map
+       ports in PCI memory space when user is writing to the VF BAR
+       registers. This template can also be used for customized BAR registers
+       where port-mapping is used. Please note that the standard BAR register
+       templates assume a bank is mapped (i.e. function-mapping). */
+    implement io_memory {
+        method operation(generic_transaction_t *mem_op,
+                         map_info_t map_info) -> (exception_type_t) {
+            if (io_memory_access(mem_op,
+                                 (SIM_get_mem_op_physical_address(mem_op)
+                                  - map_info.base + map_info.start),
+                                 NULL)) {
+                return Sim_PE_No_Exception;
+            } else {
+                log info, 2, PCI_DMA: "Target Abort sent";
+                pci_config_bank.status.sta.set(1);
+                return Sim_PE_IO_Not_Taken;
+            }
+        }
+    }
+
+    method io_memory_access(generic_transaction_t *memop,
+                            physical_address_t offset,
+                            void* aux) -> (bool) default {
+        log unimpl: "access to port:%s not implemented", _qname();
+        return true;
+    }
+}

@@ -1,0 +1,43 @@
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "pci/bridge.dml";
+
+param pcie_device = true;
+param secondary_side_is_pci = false;
+
+#if (dev.simics_api_version != "6") {
+    error "This library is deprecated, please use the new library dml-lib/pcie/*";
+}
+
+connect secondary_bus {
+    interface pci_express;
+}
+
+// Compute the map of the PCI configuration space of the secondary bus to put it
+// in the primary bus configuration space
+inline method compute_conf_space_window(inline map, inline sec, inline sub) default {
+    map->base = sec << 20;
+    map->start = sec << 20;
+    map->length = (1 << 20) * (sub - sec + 1);
+}
+
+implement pci_express {
+    method send_message(conf_object_t *src, pcie_message_type_t type,
+                        byte_string_t payload) -> (int) default {
+        // send message to implement
+        return 0;
+    }
+}

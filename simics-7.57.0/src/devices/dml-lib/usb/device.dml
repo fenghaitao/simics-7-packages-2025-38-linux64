@@ -1,0 +1,528 @@
+/*
+  device.dml - Common USB device code
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+/*
+  The generic USB device currently only support one configuration
+  descriptor and one interface descriptor. A USB device implementing
+  this code must:
+  1. Define usb_dev_new_transfer, usb_dev_abort_transfer, and
+     usb_dev_reset functions.
+  2. Call usb_dev_post_init() from post_init()
+
+  Note that all standard control transfers will be handled
+  automatically.
+ */
+
+dml 1.2;
+
+import "simics/devs/usb.dml";
+
+extern void *memcpy(void *dest, const void *src, int n);
+
+constant USB_bRequest_Get_Status        =  0;
+constant USB_bRequest_Clear_Feature     =  1;
+        /* 2 reserved */
+constant USB_bRequest_Set_Feature       =  3;
+        /* 4 reserved */
+constant USB_bRequest_Set_Address       =  5;
+constant USB_bRequest_Get_Descriptor    =  6;
+constant USB_bRequest_Set_Descriptor    =  7;
+constant USB_bRequest_Get_Configuration =  8;
+constant USB_bRequest_Set_Configuration =  9;
+constant USB_bRequest_Get_Interface     = 10;
+constant USB_bRequest_Set_Interface     = 11;
+constant USB_bRequest_Synch_Frame       = 12;
+
+constant USB_wValue_Descriptor_Type_Device                    = 1;
+constant USB_wValue_Descriptor_Type_Configuration             = 2;
+constant USB_wValue_Descriptor_Type_String                    = 3;
+constant USB_wValue_Descriptor_Type_Interface                 = 4;
+constant USB_wValue_Descriptor_Type_Endpoint                  = 5;
+constant USB_wValue_Descriptor_Type_Device_Qualifier          = 6;
+constant USB_wValue_Descriptor_Type_Other_Speed_Configuration = 7;
+constant USB_wValue_Descriptor_Type_Interface_Power           = 8;
+constant USB_wValue_Descriptor_Type_Debug                     = 10;
+constant USB_wValue_Descriptor_Type_HID_Report                = 34;
+
+constant USB_Device_State_Default    = 0;
+constant USB_Device_State_Address    = 1;
+constant USB_Device_State_Configured = 2;
+
+constant USB_Feature_Endpoint_Halt        = 0;
+constant USB_Feature_Device_Remote_Wakeup = 1;
+constant USB_Feature_Test_Mode            = 2;
+
+parameter support_ms_os_descriptor default false;
+constant MS_OS_Descriptor_Index = 0xEE;
+
+extern void *malloc(int size);
+extern void free(void *p);
+extern int strlen(const char *s);
+
+loggroup usb_dev_lg;
+
+template dbuffer_attribute {
+    parameter type = "d|n";
+    data dbuffer_t *buf;
+
+    method set(attr_value_t val) {
+        if ($buf)
+            dbuffer_free($buf);
+        if (SIM_attr_is_data(val)) {
+            $buf = new_dbuffer();
+            memcpy(dbuffer_append($buf, SIM_attr_data_size(val)),
+                   SIM_attr_data(val), SIM_attr_data_size(val));
+        } else {
+            $buf = NULL;
+        }
+    }
+
+    method get() -> (attr_value_t val) {
+        if ($buf == NULL)
+            val = SIM_make_attr_nil();
+        else
+            val = SIM_make_attr_data(dbuffer_len($buf),
+                                     dbuffer_read_all($buf));
+    }
+}
+
+template string_descriptor {
+    data dbuffer_t** arr;
+    data int size;
+    
+    method set(attr_value_t val) {
+        local int i;
+        local int n = SIM_attr_list_size(val);
+
+        for (i = 0; i < $size; i++)
+            dbuffer_free($arr[i]);
+        delete $arr;
+        $size = n;
+        $arr = new dbuffer_t *[n];
+        for (i = 0; i < n; i++) {
+            local attr_value_t p =  SIM_attr_list_item(val, i);
+            $arr[i] = new_dbuffer();
+            memcpy(
+                dbuffer_append($arr[i], SIM_attr_data_size(p)),
+                SIM_attr_data(p), SIM_attr_data_size(p));
+        }
+    }
+
+    method get() -> (attr_value_t val) {
+        local int i;
+        local int n = $size;
+        val = SIM_alloc_attr_list(n);
+        for (i = 0; i < n; i++) {
+            SIM_attr_list_set_item(
+                &val, i, SIM_make_attr_data(dbuffer_len($arr[i]),
+                                            dbuffer_read_all($arr[i])));
+        }
+    }
+}
+
+implement usb_device {
+    method submit_transfer(usb_transfer_t *transfer) -> (usb_transfer_completion_t comp) {
+        if (transfer->type == USB_Type_Control &&
+            transfer->endpoint_number == 0 &&
+            transfer->u.control_request.bmRequestType[6:5] == 0)
+            call $usb_dev_standard_control_transfer(transfer) -> (comp);
+        else
+            call $usb_dev_new_transfer(transfer) -> (comp);
+    }
+    method abort_transfer(usb_transfer_t *transfer) {
+        call $usb_dev_abort_transfer(transfer);
+    }
+    method reset() {
+        call $dev.hard_reset();
+        $device_address = 0;
+        $device_state = 0;
+        call $usb_dev_reset();
+    }
+}
+
+connect usb_host {
+    parameter documentation = "The USB host controller.";
+    parameter configuration = "optional";
+    interface usb;
+    method before_set() {
+        if (!SIM_is_restoring_state($dev.obj) && $obj != NULL) {
+            $usb.disconnect_device($dev.obj);
+        }
+    }
+
+    method after_set() {
+        if (SIM_object_is_configured($dev.obj)) {
+            call $connect();
+        }
+    }
+
+    method connect() {
+        if (!SIM_is_restoring_state($dev.obj) && $obj != NULL)
+            $usb.connect_device($dev.obj, $USB_DEVICE_SPEED);
+    }
+}
+
+attribute descriptor_data {
+    is dbuffer_attribute;
+    parameter documentation = "The descriptors in data format.";
+    parameter configuration = "optional";
+}
+
+attribute string_descriptor_array {
+    is string_descriptor;
+    parameter documentation = "String descriptors.";
+    parameter configuration = "optional";
+    parameter type = "[d*]";
+}
+
+attribute ms_os_descriptor {
+    is dbuffer_attribute;
+    parameter documentation = "The Microsoft OS Descriptor.";
+    parameter configuration = "optional";
+}
+
+attribute hid_report_descriptor_data {
+    is dbuffer_attribute;
+    parameter documentation = "The descriptors in data format.";
+    parameter configuration = "optional";
+}
+
+attribute device_qualifier_descriptor_data {
+    is dbuffer_attribute;
+    parameter documentation = "The device qualifier in data format.";
+    parameter configuration = "optional";
+}
+
+method ms_os_descriptor_to_dbuffer(dbuffer_t *d_buf, int size) 
+    -> (int written) {
+    local dbuffer_t *p;
+    local int n;
+    p = $ms_os_descriptor.buf;
+    n = dbuffer_len(p);
+    written = size < n ? size : n;
+    dbuffer_copy_append(d_buf, p, 0, written);
+}
+
+method string_descriptor_to_dbuffer(dbuffer_t *d_buf, int size, int idx)
+    -> (int written) {
+    local dbuffer_t *p;
+    local int n;
+    if (idx < $string_descriptor_array.size) {
+        p = $string_descriptor_array.arr[idx];
+        n = dbuffer_len(p);
+        written = size < n ? size : n;
+        dbuffer_copy_append(d_buf, p, 0, written);
+    } else {
+        log error, 1, usb_dev_lg: 
+            "requested string descriptor with index too big (%d)", idx;
+        written = 0;
+    }
+}
+
+method device_qualifier_descriptor_to_dbuffer(dbuffer_t *d_buf, int size, int idx) -> (int written) {
+    local int n = dbuffer_len($device_qualifier_descriptor_data.buf);
+    written = size < n ? size : n;
+    dbuffer_copy_append(d_buf, $device_qualifier_descriptor_data.buf, 0, written);
+}
+
+method hid_report_descriptor_to_dbuffer(dbuffer_t *d_buf, int size, int idx) -> (int written) {
+    local int n = dbuffer_len($hid_report_descriptor_data.buf);
+    written = size < n ? size : n;
+    dbuffer_copy_append(d_buf, $hid_report_descriptor_data.buf, 0, written);
+}
+
+method usb_dev_post_init() {
+    call $usb_host.connect();
+}
+
+method get_device_descriptor_len() -> (int len) {
+    len = UNALIGNED_LOAD_LE8(dbuffer_read($descriptor_data.buf, 0, 1));
+}
+
+method get_tot_configuration_desc_len(int idx) -> (int len) {
+    local int conf_descs;
+    local int offset;
+
+    conf_descs = UNALIGNED_LOAD_LE8(dbuffer_read($descriptor_data.buf, 17, 1));
+    if (idx >= conf_descs) {
+        len = 0;
+        offset = -1;
+        return;
+    }
+
+    call $get_configuration_desc_offset(idx) -> (offset);
+    len = UNALIGNED_LOAD_LE16(dbuffer_read($descriptor_data.buf, offset + 2, 2));
+}
+
+method get_configuration_desc_offset(int idx) -> (int offset) {
+    local int conf_descs;
+    local int i;
+
+    conf_descs = UNALIGNED_LOAD_LE8(dbuffer_read($descriptor_data.buf, 17, 1));
+    if (idx >= conf_descs) {
+        offset = -1;
+        return;
+    }
+
+    offset = UNALIGNED_LOAD_LE8(dbuffer_read($descriptor_data.buf, 0, 1));
+    for (i = 0; i < idx; i++)
+        offset += UNALIGNED_LOAD_LE16(dbuffer_read($descriptor_data.buf, offset + 2, 2));
+}
+
+method device_descriptor_to_dbuffer(dbuffer_t *d_buf, int size) -> (int written) {
+    local int len;
+
+    call $get_device_descriptor_len() -> (len);
+    written = size < len ? size : len;
+    dbuffer_copy_append(d_buf, $descriptor_data.buf, 0, written);
+}
+
+method configuration_descriptor_to_dbuffer(dbuffer_t *d_buf, int size, int idx) -> (int written) {
+    local int len;
+    local int offset;
+
+    call $get_tot_configuration_desc_len(idx) -> (len);
+    call $get_configuration_desc_offset(idx) -> (offset);
+    written = size < len ? size : len;
+    dbuffer_copy_append(d_buf, $descriptor_data.buf, offset, written);
+}
+
+attribute device_address {
+    parameter documentation = "USB device/function address.";
+    parameter configuration = "optional";
+    parameter allocate_type = "uint8";
+}
+
+attribute device_state {
+    parameter documentation = "USB device state.";
+    parameter configuration = "optional";
+    parameter allocate_type = "int32";
+}
+
+method usb_dev_standard_control_transfer(usb_transfer_t *transfer)
+    -> (usb_transfer_completion_t comp) {
+    assert transfer->type == USB_Type_Control;
+
+    local uint64 str_desc_ind;
+    log info, 2, usb_dev_lg: "received standard control transfer";
+    comp = USB_Transfer_Completed;
+
+    switch (transfer->u.control_request.bRequest) {
+    case USB_bRequest_Get_Status:
+        log info, 2, usb_dev_lg: "Get Status request";
+        transfer->status = USB_Status_Ack;
+        if (transfer->size < 2) {
+            log error, 1, usb_dev_lg:
+                "status request should be able to return 2 bytes";
+        } else {
+            // TODO add correct value not always 0
+            dbuffer_append_value(transfer->buf, 0, 2);
+        }
+        break;
+    case USB_bRequest_Clear_Feature:
+        switch ($device_state) {
+        case USB_Device_State_Default:
+        case USB_Device_State_Address:
+        case USB_Device_State_Configured:
+            if (transfer->u.control_request.wValue
+                == USB_Feature_Endpoint_Halt) {
+                log unimpl, 1, usb_dev_lg:
+                    "Clear Feature request: Endpoint Halt";
+            } else if (transfer->u.control_request.wValue
+                       == USB_Feature_Device_Remote_Wakeup) {
+                log unimpl, 1, usb_dev_lg:
+                    "Clear Feature request: Device Remote Wakeup";
+            } else if (transfer->u.control_request.wValue
+                       == USB_Feature_Test_Mode) {
+                log unimpl, 1, usb_dev_lg:
+                    "Clear Feature request: Feature Test Mode";
+            } else {
+                assert false;
+            }
+            break;
+        default:
+            assert false;
+        }
+        break;
+    case USB_bRequest_Set_Feature:
+        log unimpl, 1, usb_dev_lg: "Set Feature request";
+        transfer->status = USB_Status_Nak;
+        break;
+    case USB_bRequest_Set_Address:
+        switch ($device_state) {
+        case USB_Device_State_Default:
+        case USB_Device_State_Address:
+        case USB_Device_State_Configured:
+            log info, 2, usb_dev_lg:
+            "Set Address request: address set to 0x%x",
+                transfer->u.control_request.wValue;
+            $device_address = transfer->u.control_request.wValue;
+            if ($device_address == 0)
+                $device_state = USB_Device_State_Default;
+            else
+                $device_state = USB_Device_State_Address;
+            break;
+        default:
+            assert false;
+        }
+        break;
+    case USB_bRequest_Get_Descriptor:
+
+        switch (transfer->u.control_request.wValue[15:8]) {
+        case USB_wValue_Descriptor_Type_Device:
+            assert transfer->direction == USB_Direction_In;
+            log info, 2, usb_dev_lg: "Get Device Descriptor request";
+            call $device_descriptor_to_dbuffer(transfer->buf, transfer->size)
+                -> (transfer->size);
+            transfer->status = USB_Status_Ack;
+            break;
+        case USB_wValue_Descriptor_Type_Configuration:
+            assert transfer->direction == USB_Direction_In;
+            log info, 2, usb_dev_lg:
+                "Get Configuration Descriptor request: index 0x%x",
+                transfer->u.control_request.wValue[7:0];
+            call $configuration_descriptor_to_dbuffer(
+                transfer->buf, transfer->size,
+                transfer->u.control_request.wValue[7:0]) -> (transfer->size);
+            transfer->status = USB_Status_Ack;
+            break;
+        case USB_wValue_Descriptor_Type_String:
+            str_desc_ind = transfer->u.control_request.wValue[7:0];
+            log info, 2, usb_dev_lg:
+                "Get String Descriptor request: index 0x%x", str_desc_ind;
+            if (str_desc_ind == MS_OS_Descriptor_Index) {
+                if (!$support_ms_os_descriptor) {
+                    log info, 2:
+                        "The MS OS descriptor is not supported by this device.";
+                    transfer->status = USB_Status_Stall;
+                } else {
+                    call $ms_os_descriptor_to_dbuffer(transfer->buf,
+                        transfer->size) -> (transfer->size);
+                    transfer->status = USB_Status_Ack;
+                }
+            } else {
+                call $string_descriptor_to_dbuffer(
+                    transfer->buf, transfer->size,
+                    transfer->u.control_request.wValue[7:0])
+                    -> (transfer->size);
+                transfer->status = USB_Status_Ack;
+            }
+            break;
+        case USB_wValue_Descriptor_Type_Endpoint:
+            log unimpl, 1, usb_dev_lg:
+            "Get Endpoint Descriptor request";
+            transfer->status = USB_Status_Nak;
+            break;
+        case USB_wValue_Descriptor_Type_Device_Qualifier:
+            log info, 2, usb_dev_lg: "Get Device Qualifier Descriptor request";
+            call $device_qualifier_descriptor_to_dbuffer(
+                transfer->buf, transfer->size,
+                transfer->u.control_request.wValue[7:0]) -> (transfer->size);
+            transfer->status = USB_Status_Ack;
+            break;
+        case USB_wValue_Descriptor_Type_Other_Speed_Configuration:
+            log unimpl, 1, usb_dev_lg:
+            "Get Other Speed Configuration request";
+            transfer->status = USB_Status_Nak;
+            break;
+        case USB_wValue_Descriptor_Type_Interface_Power:
+            log unimpl, 1, usb_dev_lg:
+            "Get Interface Power Descriptor request";
+            transfer->status = USB_Status_Nak;
+            break;
+        case USB_wValue_Descriptor_Type_Debug:
+            log unimpl, 1, usb_dev_lg: "Get Debug Descriptor request";
+            transfer->status = USB_Status_Stall;
+            break;
+        case USB_wValue_Descriptor_Type_HID_Report:
+            log info, 2, usb_dev_lg:
+            "Get HID Report Descriptor request: index 0x%x",
+                transfer->u.control_request.wValue[7:0];
+            call $hid_report_descriptor_to_dbuffer(
+                transfer->buf, transfer->size,
+                transfer->u.control_request.wValue[7:0]) -> (transfer->size);
+            transfer->status = USB_Status_Ack;
+            break;
+        default:
+            assert false;
+        }
+        break;
+    case USB_bRequest_Set_Descriptor:
+        log unimpl, 1, usb_dev_lg: "Set Descriptor request";
+        transfer->status = USB_Status_Nak;
+        break;
+    case USB_bRequest_Get_Configuration:
+        log unimpl, 1, usb_dev_lg: "Get Configuration request";
+        transfer->status = USB_Status_Nak;
+        break;
+    case USB_bRequest_Set_Configuration:
+        switch ($device_state) {
+        case USB_Device_State_Default:
+            log error, 1, usb_dev_lg:
+                "Set Configuration request in Default state";
+            break;
+        case USB_Device_State_Address:
+        case USB_Device_State_Configured:
+            log info, 2, usb_dev_lg:
+            "Set Configuration request: configuration value is 0x%x",
+                transfer->u.control_request.wValue;
+            if (transfer->u.control_request.wValue == 0)
+                $device_state = USB_Device_State_Address;
+            else {
+                local int conf_descs;
+                local int i;
+                local const uint8* buf =
+                    dbuffer_read($descriptor_data.buf, 17, 1);
+                conf_descs = UNALIGNED_LOAD_LE8(buf);
+                for (i = 0; i < conf_descs; i++) {
+                    local int conf_val;
+                    local int offset;
+                    call $get_configuration_desc_offset(i) -> (offset);
+                    buf = dbuffer_read($descriptor_data.buf, offset + 5, 1);
+                    conf_val = UNALIGNED_LOAD_LE8(buf);
+                    if (transfer->u.control_request.wValue == conf_val) {
+                        $device_state = USB_Device_State_Configured;
+                        break;
+                    }
+                }
+                if (i == conf_descs) {
+                    log error, 1, usb_dev_lg:
+                        "could not find any matching configuration";
+                    transfer->status = USB_Status_Nak;
+                }
+            }
+            break;
+        default:
+            assert false;
+        }
+        break;
+    case USB_bRequest_Get_Interface:
+        log unimpl, 1, usb_dev_lg: "Get Interface request";
+        transfer->status = USB_Status_Nak;
+        break;
+    case USB_bRequest_Set_Interface:
+        log unimpl, 1, usb_dev_lg: "Set Interface request";
+        transfer->status = USB_Status_Nak;
+        break;
+    case USB_bRequest_Synch_Frame:
+        log unimpl, 1, usb_dev_lg: "Synch Frame request";
+        transfer->status = USB_Status_Nak;
+        break;
+    default:
+        log error, 1, usb_dev_lg: "unsupported control request: 0x%x",
+            transfer->u.control_request.bRequest;
+        assert false;
+    }
+}

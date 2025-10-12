@@ -1,0 +1,22 @@
+ICH10 SMBus Test Description
+============================
+
+Included Cases
+--------------
+The ICH10 SMBus test totally includes 10 cases:
+(1) s-smbus-reset.py: tests default states of SMBus
+(2) s-smbus-checkpoint.py: tests correct checkpointing of SMBus
+(3) s-smbus-byte.py: tests byte transfer command of SMBus
+(4) s-smbus-byte-data.py: tests byte data transfer command of SMBus
+(5) s-smbus-block.py: tests block transfer command of SMBus
+(6) s-smbus-block-process-call.py: tests block process call command of SMBus
+(7) s-smbus-process-call.py: tests process call transfer command of SMBus
+(8) s-smbus-quick.py: tests quick transfer command of SMBus
+(9) s-smbus-word-data.py: tests word data transfer command of SMBus
+(10) s-smbus-slave.py: tests slave mode of SMBus
+
+
+
+Not Tested Features
+-------------------
+None

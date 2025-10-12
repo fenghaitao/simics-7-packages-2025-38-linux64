@@ -1,0 +1,29 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/devs/memory-space.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/base/memory.dml";
+import "simics/base/memory-transaction.dml";
+import "simics/base/time.dml";
+import "simics/pywrap.dml";
+
+extern typedef struct { map_list_t *(*space_lookup)(conf_object_t *obj, generic_transaction_t *mop, map_info_t mapinfo); exception_type_t (*access)(conf_object_t *obj, generic_transaction_t *mop); exception_type_t (*access_simple)(conf_object_t *obj, conf_object_t *initiator, physical_address_t addr, uint8 *buf, physical_address_t len, read_or_write_t type, endianness_t endian); exception_type_t (*access_simple_inq)(conf_object_t *obj, conf_object_t *initiator, physical_address_t addr, uint8 *buf, physical_address_t len, read_or_write_t type, endianness_t endian); attr_value_t (*read)(conf_object_t *obj, conf_object_t *initiator, physical_address_t addr, int length, int inquiry); exception_type_t (*write)(conf_object_t *obj, conf_object_t *initiator, physical_address_t addr, attr_value_t data, int inquiry); cycles_t (*_deprecated_timing_model_operate)(conf_object_t *space, generic_transaction_t *mop); uint64 (*fill)(conf_object_t *obj, physical_address_t start, uint64 size, uint8 value, bool inquiry); } memory_space_interface_t;
+extern typedef struct { exception_type_t (*port_operation)(conf_object_t *pspace_obj, generic_transaction_t *mop, map_info_t map_info); attr_value_t (*read)(conf_object_t *obj, conf_object_t *initiator, physical_address_t addr, int length, int inquiry); exception_type_t (*write)(conf_object_t *obj, conf_object_t *initiator, physical_address_t addr, attr_value_t data, int inquiry); } port_space_interface_t;
+extern typedef struct { conf_object_t *(*translate)(conf_object_t *obj, generic_transaction_t *mem_op, map_info_t mapinfo); } translate_interface_t;
+extern typedef struct { exception_type_t (*not_taken)(conf_object_t *obj, conf_object_t *src_space, conf_object_t *dst_space, exception_type_t ex, generic_transaction_t *mem_op, map_info_t mapinfo); } bridge_interface_t;

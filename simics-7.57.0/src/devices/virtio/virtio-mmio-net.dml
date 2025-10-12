@@ -1,0 +1,42 @@
+/*
+  virtio-mmio-net.dml
+
+  © 2020 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+// Minimal implementation of a virtio MMIO network device.
+
+dml 1.4;
+
+device virtio_mmio_net;
+
+param desc = "model of virtio MMIO network device";
+
+param documentation = "virtio MMIO network device";
+
+param limitations =
+    "Only the legacy device interface is supported, and only for little "
+    + "endian guests (in the legacy interface many memory structures use "
+    + "guest endian, but we currently always use little endian).";
+
+import "virtio-mmio-common.dml";
+import "virtio-net-common.dml";
+
+is mmio_virtio_device;
+is virtio_net_device;
+
+param device_id_val = VIRTIO_ID_NET;
+param legacy_interface = true;
+
+bank mmio is virtio_net_regs {
+    param config_regs_offset = parent.config_regs_offset;
+}

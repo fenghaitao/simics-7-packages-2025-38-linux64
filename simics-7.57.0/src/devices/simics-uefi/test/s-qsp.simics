@@ -1,0 +1,22 @@
+# Test simics-uefi device contents
+
+load-target "qsp-x86/uefi-shell"
+local $con = qsp.serconsole.con
+$con.bp-run-until-console-string "Shell>"
+
+# Display PCI configuration space
+$con.input "pci 0 0 7\n"
+
+local $ok = FALSE
+script-branch {
+        $con.bp-wait-for-console-string -regexp "PCI.*Bus 00 Device 00 Func 07"
+        local $num_pkgs = (list-length sim->package_info)
+        local $mode = (qsp.mb.simics_uefi->video_mode)
+        # Assume less than 16 packages
+        $con.bp-wait-for-console-string "00000040: FF 00 0%x" % [$mode]
+        $con.bp-wait-for-console-string "00000050: 0%X 00 00 00" % [$num_pkgs]
+        $ok = TRUE
+}
+
+c 10 s
+expect $ok TRUE

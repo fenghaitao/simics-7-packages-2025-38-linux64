@@ -1,0 +1,79 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device cf9_handler;
+
+param desc = "CF9 handler";
+param documentation = "Device to handle reset and init requests sent from" +
+                          " SW to port CF9.";
+
+import "utility.dml";
+import "simics/devs/signal.dml";
+
+connect reset_signal "Reset target" {
+    interface signal;
+    param configuration = "required";
+    param documentation = "The target to send resets to. For example, a " +
+                          " signal bus.";
+}
+
+connect init_signal "Init target"{
+    interface signal;
+    param configuration = "optional";
+    param documentation = "The target to send init signals to. For example, a " +
+                          " signal bus.";
+}
+
+port system_reset {
+    implement signal {
+        method signal_raise() {
+            log info, 3: "external system reset";
+            reset_signal.signal.signal_raise();
+            reset_signal.signal.signal_lower();
+        }
+
+        method signal_lower() {
+        }
+    }
+}
+
+param CF9_FULL_RST = 0x8;
+param CF9_RST_CPU  = 0x4;
+param CF9_SYS_RST  = 0x2;
+
+bank regs {
+    register cf9 size 1 @ 0 is (write) {
+        method write(uint64 value) {
+            log info, 3: "cf9 reset";
+            default(value);
+            if ((value & CF9_RST_CPU) != 0) {
+                if ((value & CF9_SYS_RST) != 0) {
+                    log info, 3: "triggering HARD reset";
+                    reset_signal.signal.signal_raise();
+                    reset_signal.signal.signal_lower();
+                } else {
+                    log info, 3: "triggering SOFT reset";
+                    if (init_signal.obj) {
+                        init_signal.signal.signal_raise();
+                        init_signal.signal.signal_lower();
+                    } else {
+                        log info, 1: "Reset lost, init_signal not" +
+                            "connected. You need to update your component.";
+                    }
+                }
+            }
+        }
+    }
+}

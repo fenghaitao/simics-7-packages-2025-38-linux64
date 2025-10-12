@@ -1,0 +1,216 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device minimal_acpi_support;
+
+import "utility.dml";
+import "simics/arch/x86.dml";
+import "simics/model-iface/image.dml";
+
+param desc = "simple ACPI support unit";
+
+param documentation =
+    "The <class>minimal_acpi_support</class> provides an ACPI timer"
+    + " , some \"Flash\"and an SMM trigger mechanism.";
+
+// FIXME MINIQSP: Add timer overlow event??? At least as a warning?
+
+is (hreset, sreset);
+
+bank timer_regs {
+    register pm_tmr size 4 @ 0x00 {
+        field TMR_VAL @[23:0] is (read, read_only) {
+            method read() -> (uint64) {
+                local uint64 cycles;
+                cycles = cast(SIM_time(dev.obj) * 3579545, uint64);
+                return cycles & 0xffffff;
+            }
+        }
+    }
+}
+
+attribute cpus {
+    param documentation = "CPUs receiving direct pin connections "
+        + "for SMI";
+    param type = "[o*]";
+    param configuration = "required";
+
+    session int len;
+    session conf_object_t **o;
+    session const x86_interface_t **x86;
+    saved uint1 smi_state;
+
+    method set(attr_value_t val) throws {
+        local int j;
+        len = SIM_attr_list_size(val);
+        if (o)
+            delete o;
+        o = new conf_object_t*[len];
+        if (x86)
+            delete x86;
+        x86 = new const x86_interface_t*[len];
+        for (j=0; j<SIM_attr_list_size(val); j++) {
+            o[j] = SIM_attr_object(SIM_attr_list_item(val, j));
+            x86[j] = cast(SIM_c_get_interface(o[j], "x86"), const x86_interface_t *);
+            if (!x86[j]) {
+                SIM_c_attribute_error(
+                    "the %s object does not implement the required %s interface",
+                    SIM_object_name(o[j]), "x86");
+                delete o; o = NULL;
+                delete x86; x86 = NULL;
+                len = 0;
+                throw;
+            }
+        }
+    }
+    method get() -> (attr_value_t) {
+        local int j;
+        local attr_value_t ret = SIM_alloc_attr_list(len);
+        for (j=0; j<len; j++) {
+            SIM_attr_list_set_item(&ret, j, SIM_make_attr_object(o[j]));
+        }
+        return ret;
+    }
+    method set_smi(uint1 signal) {
+        local int i;
+        if ((smi_state == 0) && (signal == 1)
+            && ((smm_regs.smi_enable.val & 0x1) == 1)) {
+            // raise pin
+            smi_state = 1;
+            log info, 2, 0: "SMI pin raised";
+            for (i=0; i<len; i++)
+                    x86[i]->set_pin_status(o[i], Pin_Smi, 1);
+        } else if ((smi_state == 1) && (signal == 0)) {
+            // lower pin
+            smi_state = 0;
+            log info, 2, 0: "SMI pin lowered";
+            for (i=0; i<len; i++)
+                    x86[i]->set_pin_status(o[i], Pin_Smi, 0);
+        }
+    }
+}
+
+bank smm_regs {
+    saved uint1 smi_req;
+
+    method smi_req_change(uint1 val) {
+        smi_req = val;
+        cpus.set_smi(val);
+    }
+    register smi_cmd size 1 @ 0x0 is (write) {
+        method write(uint64 value) {
+            default(value);
+            smi_req_change(1);
+        }
+    }
+    register smi_data size 1 @ 0x1;
+    register smi_ack size 1 @ 0x2 is (write) {
+        method write(uint64 value) {
+            default(value);
+            if (value == 1)
+                smi_req_change(0);
+        }
+    }
+    register smi_enable size 1 @ 0x3 is (write) {
+        method write(uint64 value) {
+            if ((this.val & 0x2) != 0)  // locked
+                return;
+            local uint64 old_smi_en = this.val & 0x1;
+            local uint64 new_smi_en = value & 0x1;
+            default(value);
+            if (old_smi_en == 0 && new_smi_en == 1) {
+                smi_req_change(smi_req);
+            } else if (old_smi_en == 1 && new_smi_en == 0) {
+                smi_req_change(0);
+            }
+            
+        }
+    }
+}
+
+bank flash_regs {
+    register id size 4 @ 0x0 {
+        param init_val = 0xc0ffee42;
+    }
+    register fsize size 4 @ 0x4 is (read, read_only) {
+        param configuration = "pseudo";
+        method read() -> (uint64) {
+            return get();
+        }
+        method get() -> (uint64) {
+            return internal_flash_size.val;
+        }
+    }
+    register addr size 4 @ 0x8 {
+        field auto_inc @[31];
+        field addr @[30:0];
+    }
+
+    register data size 1 @ 0xc is (read,write) {
+        param configuration = "pseudo";
+        method write(uint64 val) {
+            set(val);
+            if (addr.auto_inc.val == 1)
+                addr.addr.val += 1;
+        }
+        method set(uint64 val) {
+            if ((addr.addr.val + 1) >= internal_flash_size.val)
+                log error: "%d byte access access to 0x%x outside of flash",
+                           1, addr.addr.val;
+            else
+                internal_flash.image.write(&val, addr.addr.val, 1);
+        }
+        method read() -> (uint64) {
+            local uint64 rv = get();
+            if (addr.auto_inc.val == 1)
+                addr.addr.val += 1;
+            return rv;
+        }
+        method get() -> (uint64) {
+            local uint64 v;
+            if ((addr.addr.val + 1) >= internal_flash_size.val)
+                log error: "%d byte access access to 0x%x outside of flash",
+                           1, addr.addr.val;
+            else
+                internal_flash.image.read(&v, addr.addr.val, 1);
+            return v;
+        }
+    }
+}
+
+extern void SIM_set_attribute_default(conf_object_t*, const char*, attr_value_t);
+
+attribute internal_flash_size is (uint64_attr) "Size of internal flash" {
+    param configuration = "required";
+    method set(attr_value_t val) throws {
+        if (!SIM_is_restoring_state(dev.obj) && !SIM_object_is_configured(dev.obj)) {
+            if (SIM_attr_integer(val) > 0xfffffff)
+                log error: "Value must not exceed 31 bits.";
+            SIM_set_attribute_default(internal_flash.obj, "size", val);
+            default(val);
+        } else {
+            if (SIM_object_is_configured(dev.obj))
+                log error: "The internal flash size cannot be changed after object creation.";
+        }
+    }
+}
+
+connect internal_flash is (init_as_subobj) "Internal Flash" {
+    param classname = "image";
+    interface image;
+    param internal = true;
+}
+
+

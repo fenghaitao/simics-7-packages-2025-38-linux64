@@ -1,0 +1,526 @@
+/*
+  © 2019 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device riscv_plic;
+param classname = "riscv-plic";
+
+import "utility.dml";
+import "riscv-interrupts-common.dml";
+
+param desc = "model of RISC-V PLIC";
+param documentation = "RISC-V Platform Interrupt Controller";
+
+param register_size = 4;
+param MAX_CONTEXTS = 128; // specs allow up to 15872
+
+is hreset_mark;
+
+attribute max_interrupt is (uint64_attr, init) {
+    param documentation = "Maximum interrupt id supported, default is 1023";
+    method init() {
+        val = 1023;
+    }
+
+    method check(uint64 intid) throws {
+        if (intid == 0 || intid > val)
+            throw;
+    }
+
+    method mask(uint64 reg) -> (uint64) throws {
+        if (reg > (val / 32))
+            throw;
+        local uint64 lsb = reg == 0 ? 1 : 0;
+        local uint64 msb = reg == (val / 32) ? val % 32 : 31;
+        return (~0)[msb:lsb] << lsb;
+    }
+}
+
+attribute max_priority is (uint64_attr, init) {
+    param documentation = "Maximum priority supported, must equal 2^x - 1"
+        + " for some x greater than 0. Default is 0xffffffff";
+    method init() {
+        val = 0xffffffff;
+    }
+}
+
+attribute max_threshold is (init) {
+    param documentation = "Maximum threshold for each context, must equal"
+        + " 2^x - 1 for some x greater than 0. Default is max_priority";
+    param type = "[i*]";
+    session attr_value_t val;
+
+    method init() {
+        val = SIM_alloc_attr_list(0);
+    }
+
+    method set(attr_value_t value) throws {
+        SIM_attr_free(&val);
+        val = SIM_attr_copy(value);
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_attr_copy(val);
+    }
+
+    method mask(uint64 c) -> (uint32) {
+        local uint32 max = 0;
+        if (SIM_attr_list_size(val) > c)
+            max = SIM_attr_integer(SIM_attr_list_item(val, c));
+        return max > 0 ? max : max_priority.val;
+    }
+}
+
+attribute hart {
+    param documentation = "Connected HARTs. This attribute will connect"
+        + " irq_dev[2*x:2*x+1] = [HART[x]:MEIP, HART[x]:SEIP]";
+    param type = "[o*]";
+    param configuration = "pseudo";
+    method get() -> (attr_value_t) {
+        local attr_value_t val = SIM_alloc_attr_list(MAX_CONTEXTS / 2);
+        local int j = 0;
+        for (local int i = 0; i < MAX_CONTEXTS / 2; i += 2) {
+            if (!irq_dev[i].obj) {
+                SIM_attr_list_resize(&val, j);
+                break;
+            }
+            local conf_object_t *o = SIM_port_object_parent(irq_dev[i].obj);
+            if (o == NULL) // not a port-object, old-style obj:port
+                o = irq_dev[i].obj;
+            SIM_attr_list_set_item(&val, j++, SIM_make_attr_object(o));
+        }
+        return val;
+    }
+
+    method set(attr_value_t val) throws {
+        if (SIM_attr_list_size(val) > (MAX_CONTEXTS / 2)) {
+            SIM_c_attribute_error(
+                "too many values, max is %lld", MAX_CONTEXTS / 2);
+            throw;
+        }
+        for (local int i = 0; i < SIM_attr_list_size(val); i++) {
+            local attr_value_t hart = SIM_attr_list_item(val, i);
+            local attr_value_t meip_attr = port_attr(hart, "MEIP");
+            local attr_value_t seip_attr = port_attr(hart, "SEIP");
+            if (dev.irq_dev[i * 2].set_attribute(meip_attr) != Sim_Set_Ok)
+                throw;
+            if (dev.irq_dev[i * 2 + 1].set_attribute(seip_attr) != Sim_Set_Ok)
+                throw;
+        }
+    }
+}
+
+connect irq_dev[c < MAX_CONTEXTS] is (sig) {
+    param documentation = "Interrupt request target for each connected context";
+
+    method raise() {
+        default();
+        regs.context[c].eip.val = 1;
+    }
+    method lower() {
+        default();
+        regs.context[c].eip.val = 0;
+    }
+}
+
+attribute enable_set is (enable_mask) {
+    param documentation = "Enable bits for each context that are hardwired"
+        + " as 1. Value is a list of list of integers. The outer list "
+        + " corresponds to each connected context, the inner list corresponds"
+        + " to the 'enable' registers. For each enable register, bits set in"
+        + " this attribute will be hardwired as 1";
+}
+
+attribute enable_clr is (enable_mask) {
+    param documentation = "Enable bits for each context that are hardwired"
+        + " as 0. Value is a list of list of integers. The outer list "
+        + " corresponds to each connected context, the inner list corresponds"
+        + " to the 'enable' registers. For each enable register, bits set in"
+        + " this attribute will be hardwired as 0";
+}
+
+attribute highest_pending is (read_only_attr) {
+    param documentation = "Currently highest pending interrupt and priority on"
+        + " each connected context";
+    param type = "[[ii]*]";
+
+    method get() -> (attr_value_t) {
+        local attr_value_t val = SIM_alloc_attr_list(MAX_CONTEXTS);
+        for (local int i = 0; i < MAX_CONTEXTS; i++) {
+            if (!irq_dev[i].obj) {
+                SIM_attr_list_resize(&val, i);
+                break;
+            }
+            local uint32 intid;
+            local uint32 prio;
+            (intid, prio) = regs.context[i].get_highest();
+            local attr_value_t elem = SIM_make_attr_list(
+                2, SIM_make_attr_uint64(intid), SIM_make_attr_uint64(prio));
+            SIM_attr_list_set_item(&val, i, elem);
+        }
+        return val;
+    }
+}
+
+bank regs is checking_offset {
+    register priority[intid < 1024] @ 0x0000 + intid * 4    "Interrupt source priority";
+    register pending[i < 32]        @ 0x1000 + i * 4        "Interrupt pending bits";
+    register active[i < 32]         is unmapped             "Interrupt active bits";
+    register raw[i < 32]            is (unmapped, no_reset) "Interrupt raw bits";
+
+    group context[c < MAX_CONTEXTS] {
+        register enable[i < 32] @ 0x002000 + c * 0x80 + i * 4 "Interrupt enable bits";
+        register threshold      @ 0x200000 + c * 0x1000 "Interrupt threshold";
+        register claim          @ 0x200004 + c * 0x1000 "Interrupt threshold";
+        register eip            is unmapped             "External Interrupt Pending";
+    }
+
+    method is_disabled() -> (bool) {
+        return dev.CLOCK_DISABLE.signal.high ||
+            dev.HRESET.signal.high;
+    }
+
+    method check_offset(uint64 offset) throws {
+        // fail if access would target a register without a connected irq_dev
+        local uint64 c = 0;
+        if (offset >= 0x200000)
+            c = (offset - 0x200000) / 0x1000;
+        else if (offset >= 0x2000)
+            c = (offset - 0x2000) / 0x80;
+
+        if (c >= MAX_CONTEXTS || !irq_dev[c].obj)
+            throw;
+    }
+
+    register pending[i < 32] is (masked_read, read_only);
+    register priority[intid < 1024] is (read, write) {
+        method read() -> (uint64) {
+            try {
+                max_interrupt.check(intid);
+            } catch {
+                log spec_viol: "Read RESERVED register %s", qname;
+                return 0;
+            }
+            return this.val;
+        }
+        method write(uint64 value) {
+            try {
+                max_interrupt.check(intid);
+            } catch {
+                log spec_viol: "Write RESERVED register %s", qname;
+                return;
+            }
+            this.val = value & max_priority.val;
+            local uint32 r = intid / 32;
+            local uint32 b = intid % 32;
+            if (pending[r].val[b]) {
+                for (local int c = 0; c < MAX_CONTEXTS; c++) {
+                    if (!irq_dev[c].obj)
+                        break;
+                    if (context[c].enable[r].val[b]) {
+                        local uint32 intid;
+                        local uint32 prio;
+                        (intid, prio) = context[c].get_highest();
+                        if (prio > context[c].threshold.val)
+                            context[c].raise();
+                        else
+                            context[c].lower();
+                    }
+                }
+            }
+        }
+    }
+
+    group context[c < MAX_CONTEXTS] {
+        register enable[i < 32] is (masked_read, masked_write) {
+            method masked_write(uint64 value) {
+                value |=  enable_set.getmask(c, i);
+                value &= ~enable_clr.getmask(c, i);
+                this.val = value;
+                threshold.write(threshold.val); // update interrupts
+            }
+        }
+        register threshold is (read, write) {
+            method write(uint64 value) {
+                this.val = value & max_threshold.mask(c);
+                local uint32 intid;
+                local uint32 prio;
+                (intid, prio) = get_highest();
+                if (prio > this.val)
+                    raise();
+                else
+                    lower();
+            }
+        }
+        register claim is (read, write) {
+            method read() -> (uint64) {
+                return claim_highest_pending();
+            }
+            method write(uint64 value) {
+                complete_interrupt(value);
+            }
+        }
+
+        method get_highest() -> (uint32, uint32) {
+            local uint32 intid = 0;
+            local uint32 prio = 0;
+            local int r;
+            for (r = 0; r < 32; r++) {
+                local uint32 pend = pending[r].val;
+                pend &= ~active[r].val;
+                pend &= context[c].enable[r].val;
+                if (pend > 0) {
+                    local int b;
+                    for (b = 0; b < 32; b++) {
+                        if (pend[b]) {
+                            if (priority[r * 32 + b].val > prio) {
+                                intid = r * 32 + b;
+                                prio = priority[r * 32 + b].val;
+                            }
+                        }
+                    }
+                }
+            }
+            return (intid, prio);
+        }
+
+        method claim_highest_pending() -> (uint32) {
+            local uint32 intid = 0;
+            local uint32 prio = 0;
+            (intid, prio) = get_highest();
+            if (intid > 0) {
+                active[intid / 32].val[intid % 32] = 1;
+                pending[intid / 32].val[intid % 32] = 0;
+
+                // intid is now active so we may have a new highest priority,
+                // update all contexts
+                for (local int c = 0; c < MAX_CONTEXTS; c++) {
+                    if (!irq_dev[c].obj)
+                        break;
+                    if (context[c].eip.val > 0) {
+                        local uint32 dontcare;
+                        (dontcare, prio) = context[c].get_highest();
+                        if (context[c].threshold.val >= prio)
+                            context[c].lower();
+                    }
+                }
+                log info, 2: "claim in context %d activates interrupt %d",
+                    c, intid;
+            }
+            return intid;
+        }
+
+        method complete_interrupt(uint32 intid) {
+            log info, 3: "context %d trying to complete interrupt %d",
+                c, intid;
+            local uint32 r = intid / 32;
+            local uint32 b = intid % 32;
+            if (r < 32 && enable[r].val[b]) {
+                if (active[r].val[b]) {
+                    active[r].val[b] = 0;
+                    if (raw[r].val[b]) {
+                        log info, 3: "interrupt %d still high, dispatch", intid;
+                        // signal is still high, interrupt becomes pending
+                        // again, update all contexts
+                        pending[r].val[b] = 1;
+                        for (local int c = 0; c < MAX_CONTEXTS; c++) {
+                            if (!irq_dev[c].obj)
+                                break;
+                            if (context[c].eip.val == 0) {
+                                local uint32 prio;
+                                local uint32 dontcare;
+                                (dontcare, prio) = context[c].get_highest();
+                                if (prio > context[c].threshold.val)
+                                    context[c].raise();
+                            }
+                        }
+                    }
+                    log info, 2: "context %d complete interrupt %d",
+                        c, intid;
+                } else {
+                    log info, 3: "context %d complete inactive interrupt %d"
+                        + " silently ignored", c, intid;
+                }
+            } else {
+                log info, 3: "context %d complete disabled/invalid interrupt %d"
+                    + " silently ignored", c, intid;
+            }
+        }
+
+        method raise() { irq_dev[c].raise(); }
+        method lower() { irq_dev[c].lower(); }
+    }
+    method set_pending(uint32 intid) {
+        local uint32 r = intid / 32;
+        local uint32 b = intid % 32;
+
+        regs.pending[r].val[b] = 1;
+        local uint32 prio = regs.priority[intid].val;
+
+        log info, 4: "IRQ%d pending, prio %d", intid, prio;
+
+        if (prio > 0) {
+            for (local int c = 0; c < MAX_CONTEXTS; c++) {
+                if (!irq_dev[c].obj)
+                    break;
+                if (regs.context[c].eip.val == 0
+                    && regs.context[c].enable[r].val[b] == 1
+                    && prio > regs.context[c].threshold.val) {
+                    regs.context[c].raise();
+                }
+            }
+        }
+    }
+}
+
+port IRQ[intid < 1024] "interrupt request input signals" {
+    implement signal {
+        method signal_raise() {
+            try {
+                max_interrupt.check(intid);
+                local uint32 r = intid / 32;
+                local uint32 b = intid % 32;
+                if (!regs.raw[r].val[b]) {
+                    log info, 3: "signal raised";
+                    regs.raw[r].val[b] = 1;
+                    if (!CLOCK_DISABLE.signal.high) {
+                        if (!regs.active[r].val[b]) {
+                            regs.set_pending(intid);
+                        }
+                    }
+                }
+            } catch {
+                log error: "Invalid interrupt %d raised, PLIC configured for"
+                    + " %d interrupts", intid, max_interrupt.val;
+            }
+        }
+        method signal_lower() {
+            try {
+                max_interrupt.check(intid);
+                local uint32 r = intid / 32;
+                local uint32 b = intid % 32;
+                if (regs.raw[r].val[b]) {
+                    log info, 3: "signal lowered";
+                    regs.raw[r].val[b] = 0;
+                }
+            } catch {
+                log error: "Invalid interrupt %d lowered, PLIC configured for"
+                    + " %d interrupts", intid, max_interrupt.val;
+            }
+        }
+    }
+}
+
+template enable_mask {
+    param type = "[[i*]*]";
+    session attr_value_t val;
+    is init;
+
+    method set(attr_value_t value) throws {
+        SIM_attr_free(&val);
+        val = SIM_attr_copy(value);
+    }
+
+    method get() -> (attr_value_t) {
+        return SIM_attr_copy(val);
+    }
+
+    method init() {
+        if (SIM_attr_is_invalid(val))
+            val = SIM_alloc_attr_list(0);
+    }
+
+    method getmask(uint64 c, uint64 r) -> (uint32) {
+        init();
+        if (SIM_attr_list_size(val) > c) {
+            local attr_value_t li = SIM_attr_list_item(val, c);
+            if (SIM_attr_list_size(li) > r)
+                return SIM_attr_integer(SIM_attr_list_item(li, r));
+        }
+        return 0;
+    }
+}
+
+template masked_read is read {
+    method read() -> (uint64) {
+        try {
+            local uint64 mask = max_interrupt.mask(i);
+            return this.masked_read() & mask;
+        } catch {
+            log spec_viol: "Read RESERVED register %s", qname;
+            return 0;
+        }
+    }
+    method masked_read() -> (uint64) default {
+        return this.val;
+    }
+}
+
+template masked_write is write {
+    param i: int;
+    shared method write(uint64 val)  {
+        try {
+            local uint64 mask = max_interrupt.mask(i);
+            this.masked_write(val & mask);
+        } catch {
+            log spec_viol: "Write RESERVED register %s", qname;
+        }
+    }
+    shared method masked_write(uint64 val);
+}
+
+method hard_reset() {
+    // if CLOCK_DISABLE is high, HRESET is delayed or ignored
+    // depending on if CLOCK_DISABLE is lowered before HRESET or not
+    if (!CLOCK_DISABLE.signal.high) {
+        for (local int c = 0; c < MAX_CONTEXTS; c++) {
+            regs.context[c].lower();
+        }
+        default();
+        handle_all_raised_irqs();
+    }
+}
+
+method handle_all_raised_irqs() {
+    for (local int intid = 0;  intid <= max_interrupt.val; intid++) {
+        local uint32 r = intid / 32;
+        local uint32 b = intid % 32;
+        if (regs.raw[r].val[b] &&
+            !regs.pending[r].val[b] &&
+            !regs.active[r].val[b]) {
+            regs.set_pending(intid);
+        }
+    }
+}
+
+port CLOCK_DISABLE is signal_port {
+    param documentation = "When the CLOCK_DISABLE signal is raised the plic will not"
+        + " forward incoming IRQ's to contexts and ignore all register accesses";
+
+    implement signal {
+        method signal_raise() {
+            default();
+            log info, 3: "signal raised";
+        }
+        method signal_lower() {
+            default();
+            log info, 3: "signal lowered";
+            if (dev.HRESET.signal.high)
+                dev.hard_reset();
+            else
+                dev.handle_all_raised_irqs();
+        }
+    }
+}
+

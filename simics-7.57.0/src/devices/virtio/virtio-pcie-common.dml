@@ -1,0 +1,586 @@
+
+/*
+  virtio-pcie.dml
+
+  © 2022 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "virtio-common.dml";
+import "utility.dml";
+import "pcie/common.dml";
+import "pcie/capabilities.dml";
+
+is sreset;
+
+// Capability id types
+param VIRTIO_PCI_CAP_COMMON_CFG = 1;
+param VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
+param VIRTIO_PCI_CAP_ISR_CFG    = 3;
+param VIRTIO_PCI_CAP_DEVICE_CFG = 4;
+param VIRTIO_PCI_CAP_PCI_CFG    = 5;
+
+param VIRTIO_PCI_BASE_ID = 0x1040;
+
+param VIRTIO_INTERRUPT_QUEUE = 0x0;
+param VIRTIO_INTERRUPT_CONFIG = 0x1;
+
+param VIRTIO_MSI_NO_VECTOR = 0xFFFF;
+
+param VIRTIO_PCI_CAP_NOTIFY_ALIGN    = 2;
+param VIRTIO_PCI_CAP_DEVICE_ALIGN    = 4;
+
+param capabilities_offset = 0x40;
+
+template virtio_pcie_handlers {
+    group virtqs[i < NUM_QUEUES] is virtq_pcie {
+        param virtio_dev = cast(this.parent, virtio_device);
+        param virtq_idx = i;
+    }
+
+    method get_virtq(uint16 virtq_idx) -> (virtq) {
+        if (virtq_idx > NUM_QUEUES) {
+            log error, 1, virtio: "get_virtq: out-of-bounds virtq_idx %u",
+                virtq_idx;
+            virtq_idx = 0;
+        }
+        return cast(virtqs[virtq_idx], virtq);
+    }
+
+    method sys_mem_read(uint64 addr, size_t len, void *buf) throws {
+        local buffer_t buffer  = {
+            .data = cast(buf, uint8*),
+            .len = len
+        };
+        local pcie_error_t err =
+            pcie_config.memory.read_bytes(addr, buffer);
+        verify_pci_mem_op(err, "read", addr, len);
+    }
+
+    method sys_mem_write(uint64 addr, size_t len, void *buf) throws {
+        local bytes_t bytes  = {
+            .data = cast(buf, uint8*),
+            .len = len
+        };
+        local pcie_error_t err =
+            pcie_config.memory.write_bytes(addr, bytes);
+        verify_pci_mem_op(err, "write", addr, len);
+    }
+}
+
+template virtio_device_registers is bank {
+    param cc_offset = 0;
+    param notify_offset = ((cc_offset + 0x38) +
+        VIRTIO_PCI_CAP_NOTIFY_ALIGN - 1) & -VIRTIO_PCI_CAP_NOTIFY_ALIGN;
+    param isr_offset = notify_offset + 0x02;
+    param device_specific_offset = ((isr_offset + 0x04) +
+        VIRTIO_PCI_CAP_DEVICE_ALIGN - 1) & -VIRTIO_PCI_CAP_DEVICE_ALIGN;
+
+    group common_config {
+        register device_feature_select size 4 @ cc_offset + 0x00 "DeviceFeatureSelect";
+        register device_feature        size 4 @ cc_offset + 0x04 "DeviceFeature";
+        register driver_feature_select size 4 @ cc_offset + 0x08 "DriverFeatureSelect";
+        register driver_feature        size 4 @ cc_offset + 0x0C "DriverFeature";
+        register msix_config           size 2 @ cc_offset + 0x10 "MSIXConfig";
+        register num_queues            size 2 @ cc_offset + 0x12 "NumQueues";
+        register device_status         size 1 @ cc_offset + 0x14 "DeviceStatus";
+        register config_generation     size 1 @ cc_offset + 0x15 "ConfigGeneration";
+
+        register queue_select      size 2 @ cc_offset + 0x16 "QueueSelect";
+        register queue_size        size 2 @ cc_offset + 0x18 "QueueSize";
+        register queue_msix_vector size 2 @ cc_offset + 0x1A "QueueMsixVector";
+        register queue_enable      size 2 @ cc_offset + 0x1C "QueueEnable";
+        register queue_notify_off  size 2 @ cc_offset + 0x1E "QueueNotifyOff";
+        register queue_desc        size 8 @ cc_offset + 0x20 "QueueDesc";
+        register queue_driver      size 8 @ cc_offset + 0x28 "QueueDriver";
+        register queue_device      size 8 @ cc_offset + 0x30 "QueueDevice";
+
+        register device_feature_select is selector_reg;
+
+        register device_feature is (read, read_only) {
+            param configuration = "pseudo";
+            method read() -> (uint64) {
+                return features.feature[device_feature_select.val].val;
+            }
+            method get() -> (uint64) {
+                return features.feature[device_feature_select.val].val;
+            }
+            method set(uint64 value) {
+                features.feature[device_feature_select.val].val = value;
+            }
+        }
+
+        register driver_feature_select is selector_reg;
+
+        register driver_feature is (read, write) {
+            param configuration = "pseudo";
+            method write(uint64 value) {
+                features.feature_enable[driver_feature_select.val].write(value);
+            }
+            method set(uint64 value) {
+                features.feature_enable[driver_feature_select.val].val = value;
+            }
+            method read() -> (uint64) {
+                return features.feature_enable[driver_feature_select.val].val;
+            }
+            method get() -> (uint64) {
+                return features.feature_enable[driver_feature_select.val].val;
+            }
+        }
+
+        register num_queues is (read_only) {
+            param init_val = NUM_QUEUES;
+        }
+
+        register device_status is (write) {
+            method write(uint64 value) {
+                if (value == 0) {
+                    bank.soft_reset();
+                }
+                default(value);
+            }
+        }
+
+        register config_generation is (read_only);
+        register queue_notify_off is (read_only);
+
+        register queue_select is (write) {
+            method write(uint64 value) {
+                if (value > NUM_QUEUES) {
+                    log spec_viol : "Invalid queue_selected value. " +
+                        "This device has %d virtqueues", NUM_QUEUES;
+                    return;
+                }
+                default(value);
+            }
+        }
+
+        register queue_size is (write, read) {
+            param configuration = "pseudo";
+            param writable = false;  // only applies to attribute
+            param init_val = QUEUE_NUM_MAX;
+
+            method write(uint64 value) {
+                if (value > this.init_val) {
+                    log spec_viol, 1 : "Unsupported a queue_size. This " +
+                    "device supports queue sizes up to %d", this.init_val;
+                    return;
+                }
+                virtqs[queue_select.val].q_size = value;
+            }
+            method read() -> (uint64) {
+                return virtqs[queue_select.val].q_size;
+            }
+            method get() -> (uint64) {
+                return virtqs[queue_select.val].q_size;
+            }
+        }
+
+        register queue_msix_vector is (write, read) {
+            param configuration = "pseudo";
+            param writable = false;  // only applies to attribute
+
+            method write(uint64 value) {
+                virtqs[queue_select.val].msix_vector = value;
+            }
+            method read() -> (uint64) {
+                return virtqs[queue_select.val].msix_vector;
+            }
+            method get() -> (uint64) {
+                return virtqs[queue_select.val].msix_vector;
+            }
+        }
+
+        register queue_enable is (write, read) {
+            param configuration = "pseudo";
+            param writable = false;  // only applies to attribute
+
+            method write(uint64 value) {
+                if (value > 0x01) {
+                    log spec_viol, 1 : "Invalid queue_enable value. Must " +
+                    "be either 0x00 or 0x01";
+                    return;
+                }
+                virtqs[queue_select.val].enabled = value;
+            }
+            method read() -> (uint64) {
+                return virtqs[queue_select.val].enabled;
+            }
+            method get() -> (uint64) {
+                return virtqs[queue_select.val].enabled;
+            }
+
+        }
+
+        register queue_desc is (write, read) {
+            param configuration = "pseudo";
+            param writable = false;  // only applies to attribute
+
+            method write(uint64 value) {
+                virtqs[queue_select.val].desc_addr = value;
+            }
+            method read() -> (uint64) {
+                return virtqs[queue_select.val].desc_addr;
+            }
+            method get() -> (uint64) {
+                return virtqs[queue_select.val].desc_addr;
+            }
+        }
+        register queue_driver is (write, read) {
+            param configuration = "pseudo";
+            param writable = false;  // only applies to attribute
+
+            method write(uint64 value) {
+                virtqs[queue_select.val].driver_addr = value;
+            }
+            method read() -> (uint64) {
+                return virtqs[queue_select.val].driver_addr;
+            }
+            method get() -> (uint64) {
+                return virtqs[queue_select.val].driver_addr;
+            }
+        }
+        register queue_device is (write, read) {
+            param configuration = "pseudo";
+            param writable = false;  // only applies to attribute
+
+            method write(uint64 value) {
+                virtqs[queue_select.val].device_addr = value;
+            }
+            method read() -> (uint64) {
+                return virtqs[queue_select.val].device_addr;
+            }
+            method get() -> (uint64) {
+                return virtqs[queue_select.val].device_addr;
+            }
+        }
+    }
+
+    group notify {
+        register virtqueue_available_buffer size 2 @ notify_offset is (write) {
+            method write(uint64 value) {
+                default(value);
+                try {
+                    handle_notify(value);
+                } catch {
+                    log error, 1, virtio:
+                        "Error while processing notification.";
+                }
+            }
+        }
+    }
+
+    group isr_config {
+        register isr_status size 4 @ isr_offset is (read) {
+            field queue_interrupt  @ [0:0] "QueueInterrupt";
+            field configuration_interrupt  @ [1:1] "ConfigurationInterrupt";
+
+            method read() -> (uint64) {
+                log spec_viol, 1 then 2: "Unexpected read, MSIX should be" +
+                    " used by the driver";
+                local uint64 value = default();
+                this.val = 0;
+                return value;
+            }
+        }
+    }
+
+    group device_specific {
+        param config_regs_offset = device_specific_offset;
+    }
+}
+
+template virtio_pcie_capabilities {
+    param virtio_pcie_capabilities_start: uint64;
+
+
+    group common_config is (virtio_capability) {
+        param base = virtio_pcie_capabilities_start;
+        param config_type = VIRTIO_PCI_CAP_COMMON_CFG;
+        param len = 0x38;
+        param offs = virtio_config.cc_offset;
+    }
+    group notifications is (virtio_capability) {
+        param base = common_config.base + common_config.cap_length;
+        param cap_length = 0x14;
+        param config_type = VIRTIO_PCI_CAP_NOTIFY_CFG;
+        param len = 0x02;
+        param offs = virtio_config.notify_offset;
+
+        register notify_off_multiplier size 4 @ base + 0x10 "NotifyOffMultiplier";
+    }
+    group isr is (virtio_capability) {
+        param base = notifications.base + notifications.cap_length;
+        param config_type = VIRTIO_PCI_CAP_ISR_CFG;
+        param len = 0x04;
+        param offs = virtio_config.isr_offset;
+    }
+
+    group device_specific is (virtio_capability) {
+        param base = isr.base + isr.cap_length;
+        param next_ptr = 0x00;
+        param config_type = VIRTIO_PCI_CAP_DEVICE_CFG;
+        param len = virtio_config.device_specific.len;
+        param offs = virtio_config.device_specific_offset;
+    }
+}
+
+template virtio_pcie_function_common is (virtio_device, virtio_pcie_handlers) {
+    param DEVICE_ID : uint16;
+    param CLASS_CODE : uint24;
+
+    bank pcie_config is virtio_pcie_capabilities {
+        register class_code { param init_val = CLASS_CODE; }
+        register capabilities_ptr { param init_val = 0x40; }
+
+        param virtio_pcie_capabilities_start = exp_next_ptr;
+    }
+
+    bank features {
+        group virtio_f_version_1 is feature { param bit = VIRTIO_F_VERSION_1; }
+        group virtio_f_access_platform is feature { param bit = VIRTIO_F_ACCESS_PLATFORM; }
+    }
+
+    bank virtio_config is (virtio_device_registers, soft_reset) {
+        method soft_reset() {
+            foreach virtq in (each virtq in (this.parent)) {
+                virtq.soft_reset();
+            }
+            default();
+        }
+    }
+
+    bank msix_data is msix_table {
+        param msix_bank = pcie_config;
+    }
+}
+
+template virtio_pcie_physical_cfg_bank_common is type_0_bank  {
+    register vendor_id { param init_val = 0x1AF4; }
+    register device_id { param init_val = DEVICE_ID; }
+    register revision_id { param init_val = 0x1; }
+    register subsystem_id { param init_val = 0x40; }
+
+    register bar0 @ 0x10 is (memory_base_address_64) {
+        param map_obj = virtio_config.obj;
+        param size_bits = 14;
+    }
+
+    is defining_msix_capability;
+    param msix_offset           = capabilities_ptr.init_val;
+    param msix_next_ptr         = msix_offset + 0x0C;
+    param msix_num_vectors      = 32;  // This should not have to be larger than the number of queues
+    param msix_table_offset_bir = (virtio_config.device_specific_offset +
+        virtio_config.device_specific.len) + 7 & ~0x7;
+    param msix_pba_offset_bir   = msix_table_offset_bir +
+        (0x10 * msix_num_vectors);
+    param msix_data_bank        = msix_data;
+
+    is defining_exp_capability;
+    param exp_offset = msix_next_ptr;
+    param exp_next_ptr = exp_offset + 0x34;
+    param exp_dp_type = PCIE_DP_Type_EP;
+    group exp {
+        param has_links = true;
+        group link {
+            param max_link_speed = PCIE_Link_Speed_32;
+            param max_link_width = PCIE_Link_Width_x8;
+        }
+    }
+}
+
+template pcie_virtio_device is (pcie_endpoint, virtio_pcie_function_common) {
+    bank pcie_config is virtio_pcie_physical_cfg_bank_common;
+}
+
+template virtio_capability is (capability) {
+    param id = 0x09;
+    param cap_length default 0x10;
+    param next_ptr default base + cap_length;
+    param config_type : uint8;
+    param offs : uint32;
+    param len : uint32;
+
+    register cap_len  size 1 @ base + 0x02 "CapLen";
+    register cfg_type size 1 @ base + 0x03 "CfgType";
+    register bar      size 1 @ base + 0x04 "Bar";
+    register offset   size 4 @ base + 0x08 "Offset";
+    register length   size 4 @ base + 0x0C "Length";
+
+    register cap_len is (read_only) { param init_val = cap_length; }
+    register cfg_type is (read_only) { param init_val = config_type; }
+    register bar is (read_only) { param init_val = 0x00; }
+    register offset is (read_only) { param init_val = offs; }
+    register length is (read_only) { param init_val = len; }
+}
+
+template virtq_pcie is virtq {
+    saved uint16 q_size = QUEUE_NUM_MAX;
+    saved uint64 desc_addr;
+    saved uint64 driver_addr;
+    saved uint64 device_addr;
+    saved uint16 enabled;
+    saved uint16 msix_vector;
+
+    method hard_reset() {
+        soft_reset();
+    }
+
+    method soft_reset() {
+        default();
+        q_size = QUEUE_NUM_MAX;
+        desc_addr = 0;
+        driver_addr = 0;
+        device_addr = 0;
+        enabled = 0;
+        msix_vector = 0;
+    }
+
+    method desc_table_address() -> (uint64) {
+        return desc_addr;
+    }
+
+    method avail_ring_address() -> (uint64) {
+        return driver_addr;
+    }
+
+    method used_ring_address() -> (uint64) {
+        return device_addr;
+    }
+
+    method num_descs() -> (uint32) {
+        return q_size;
+    }
+
+    method interrupt_driver() throws {
+        local ring_info_t avail_ring_info;
+        avail_ring_info = get_avail_ring_info();
+        // Raise the interrupt only if the driver has not disabled all
+        // notifications.
+        if ((msix_vector != VIRTIO_MSI_NO_VECTOR) &&
+            ((avail_ring_info.flags & VIRTQ_AVAIL_F_NO_INTERRUPT) == 0x0)) {
+            pcie_config.msix.raise(msix_vector);
+        }
+    }
+}
+
+method verify_pci_mem_op(pcie_error_t err, const char *op, uint64 addr, size_t len) throws {
+    if (err != PCIE_Error_No_Error) {
+        log error, 2: "PCIE memory %s at 0x%02x with size %d failed with error code %d", op, addr, len, err;
+        throw;
+    }
+}
+
+template defining_virtio_physical_function {
+    subdevice PF is virtio_pcie_function_common {
+        bank pcie_config is virtio_pcie_physical_cfg_bank_common {
+            is defining_ari_capability;
+            param ari_offset = 0x100;
+            param ari_next_ptr = sriov_offset;
+
+            param sriov_offset default 0x200;
+            param sriov_next_ptr default 0;
+            is defining_sriov_capability;
+            group sriov {
+                register control {
+                    field vfe {
+                        method write(uint64 value) {
+                            if (value == 1 && !is_feature_enabled(VIRTIO_F_SR_IOV)) {
+                                log spec_viol, 1: "Trying to enable SR-IOV without"
+                                    + " the VIRTIO_F_SR_IOV feature being"
+                                    + " negotiated";
+                                return;
+                            }
+                            default(value);
+                        }
+                    }
+                }
+
+                register vf_device_id { param init_val = device_id.init_val; }
+
+                register vf_bar_01 @ base + 0x24 is vf_bar_64 {
+                    param size_bits = 14;
+                }
+
+                method get_offset() -> (uint16) default {
+                    return 0x100;
+                }
+                method get_stride() -> (uint16) default {
+                    return 0x10;
+                }
+            }
+        }
+
+        bank features {
+            group virtio_f_sr_iov is feature { param bit = VIRTIO_F_SR_IOV; }
+        }
+    }
+}
+
+template defining_virtio_virtual_functions {
+    param N_VIRTUAL_FUNCTIONS;
+    subdevice VF[i < N_VIRTUAL_FUNCTIONS] is (virtio_pcie_function_common) {
+        param function_index = pcie_config.vf_number;
+        bank pcie_config is (vf_type_0_bank, soft_reset) {
+            param vf_number = i + 1;
+            is defining_sriov_msix_capability;
+            param msix_offset           = capabilities_ptr.init_val;
+            param msix_next_ptr         = msix_offset + 0x0C;
+            param msix_num_vectors      = 32;
+            param msix_table_offset_bir = (virtio_config.device_specific_offset
+                + virtio_config.device_specific.len) + 7 & ~0x7;
+            param msix_pba_offset_bir   = msix_table_offset_bir +
+                (0x10 * msix_num_vectors);
+            param msix_data_bank        = msix_data;
+
+            is defining_sriov_exp_capability;
+            param exp_offset = msix_next_ptr;
+            param exp_next_ptr = exp_offset + 0x34;
+            param exp_dp_type = PCIE_DP_Type_EP;
+
+            is defining_sriov_ari_capability;
+            param ari_offset = 0x100;
+            param ari_next_ptr = 0;
+        }
+    }
+}
+
+template defining_virtio_pcie_sriov_device {
+    is defining_virtio_physical_function;
+    is defining_virtio_virtual_functions;
+
+    param DEVICE_ID: uint16;
+    param CLASS_CODE: uint24;
+
+    subdevice VF[i < N_VIRTUAL_FUNCTIONS] {
+        param DEVICE_ID = 0xFFFF;
+        param CLASS_CODE = parent.CLASS_CODE;
+    }
+
+    subdevice PF {
+        param DEVICE_ID = parent.DEVICE_ID;
+        param CLASS_CODE = parent.CLASS_CODE;
+        bank pcie_config {
+            param sriov_virtual_functions = (each vf_type_0_bank in (dev));
+            group sriov {
+                register vf_bar_01 {
+                    method get_vf_bar_map(uint64 vf_number) -> (conf_object_t *) throws {
+                        if ((vf_number == 0) || (vf_number > VF.len))
+                            throw;
+                        return VF[vf_number - 1].virtio_config.obj;
+                    }
+                }
+            }
+        }
+    }
+}

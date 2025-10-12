@@ -1,0 +1,192 @@
+dml 1.2;
+
+/*
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+device signal_bus;
+
+import "simics/devs/signal.dml";
+
+parameter classname = "signal-bus";
+
+parameter desc = "signal bus";
+
+parameter documentation =
+    "The <class>" + $classname + "</class> class implements a " +
+    "signal bus that distributes a signal from one or more initiators " +
+    "to a configured list of targets. Both the signal bus itself " +
+    "and all targets implement the <iface>signal</iface> interface. " +
+    "The initiator must also comply to the <iface>signal</iface> interface, " +
+    "with the exception that multiple initiators are allowed for " +
+    "<class>" + $classname + "</class> class.";
+
+struct signal_target_t {
+    conf_object_t *tgt;
+    const signal_interface_t *signal_iface;
+    const char *name;
+    bool invert;
+}
+
+typedef signal_target_t vect target_list_t;
+
+
+method free_target_list(target_list_t *list) {
+    local signal_target_t *t;
+    foreach t in (*list)
+        MM_FREE(cast(t->name, char*));
+    VFREE(*list);
+}
+
+method init {
+    VINIT($targets.targets);
+}
+
+implement signal {
+    method signal_raise() {
+        local signal_target_t *t;
+
+        if ($level++ != 0) {
+            log info, 4: "input raised, output already high";
+            return;
+        }
+
+        log info, 2:"output signal raised";
+
+        foreach t in ($targets.targets) {
+            if ($input_inverted != t->invert)
+                t->signal_iface->signal_lower(t->tgt);
+            else
+                t->signal_iface->signal_raise(t->tgt);
+        }
+    }
+
+    method signal_lower() {
+        local signal_target_t *t;
+
+        $level--;
+        if ($level > 0) {
+            log info, 4: "input lowered, output still high (level = %d)",
+                $level;
+            return;
+        }
+        if ($level < 0) {
+            $level = 0;
+            log error: "negative signal level (lower without matching raise)";
+            return;
+        }
+
+        log info, 2: "output signal lowered";
+
+        foreach t in ($targets.targets) {
+            if ($input_inverted != t->invert)
+                t->signal_iface->signal_raise(t->tgt);
+            else
+                t->signal_iface->signal_lower(t->tgt);
+        }
+    }
+}
+
+attribute targets {
+    parameter type = "[o|[o,n|s]|[o,n|s,b]*]";
+    parameter documentation =
+        "Signal target objects, implementing one or more instances " +
+        "of the <iface>signal</iface> interface. The third argument in the " +
+        "target sub-list can be set to True if the target should get " +
+        "the signal inverted.";
+
+    data target_list_t targets;
+    
+    method get -> (attr_value_t ret) {
+        local int i;
+
+        ret = SIM_alloc_attr_list(VLEN($targets));
+
+        for (i = 0; i < SIM_attr_list_size(ret); i++) {
+            local signal_target_t *t = &$targets[i];
+            SIM_attr_list_set_item(
+                &ret, i, 
+                SIM_make_attr_list(3,
+                                   SIM_make_attr_object(t->tgt),
+                                   SIM_make_attr_string(t->name),
+                                   SIM_make_attr_boolean(t->invert)));
+        }
+    }
+
+    method set_attribute(attr_value_t val) -> (set_error_t ret) {
+        local target_list_t targets;
+        VINIT(targets);
+        local int i;
+
+        /* TODO: for proper hotplugging, all current targets that are not
+           part of the new target list should get a lower() call
+           SIMICS-8901 */
+
+        for (i = 0; i < SIM_attr_list_size(val); i++) {
+            local const signal_interface_t *iface;
+            local conf_object_t *tgt;
+            local const char *name;
+            local attr_value_t attr = SIM_attr_list_item(val, i);
+            local bool invert;
+            local signal_target_t t;
+
+            if (SIM_attr_is_object(attr)) {
+                tgt = SIM_attr_object(attr);
+                name = NULL;
+                invert = false;
+            } else {
+                tgt = SIM_attr_object(SIM_attr_list_item(attr, 0));
+                if (SIM_attr_is_string(SIM_attr_list_item(attr, 1)))
+                    name = SIM_attr_string(SIM_attr_list_item(attr, 1));
+                else
+                    name = NULL;
+                if (SIM_attr_list_size(attr) > 2)
+                    invert = SIM_attr_boolean(SIM_attr_list_item(attr, 2));
+                else
+                    invert = false;
+            }
+
+            iface = SIM_get_port_interface(tgt, "signal", name);
+            if (!iface) {
+                call $free_target_list(&targets);
+                ret = Sim_Set_Interface_Not_Found;
+                return;
+            }
+
+            t.tgt = tgt;
+            t.signal_iface = iface;
+            t.name = name ? MM_STRDUP(name) : NULL;
+            t.invert = invert;
+            VADD(targets, t);
+        }
+
+        call $free_target_list(&$targets);
+        $targets = targets;
+
+        ret = Sim_Set_Ok;
+    }
+}
+
+attribute input_inverted {
+    parameter allocate_type = "bool";
+    parameter documentation =
+        "True if the input signal should be inverted before sent out " +
+        "to the connected targets. Default is False.";
+
+}
+
+attribute level {
+    parameter allocate_type = "int32";
+    parameter internal = true;
+    parameter documentation =
+        "The current output level, used for checkpointing.";
+}

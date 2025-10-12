@@ -1,0 +1,269 @@
+/*
+  i82571EB-mac.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "simics/devs/mii.dml";
+import "simics/devs/ieee_802_3.dml";
+
+import "ethernet-utils.dml";
+
+import "e1000-mac.dml";
+import "e1000-mac-intr.dml";
+import "e1000-mac-management.dml";
+import "i82571EB-mac-rx.dml";
+import "i82571EB-mac-tx.dml";
+import "i82571EB-mac-intr.dml";
+import "i82571EB-mac-management.dml";
+import "i82571EB-mac-pcie.dml";
+
+attribute lan_identifier is uint64_attr {
+    param documentation = "LAN ID, LAN A or LAN B (0b00=LAN A, 0b01=LAN B)";
+    param configuration = "required";
+
+    method set(attr_value_t value) throws {
+        // 0b00 = LAN A, 0b01 == LAN B
+        if (SIM_attr_integer(value) != 0 && SIM_attr_integer(value) != 1) {
+            log spec_viol, 1: "attribute for status.lan_id set w/ incorrect value: %d", SIM_attr_integer(value);
+            this.val = 0;
+        } else {
+            this.val = SIM_attr_integer(value);
+        }
+    }
+}
+
+param PHY_SPEED_10M = 0;
+param PHY_SPEED_100M = 1;
+param PHY_SPEED_1000M = 2;
+
+param MAX_NORMAL_FRAME = 1522;
+
+param RX_DELAY_TIMER   = 1.024e-6;
+
+/* --------------------------------------------------------------
+   IO-MEMORY MAPPED REGISTERS
+   -------------------------------------------------------------- */
+bank csr {
+    param documentation = "i82571EB Ethernet Controller Registers";
+
+    /* --------------------------------------------------------------
+       GENERAL REGISTERS
+       -------------------------------------------------------------- */
+    register serdesctl   @ 0x00024 "Serdes_ana";
+    register fcal        @ 0x00028 "Flow Control Address Low";
+    register fcah        @ 0x0002c "Flow Control Address High";
+    register fct         @ 0x00030 "Flow Control Type";
+    register kumctrlsta  @ 0x00034 "GLCI Control and Status Register (the 631xESB/632xESB)";
+    register lpic        @ 0x000fc "Low Power IDLE control";
+    register fcttv       @ 0x00170 "Flow Control Transmit Timer Value";
+    register txcw        @ 0x00178 "Transmit Configuration Word";
+    register rxcw        @ 0x00180 "Receive Configuration Word";
+    register ledctl      @ 0x00e00 "LED Control";
+    register pba         @ 0x01000 "Packet Buffer Allocation";
+    register eemngctl    @ 0x01010 "MNG EEPROM Control";
+    register sw_fw_sync  @ 0x05b5c "Software/Firmware Synchronization";
+
+    /* Some dummy registers */
+    register dummy_3004 @ 0x3004 is (undocumented);
+
+    register ctrl {
+        field fd @ [0] "Full-Duplex" {
+            param init_val = 1;
+        }
+        // reserved[1]
+        field md @ [2] "Master Disable";
+        // lrst[3] "Link Reset"
+        // reserved[5:4]
+        // slu[6] "Set Link Up"
+        // reserved[7]
+        field speed @ [9:8] "Speed selection";
+        // reserved[10]
+        field frcspd @ [11] "Force Speed";
+        field frcdplx @ [12] "Force Duplex";
+        // reserved[14:13]
+        // reserved [17:15]
+        // sdp0_data[18]
+        // sdp1_data[19]
+        // advd3wuc[20]
+        // reserved[21]
+        // sdp0_iodir[22]
+        // sdp1_iodir[23]
+        // reserved[25:24]
+        field swrst @ [26] "Host Software Reset";
+        field rfce @ [27] is (unimpl) "Receive Flow Control Enable";
+        field tfce @ [28] is (unimpl) "Transmit Flow Control Enable";
+        // reserved[29]
+        field vme @ [30] "VLAN Mode Enable";
+        field phy_rst @ [31] is (unimpl) "PHY Reset";
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (swrst.val == 1) {
+                dev.soft_reset();
+
+                /* copy the MAC address to the RAL/RAH registers */
+                memcpy(&csr.ra[0].low.val, &mac_address.val, 4);
+                csr.ra[0].high.rah.val = (mac_address.val >> 32) & 0xFFFF;
+                csr.ra[0].high.asel.val = RAH_ASEL_DESTINATION_ADDRESS;
+                csr.ra[0].high.av.val = 1;
+            }
+
+            if (frcspd.val == 1)
+                status.speed.val = speed.val;
+            if (frcdplx.val == 1)
+                status.fd.val = fd.val;
+        }
+    }
+
+    register status {
+        field fd @ [0] is (read_only) "Full Duplex" {
+            param init_val = 1;
+        }
+        field lu @ [1] is (read_only) "Link Up" {
+            param init_val = 1;
+        }
+        field lan_id @ [3:2] is (read_only) "LAN Identifier" {
+            is read;
+            method read() -> (uint64) {
+                return lan_identifier.val;
+            }
+        }
+        field txoff @ [4] is (read_only) "Transmit Paused";
+        field tbimode @ [5] is (read_only) "TBI Mode - Internal SerDes Indication" {
+            param init_val = 0;
+        }
+        field speed @ [7:6] is (read_only) "Link Speed Setting";
+        field asdv @ [9:8] is (read_only) "Auto Speed Detection Value";
+        field phyra @ [10] is (read_only) "PHY Reset Asserted";
+        // reserved[18:11]
+        field mes @ [19] is (read_only) "Master Enable Status";
+        // reserved[31:20]
+    }
+
+    register ctrl_ext {
+        // reserved[1:0]
+        field sdp2_gpien @ [2] is (unimpl) "General Purpose Interrupt Detection Enable for SDP2";
+        field sdp3_gpien @ [3] is (unimpl) "General Purpose Interrupt Detection Enable for SDP3";
+        // reserved[5:4]
+        field sdp2_data @ [6] is (unimpl) "SDP2 Data Value";
+        field sdp3_data @ [7] is (unimpl) "SDP3 Data Value";
+        // reserved[9:8]
+        field sdp2_iodir @ [10] is (unimpl) "SDP2 Pin Directionality";
+        field sdp3_iodir @ [11] is (unimpl) "SDP3 Pin Directionality";
+        field asdchk @ [12] is (unimpl) "ASD Check";
+        field ee_rst @ [13] is (unimpl) "EEPROM Reset";
+        // reserved[14]
+        field spd_byps @ [15] is (unimpl) "Speed Select Bypass";
+        // reserved[16]
+        field ro_dis @ [17] is (unimpl) "Relaxed Ordering Disable";
+        field sd_lpe @ [18] is (unimpl) "SERDES Low Power Enable";
+        field dma_dge @ [19] is (unimpl) "Dynamic Clock Gating Enable";
+        field phy_pde @ [20] is (unimpl) "PHY Power Down Enable";
+        // reserved[21]
+        field link_mode @ [23:22] is (unimpl) "Link Mode";
+        // reserved [26:24]
+        field iame @ [27] "Interrupt Acknowledge Auto Mask Enable" {
+            is write;
+            method write(uint64 val) {
+                this.val = val;
+                log info, 2:
+                    "%s %s bit %s",
+                        qname, desc,
+                        (val == 1) ? "enabled" : "disabled";
+            }
+        }
+        field drv_load @ [28] is (unimpl) "Driver Loaded";
+        field itcen @ [29] is (unimpl) "Interrupt Timers Clean Enable";
+        // reserved[31:30]
+    }
+
+    register fla is (unimpl);
+
+    register mdic {
+        field data @ [15:0] "MDIO Data";
+        field rega @ [20:16] "PHY Register Address";
+        field phya @ [25:21] "PHY Address";
+        field op @ [27:26] "Opcode";
+        field r @ [28] "Ready" {
+            param init_val = 1;
+        }
+        field ie @ [29] "Interrupt Enable";
+        field e @ [30] "Error";
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (r.val == 1) {
+                log info, 2:
+                    "MDIC ready bit must be 0 to read/write PHY registers";
+                return;
+            }
+
+            if (phya.val != dev.phy_address.val) {
+                log info, 2:
+                "phy address in MDIC %d mismatch the actual phy address %d",
+                phya.val, dev.phy_address.val;
+                return;
+            }
+
+            if (op.val == 0b01) {
+                mii.mii_management.write_register(phya.val, rega.val, data.val);
+            } else if (op.val == 0b10) {
+                data.val = mii.mii_management.read_register(phya.val, rega.val);
+            } else {
+                log spec_viol, 1:
+                    "write register %s with reserved opcode %d", name, op.val;
+                e.val = 1;
+            }
+
+            r.val = 1;
+            if (ie.val == 1)
+                raise_interrupt(INTR_MDAC);
+        }
+    }
+
+    register serdesctl is (unimpl);
+    register fcal is (unimpl);
+    register fcah is (unimpl);
+    register fct is (unimpl);
+    register kumctrlsta is (unimpl);
+    register fcttv is (unimpl);
+    register txcw is (unimpl);
+    register rxcw is (unimpl);
+    register ledctl is (unimpl);
+    register lpic is (reserved);
+
+    register pba {
+        field rxa @ [15:0] is (unimpl) "Receive Packet Buffer Allocation" {
+            param init_val = 0x0020;
+            is ignore_soft_reset;
+        }
+        field txa @ [20:16] is (unimpl) "Transmit Packet Buffer Allocation" {
+            param init_val = 0x0010;
+            is ignore_soft_reset;
+        }
+    }
+    register eemngctl {
+        field cfg_done @ [18] {
+            is read;
+            method read() -> (uint64) {
+                return 1;
+            }
+        }
+    }
+    register sw_fw_sync is (unimpl);
+}
+
+template ignore_soft_reset is soft_reset {
+    method soft_reset() { /* do nothing */ }
+}

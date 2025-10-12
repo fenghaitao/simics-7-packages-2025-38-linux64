@@ -1,0 +1,119 @@
+/*
+  sample-generic-message-device.dml - sample code for a Simics generic message
+  device
+
+  © 2017 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+device sample_generic_message_device;
+parameter desc = "sample generic message device";
+parameter documentation = "The is the <class>" + $classname + "</class> class"
+    + " which is an example of how generic message devices can be written in"
+    + "Simics.";
+
+import "generic-message-interfaces.dml";
+
+attribute address {
+    parameter documentation = "Address of device itself on the link.";
+    parameter allocate_type = "uint32";
+}
+
+attribute dest_address {
+    parameter documentation = "Destination address of the message.";
+    parameter allocate_type = "uint32";
+}
+
+attribute length {
+    parameter documentation = "Length of the message to send.";
+    parameter allocate_type = "uint32";
+}
+
+attribute send_value {
+    parameter documentation = "Value to send to the link.";
+    parameter allocate_type = "uint8";
+}
+
+attribute received_value {
+    parameter documentation = "Last byte received from the link.";
+    parameter allocate_type = "uint8";
+}
+
+attribute delay {
+    parameter documentation = "Delay between each message in cycles.";
+    parameter allocate_type = "uint32";
+}
+
+attribute frame_delay {
+    parameter documentation = "Delay to send the message in ns.";
+    parameter allocate_type = "uint64";
+}
+
+// gml link connection
+connect link {
+    parameter desc = "generic message link Connection";
+    parameter configuration = "optional";
+    interface generic_message_link;
+
+    method before_set() {
+        if (!SIM_is_restoring_state($dev.obj) && $obj != NULL) {
+            local bool already_posted;
+            $generic_message_link.disconnect_device($dev.obj);
+            log info, 3: "disconnect with link ";
+            call $send_message_event.posted(NULL) -> (already_posted);
+            if (already_posted)
+                inline $send_message_event.remove(NULL);
+        }
+    }
+
+    method after_set() {
+        if (SIM_object_is_configured($dev.obj) && $obj != NULL) {
+            $generic_message_link.connect_device($dev.obj, NULL, $address);
+            log info, 3: "connect with link, address: 0x%x", $address;
+            inline $send_message_event.post($delay, NULL);
+        }
+    }
+}
+
+// generic_message_device interface
+implement generic_message_device {
+    method receive_frame(conf_object_t *link, dbuffer_t *frame) {
+        local const uint8 *contents = dbuffer_read_all(frame);
+        local uint32 len = dbuffer_len(frame);
+        $received_value = contents[len - 1];
+        log info, 4: "receive: dst 0x%x, size %d, contents 0x%x",
+            $address, len, $received_value;
+    }
+}
+
+event send_message_event {
+    parameter timebase = "cycles";
+    method event(void *data) {
+        local dbuffer_t *frame = new_dbuffer();
+        dbuffer_append_value(frame, $send_value, $length);
+        $link.generic_message_link.send_frame(0, $dest_address,
+                                              frame, $frame_delay);
+        log info, 4: "send: src 0x%x -> dst 0x%x, size %d, contents 0x%x",
+            $address, $dest_address, $length, $send_value;
+        dbuffer_free(frame);
+        inline $send_message_event.post($delay, NULL);
+    }
+}
+
+method post_init() {
+    if ($link.obj != NULL) {
+        $link.generic_message_link.connect_device($dev.obj, NULL, $address);
+        log info, 3: "connect with link after init, address: 0x%x", $address;
+        inline $send_message_event.post($delay, NULL);
+    }
+}

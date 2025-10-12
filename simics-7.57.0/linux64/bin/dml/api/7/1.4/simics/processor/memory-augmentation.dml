@@ -1,0 +1,27 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/processor/memory-augmentation.h>
+%}
+
+import "simics/base/types.dml";
+
+extern void SIM_clear_augmentation_bit(uint8 *tag_page_data, uint32 pofs);
+extern int SIM_get_augmentation_bit(uint8 *tag_page_data, uint32 pofs);
+extern void SIM_set_augmentation_bit(uint8 *tag_page_data, uint32 pofs);
+extern void VT_clear_augmentation_bit(uint8 *page_data, uint32 pofs);
+extern int VT_get_augmentation_bit(uint8 *page_data, uint32 pofs);
+extern void VT_set_augmentation_bit(uint8 *page_data, uint32 pofs);

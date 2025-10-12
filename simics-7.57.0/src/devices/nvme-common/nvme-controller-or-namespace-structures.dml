@@ -1,0 +1,209 @@
+/*
+  nvme-cns.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+typedef layout "little-endian" {
+    uint16 vid;
+    uint16 ssvid;
+    char sn[20];
+    char mn[40];
+    char fr[8];
+    uint8 rab;
+    uint8 ieee[3];
+    uint8 cmic;
+    uint8 mdts;
+    uint16 cntlid;
+    uint32 ver;
+    uint32 rtd3r;
+    uint32 rtd3e;
+    uint32 oaes;
+    uint32 ctratt;
+    uint8 rsvd102[9];
+    uint16 rrls;
+    uint8 cntrltype;
+    uint8 fguid[16];
+    uint16 crdt1;
+    uint16 crdt2;
+    uint16 crdt3;
+    uint8 rsvd134[119];
+    uint8 nvmsr;
+    uint8 vwci;
+    uint8 mec;
+    uint16 oacs;
+    uint8 acl;
+    uint8 aerl;
+    uint8 frmw;
+    uint8 lpa;
+    uint8 elpe;
+    uint8 npss;
+    uint8 avscc;
+    uint8 aspta;
+    uint16 wctemp;
+    uint16 cctemp;
+    uint16 mfta;
+    uint32 hmpre;
+    uint32 hmmin;
+    uint8 tnvmcap[16];
+    uint8 unvmcap[16];
+    uint32 rpmbs;
+    uint16 edstt;
+    uint8 dsto;
+    uint8 fwug;
+    uint16 kas;
+    uint16 hctma;
+    uint16 mntmt;
+    uint16 mxtmt;
+    uint32 sanicap;
+    uint32 hmminds;
+    uint16 hmmaxd;
+    uint16 nsetidmax;
+    uint16 endgidmax;
+    uint8 anatt;
+    uint8 anacap;
+    uint32 anagrpmax;
+    uint32 nanagrpid;
+    uint32 pels;
+    uint16 domain_identifier;
+    uint8 rsvd358[10];
+    uint8 megcap[16];
+    uint8 rsvd384[128];
+    uint8 sqes;
+    uint8 cqes;
+    uint16 maxcmd;
+    uint32 nn;
+    uint16 oncs;
+    uint16 fuses;
+    uint8 fna;
+    uint8 vwc;
+    uint16 awun;
+    uint16 awupf;
+    uint8 icsvscc;
+    uint8 nwpc;
+    uint16 acwu;
+    uint16 copy_descriptor_formats_supported;
+    uint32 sgls;
+    uint32 mnan;
+    uint8 maxdna[16];
+    uint32 maxcna;
+    uint8 rsvd564[204];
+    char subnqn[256];
+    uint8 rsvd1024[768];
+    uint8 fabric_specific[14];
+    uint8 rsvd1806[242];
+    power_state_desc_t psd0[32];
+    uint8 vendor_specific[1024];
+} identify_01_t;
+
+typedef layout "little-endian" {
+    uint32 nsid[1024];
+} identify_02_t;
+
+typedef layout "little-endian" {
+    uint64 lbstm;
+    uint8 pic;
+    uint8 rsvd09[3];
+    extended_lba_format_t elbaf0[64];
+    uint8 rsvd268[3828];
+} identify_05_t;
+
+typedef layout "little-endian" {
+    uint8 vsl;
+    uint8 wzsl;
+    uint8 wusl;
+    uint8 dmrl;
+    uint32 dmrsl;
+    uint64 dmsl;
+    uint8 rsvd16[4080];
+} identify_06_nvm_t;
+
+typedef layout "little-endian" {
+    uint8 nsfeat;
+    uint8 nmic;
+    uint8 rescap;
+    uint8 fpi;
+    uint32 anagrpid;
+    uint8 nsattr;
+    uint8 rsvd09;
+    uint16 nvmsetid;
+    uint16 endgid;
+    bitfields 8 {
+        uint1 nrdy @ [0];
+    } nstat;
+    uint8 rsvd15[4081];
+} identify_08_t;
+
+typedef layout "little-endian" {
+    uint8 nidt;
+    uint8 nidl;
+    uint8 rsvd02[2];
+    uuid_t nid;
+    uint8 empty[4076];
+} identify_03_t;
+
+typedef layout "little-endian" {
+    uint16 ms;
+    uint8 lbads;
+    bitfields 8 {
+        uint2 rp @ [1:0];
+    } fields24;
+} lbaf_format_t;
+
+typedef bitfields 32 {
+    uint2 pif @ [8:7];
+    uint7 sts @ [6:0];
+} extended_lba_format_t;
+
+typedef layout "little-endian" {
+    uint64 nsze;
+    uint64 ncap;
+    uint64 nuse;
+    uint8 nsfeat;
+    uint8 nlbaf;
+    uint8 flbas;
+    uint8 mc;
+    uint8 dpc;
+    uint8 dps;
+    uint8 nmic;
+    uint8 rescap;
+    uint8 fpi;
+    uint8 dlfeat;
+    uint16 nawun;
+    uint16 nawupf;
+    uint16 nacwu;
+    uint16 nabsn;
+    uint16 nabo;
+    uint16 nabspf;
+    uint16 noiob;
+    uint8 nvmcap[16];
+    uint16 npwg;
+    uint16 npwa;
+    uint16 npdg;
+    uint16 npda;
+    uint16 nows;
+    uint16 mssrl;
+    uint32 mcl;
+    uint8 msrc;
+    uint8 rsvd81[11];
+    uint32 anagrpid;
+    uint8 rsvd96[3];
+    uint8 nsattr;
+    uint16 nvmsetid;
+    uint16 endgid;
+    uint8 nguid[16];
+    uint64 eui64;
+    lbaf_format_t lbaf[64];
+    uint8 rsvd384[3712];
+} identify_00_t;

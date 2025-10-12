@@ -1,0 +1,30 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/model-iface/step.h>
+%}
+
+import "simics/base/types.dml";
+import "simics/base/attr-value.dml";
+import "simics/base/event.dml";
+import "simics/processor/time.dml";
+import "simics/pywrap.dml";
+
+extern typedef struct { pc_step_t (*get_step_count)(conf_object_t *queue); void (*post_step)(conf_object_t *queue, event_class_t *evclass, conf_object_t *obj, pc_step_t steps, lang_void *user_data); void (*cancel_step)(conf_object_t *queue, event_class_t *evclass, conf_object_t *obj, int (*pred)(lang_void *data, lang_void *match_data), lang_void *match_data); pc_step_t (*find_next_step)(conf_object_t *queue, event_class_t *evclass, conf_object_t *obj, int (*pred)(lang_void *data, lang_void *match_data), lang_void *match_data); attr_value_t (*events)(conf_object_t *obj); pc_step_t (*advance)(conf_object_t *queue, pc_step_t steps); } step_interface_t;
+extern typedef struct { uint32 steps; uint32 cycles; } step_cycle_ratio_t;
+extern typedef struct { step_cycle_ratio_t (*get_ratio)(conf_object_t *obj); void (*set_ratio)(conf_object_t *obj, uint32 steps, uint32 cycles); } step_cycle_ratio_interface_t;
+extern typedef struct { cycles_t (*get_stall_cycles)(conf_object_t *obj); void (*set_stall_cycles)(conf_object_t *obj, cycles_t cycles); cycles_t (*get_total_stall_cycles)(conf_object_t *obj); } stall_interface_t;
+extern typedef struct { pc_step_t (*get_halt_steps)(conf_object_t *obj); void (*set_halt_steps)(conf_object_t *obj, pc_step_t steps); pc_step_t (*get_ffwd_steps)(conf_object_t *obj); void (*set_ffwd_steps)(conf_object_t *obj, pc_step_t steps); pc_step_t (*get_ma_steps)(conf_object_t *obj); void (*set_ma_steps)(conf_object_t *obj, pc_step_t steps); } step_info_interface_t;

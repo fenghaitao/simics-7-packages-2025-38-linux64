@@ -1,0 +1,47 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/base/sim-exception.h>
+%}
+
+import "simics/host-info.dml";
+
+extern sim_exception_t DBG_get_pending_exception(void);
+extern sim_exception_t SIM_clear_exception(void);
+extern sim_exception_t SIM_get_pending_exception(void);
+extern char const *SIM_last_error(void);
+extern void VT_frontend_exception(sim_exception_t exc_type, char const *str);
+extern typedef int sim_exception_t;
+constant SimExc_No_Exception = 0;
+constant SimExc_General = 1;
+constant SimExc_Lookup = 2;
+constant SimExc_Attribute = 3;
+constant SimExc_IOError = 4;
+constant SimExc_Index = 5;
+constant SimExc_Memory = 6;
+constant SimExc_Type = 7;
+constant SimExc_Break = 8;
+constant SimExc_Stop = 9;
+constant SimExc_PythonTranslation = 10;
+constant SimExc_License = 11;
+constant SimExc_IllegalValue = 12;
+constant SimExc_InquiryOutsideMemory = 13;
+constant SimExc_InquiryUnhandled = 14;
+constant SimExc_InterfaceNotFound = 15;
+constant SimExc_AttrNotFound = 16;
+constant SimExc_AttrNotReadable = 17;
+constant SimExc_AttrNotWritable = 18;
+constant Sim_Exceptions = 19;

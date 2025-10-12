@@ -1,0 +1,97 @@
+/*
+  firewire-device-test-wrapper.dml - Simple device used for testing
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device firewire_device_test_wrapper;
+bitorder be;
+import "firewire-common.dml";
+import "utility.dml";
+
+parameter desc = "simple device for testing RapidIO";
+
+implement firewire_device {
+    method transfer(dbuffer_t *packet, int crc_calculated)
+        -> (firewire_ack_code_t ack) {
+        call $packet_data_before_transfer.set_data(dbuffer_read_all(packet),
+                                                   dbuffer_len(packet));
+        ack = $real_device.firewire_device.transfer(packet, crc_calculated);
+        call $packet_data_after_transfer.set_data(dbuffer_read_all(packet),
+                                                  dbuffer_len(packet));
+    }
+
+    method reset(uint16 new_id, uint8 root_id, uint32_array_t self_ids) {
+        $real_device.firewire_device.reset(new_id, root_id, self_ids);
+    }
+
+    method get_self_id_template -> (uint32 self_id) {
+        self_id = $real_device.firewire_device.get_self_id_template();
+    }
+
+    method get_rhb -> (int rhb) {
+        rhb = $real_device.firewire_device.get_rhb();
+    }
+    method get_port_count -> (uint8 count) {
+        count = $real_device.firewire_device.get_port_count();
+    }
+    method get_port_mask -> (uint16 mask) {
+        mask = $real_device.firewire_device.get_port_mask();
+    }
+}
+
+connect real_device {
+    parameter documentation
+        = "The real firewire device the calls are forwarded to";
+    parameter configuration = "required";
+    interface firewire_device {
+        parameter required = true;
+    }
+}
+
+attribute packet_data_before_transfer {
+    parameter documentation
+        = "Content of the last packet before real_device.transfer was called.";
+    is packet_attribute;
+}
+
+attribute packet_data_after_transfer {
+    parameter documentation
+        = "Content of the last packet after real_device.transfer was called.";
+    is packet_attribute;
+}
+
+template packet_attribute {
+    parameter type = "d|n";
+    parameter configuration = "pseudo";
+
+    data uint8 *v;
+    data size_t length;
+    
+    method get() -> (attr_value_t ret) {
+        if ($v == NULL) {
+            ret = SIM_make_attr_nil();
+            return;
+        }
+        ret = SIM_make_attr_data($length, $v);
+    }
+
+    method set_data(const uint8 *v, size_t length) {
+        if ($v != NULL) {
+            delete $v;
+        }
+        $length = length;
+        $v = new uint8[$length];
+        memcpy($v, v, length);
+    }
+}

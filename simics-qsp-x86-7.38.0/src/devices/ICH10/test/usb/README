@@ -1,0 +1,16 @@
+ICH10 UHCI/EHCI Test Description
+================================
+
+Included Cases
+--------------
+The ICH10 UHCI/EHCI test totally includes 3 cases:
+(1) s-uhci-reset.py: tests default states of UHCI controller
+(2) s-ehci-reset.py: tests default states of EHCI controller
+(3) s-uhci-trans.py: tests a simple SETUP and BULK transfer of UHCI
+
+
+
+Not Tested Features
+-------------------
+(1) The SETUP and BULK transfer of EHCI
+(2) Complex transfer description lists which resemble a true UHCI/EHCI driver

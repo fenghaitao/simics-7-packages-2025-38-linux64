@@ -1,0 +1,92 @@
+/*
+  remap-unit.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+device x58_remap_unit;
+param classname = "x58-remap-unit";
+param desc = "model of DMA/Interrupt remapping unit";
+param documentation = "The DMA/Interrupt remapping unit";
+
+import "vt-d.dml";
+
+param FRCD_NUM = 8;
+param FRCD_OFFSET = 0x10;
+param IOTLB_OFFSET = 0x20;
+
+attribute non_isoch is (bool_attr)
+    "TRUE if this is the Non-Isochronous (i.e. first) VT-d engine on the X58" {
+    method set(attr_value_t new_val) throws {
+        default(new_val);
+        if (this.val) {
+            vtd.ecap.sc.val = 1;
+            vtd.ecap.dt.val = 1;
+        }
+    }
+}
+
+bank vtd {
+    register cap {
+        field drd    { param init_val = 0; }
+        field dwd    { param init_val = 1; }
+        field mamv   { param init_val = 9; }
+        field nfr    {
+            /* The documentation is not clear, the "Virtualization Technology
+               for Directed I/O" document implies that the value should be
+               $FRCD_NUM - 1, the X58 and 5500 documents implies that the value
+               should be $FRCD_NUM.
+             */
+            param init_val = FRCD_NUM - 1;
+        }
+        field psi    { param init_val = 1; }
+        field sllps  { param init_val = 0; }
+        field fro    { param init_val = FRCD_OFFSET; }
+        field zlr    { param init_val = 0; }
+        field mgaw   {
+            /* No information about 0x1008. */
+            param init_val = 0x2f;
+        }
+        field sagaw  {
+            /* No information about 0x1008. The documentation says that the
+               default value should be 2, but it is most likely wrong.*/
+            param init_val = 4;
+        }
+        field cm     { param init_val = 0; }
+        field phmr   { param init_val = 1; }
+        field plmr   { param init_val = 1; }
+        field rwbf   { param init_val = 0; }
+        field afl    { param init_val = 0; }
+        field nd     { param init_val = 2; }
+    }
+    register ecap {
+        field mhmv  { param init_val = 0xf; }
+        field iro   { param init_val = IOTLB_OFFSET; }
+        field sc is no_reset;  // set via non_isoch attribute above
+        field pt    { param init_val = 1; }
+        field dep   { param init_val = 1; }  // caching hints, deprecated
+        field eim   { param init_val = 0; }
+        field ir    { param init_val = 1; }
+        field dt is no_reset;  // set via non_isoch attribute above
+        field qi    { param init_val = 1; }
+        field c     { param init_val = 0; }
+    }
+    register rtaddr is (read) {
+        /* X58 claims that read from this register returns the value "last
+           programmed to it", VT-d makes no such claim */
+        method read() -> (uint64) {
+            return latched;
+        }
+    }
+}

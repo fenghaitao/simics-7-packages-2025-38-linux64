@@ -1,0 +1,605 @@
+/*
+  ich-smbus-common.dml - SMBus common code
+  was called ich-smbus.dml until 2024
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "pcie/common.dml";
+import "simics/devs/i2c.dml";
+import "simics/model-iface/image.dml";
+
+param limitations = "<ul>"
+    + "<li>I2C read is unimplemented.</li>"
+    + "<li>Block transfer in disabled 32-byte buffer is unimplemented.</li>"
+    + "<li>Host notify is unimplemented.</li>"
+    + "</ul>";
+
+param smbus_sram_size            = 32;
+
+param SMBus_Rd                   = 1;
+param SMBus_Wr                   = 0;
+
+param SMBus_Cmd_Quick            = 0x0;
+param SMBus_Cmd_Byte             = 0x1;
+param SMBus_Cmd_Byte_Data        = 0x2;
+param SMBus_Cmd_Word_Data        = 0x3;
+param SMBus_Cmd_Process_Call     = 0x4;
+param SMBus_Cmd_Block            = 0x5;
+param SMBus_Cmd_I2C_Read         = 0x6;
+param SMBus_Cmd_Block_Process    = 0x7;
+
+param SMBus_Master_St_Idle               = 0x0;
+param SMBus_Master_St_Started            = 0x1;
+param SMBus_Master_St_Read_Requested     = 0x2;
+param SMBus_Master_St_Write_Requested    = 0x3;
+param SMBus_Master_St_Read_Ack_Requested = 0x4;
+
+param SMBus_Master_Ev_Cmd_Fired          = 0x1;
+param SMBus_Master_Ev_Bus_Freed          = 0x2;
+param SMBus_Master_Ev_Start_Response     = 0x4;
+param SMBus_Master_Ev_Read_Response      = 0x8;
+param SMBus_Master_Ev_Ack_Read_Response  = 0x10;
+param SMBus_Master_Ev_Write_Response     = 0x20;
+
+param SMBus_Slave_St_Idle                = 0x0;
+param SMBus_Slave_St_Started             = 0x1;
+param SMBus_Slave_St_Read                = 0x2;
+param SMBus_Slave_St_Write               = 0x3;
+
+connect sram_image {
+    param documentation = "Image holding the 32-byte SRAM";
+    param configuration = "required";
+    interface image;
+}
+
+is hreset;
+is sreset;
+is pcie_endpoint;
+bank pcie_config {
+
+    register vendor_id  { param init_val = 0x8086; }
+    register command    { param init_val = 0; }
+    register status     { param init_val = 0x0280; }
+    register class_code { param init_val = 0x0C0500; }
+    register smbus_sram_bar @ 0x10 is (memory_base_address_64) {
+        param size_bits = 5;
+        param map_obj = smbus_func.obj;
+        field prefetchable { param init_val = 0; }
+    }
+    register io_bar size 4 @ 0x20 is (io_base_address) {
+        param size_bits = 5;
+        param map_obj = smbus_func.obj;
+    }
+    register interrupt_pin { param init_val = 0x02; }
+    register host_configuration size 2 @ 0x40 {
+        field I2C_EN      @ [2:2];
+        field SMB_SMI_EN  @ [1:1];
+        field HST_EN      @ [0:0];
+    }
+}
+
+bank smbus_func {
+    param register_size = 1;
+
+    register hst_sts        @ 0x00 "Host Status";
+    register hst_cnt        @ 0x02 "Host Control";
+    register hst_cmd        @ 0x03 "Host Command";
+    register xmit_slva      @ 0x04 "Transmit Slave Address";
+    register hst_d0         @ 0x05 "Host Data 0";
+    register hst_d1         @ 0x06 "Host Data 1";
+    register host_block_db  @ 0x07 "Host Block Data Byte";
+    register pec            @ 0x08 "Packet Error Check";
+    register rcv_slva       @ 0x09 "Receive Slave Address";
+    register slv_data size 2@ 0x0A "Receive Slave Data";
+    register aux_sts        @ 0x0C "Auxiliary Status";
+    register aux_ctl        @ 0x0D "Auxiliary Control";
+    register smlink_pin_ctl @ 0x0E "SMLink Pin Control";
+    register smbus_pin_ctl  @ 0x0F "SMBus Pin Control";
+    register slv_sts        @ 0x10 "Slave Status";
+    register slv_cmd        @ 0x11 "Slave Command";
+    register notify_daddr   @ 0x14 "Notify Device Address";
+    register notify_dlow    @ 0x16 "Notify Data Low Byte";
+    register notify_dhigh   @ 0x17 "Notify Data High Byte";
+
+    // Internal register
+    register ma_state         is (unmapped) 
+                    "SMBus Master IF's State";
+    register ma_event         is (unmapped) 
+                    "SMBus Master IF's Event";
+    register ma_start_res     is (unmapped) 
+                    "SMBus Master IF's Start Result";
+    register ma_read_byte     is (unmapped) 
+                    "SMBus Master IF's Read Byte";
+    register ma_write_res     is (unmapped) 
+                    "SMBus Master IF's Write Result";
+    register ma_start_repeats is (unmapped) 
+                    "SMBus Master IF's Start Repeat Count";
+    register ma_wr_repeats    is (unmapped) 
+                    "SMBus Master IF's Write Repeat Count";
+    register ma_rd_repeats    is (unmapped) 
+                    "SMBus Master IF's Read Repeat Count";
+    register sl_state         is (unmapped) 
+                    "SMBus Slave IF's State";
+    register sl_wr_repeats    is (unmapped) 
+                    "SMBus Slave IF's Write Repeat Count";
+    register sram_rd_ptr      is (unmapped) 
+                    "SRAM Read Pointer in Block Writing";
+    register sram_wr_ptr      is (unmapped) 
+                    "SRAM Write Pointer in Block Reading";
+    register sram_rd_ptr_sw   is (unmapped) 
+                    "SRAM Read Pointer in Software Reading";
+    register sram_wr_ptr_sw   is (unmapped) 
+                    "SRAM Write Pointer in Software Pumping";
+
+    register hst_sts {
+        field BYTE_DONE_STS  @ [7:7] is (write_1_clears);
+        field INUSE_STS      @ [6:6] is (write_1_clears);
+        field SMBALERT_STS   @ [5:5] is (write_1_clears);
+        field FAILED         @ [4:4] is (write_1_clears);
+        field BUS_ERR        @ [3:3] is (write_1_clears);
+        field DEV_ERR        @ [2:2] is (write_1_clears);
+        field INTR           @ [1:1] is (write_1_clears);
+        field HOST_BUSY      @ [0:0] is (ignore_write);
+        method be_little_busy() {
+            // See 'http://openbios.org/pipermail/linuxbios
+            // /2004-September/009077.html' why this is needed.
+            HOST_BUSY.val = 1;
+        }
+        method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+            local uint64 value = default(enabled_bytes, aux);
+            HOST_BUSY.val = 0;
+            return value;
+        }
+    }
+
+    register hst_cnt {
+        field PEC_EN     @ [7:7] is (silent_unimpl);
+        field START      @ [6:6];
+        field LAST_BYTE  @ [5:5] is (silent_unimpl);
+        field SMB_CMD    @ [4:2];
+        field KILL       @ [1:1] is (silent_unimpl);
+        field INTREN     @ [0:0] is (silent_unimpl);
+
+        method write_register(uint64 value, uint64 enabled_bytes, void *aux) {
+            default(value, enabled_bytes, aux);
+            if (START.val != 0) {
+                local int res;
+
+                START.val = 0;
+                if (pcie_config.host_configuration.HST_EN.val == 0) {
+                    log info, 1:
+                        "attempted SMBus operation while HST_EN = 0";
+                    return;
+                }
+                ma_event.val = SMBus_Master_Ev_Cmd_Fired;
+                proc_cmd_event.post(0.0);
+            }
+        }
+
+        method read_register(uint64 enabled_bytes, void *aux) -> (uint64) {
+            local uint64 value = default(enabled_bytes, aux);
+            sram_rd_ptr_sw.val = 0;
+            sram_wr_ptr_sw.val = 0;
+            log info, 4:
+                "internal index pointer to 32-byte buffer is cleared";
+            return value;
+        }
+    }
+
+    register xmit_slva {
+        field ADDRESS  @ [7:1];
+        field RW       @ [0:0];
+    }
+
+    register slv_data {
+        field data_msg0 @ [7:0]  "Data Message Byte 0";
+        field data_msg1 @ [15:8] "Data Message Byte 1";
+    }
+
+    register host_block_db {
+        is read;
+        method read() -> (uint64) {
+            local uint64 val;
+            local uint8 byte;
+            if (aux_ctl.E32B.val == 1) {
+                sram_image.image.read(&byte, sram_rd_ptr_sw.val++, 1);
+                val = byte;
+            } else {
+                val = this.val;
+            }
+            return val;
+        }
+
+        is write;
+        method write(uint64 val) {
+            local uint8 byte;
+            if (aux_ctl.E32B.val == 1) {
+                byte = val;
+                sram_image.image.write(&byte, sram_wr_ptr_sw.val++, 1);
+            } else {
+                this.val = val;
+            }
+        }
+    }
+
+    register rcv_slva { param init_val = 0x44; }
+
+    register aux_sts {
+        is silent_unimpl; // No place to use it, so mark it to SW
+        field STCO   @ [1] "SMBus TCO Mode";
+        field CRCE   @ [0] "CRC Error";
+    }
+
+    register aux_ctl {
+        field E32B   @ [1] "Enable 32-Byte Buffer";
+        field AAC    @ [0] "Automatically Append CRC";
+    }
+
+    event proc_cmd_event is simple_time_event {
+        method event() {
+            process_cmd();
+        }
+    }
+
+    // The action of the SMBus processor in started state
+    method action_in_started() {
+        // Only the event of a start response is allowed
+        if (ma_event.val != SMBus_Master_Ev_Start_Response
+            || ma_start_res.val != I2C_status_success) {
+            hst_sts.DEV_ERR.val = 1;
+            ma_state.val = SMBus_Master_St_Idle;
+            if (ma_event.val != SMBus_Master_Ev_Start_Response)
+                log info, 2:
+                    "only the start resp is allowed after a start request";
+            else
+                log info, 2:
+                    "failed to start a SMBus cycle to address 0x%x for %s",
+                    xmit_slva.ADDRESS.val,
+                    (ma_start_res.val == I2C_status_noack)
+                        ?  "no such address" : "the bus is busy";
+            return;
+        }
+
+        // Terminate, read the slave or write the slave
+        if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Quick) {
+            log info, 2: "a quick command is finished";
+            assert (ma_start_repeats.val == 1);
+            ma_state.val = SMBus_Master_St_Idle;
+        } else if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte) {
+            // Determine the direction of the byte
+            assert (ma_start_repeats.val == 1);
+            if (xmit_slva.RW.val == SMBus_Wr) {
+                i2c_write(hst_cmd.val);
+                ma_wr_repeats.val = 1;
+                ma_state.val = SMBus_Master_St_Write_Requested;
+            } else {
+                i2c_read();
+                ma_rd_repeats.val = 1;
+                ma_state.val = SMBus_Master_St_Read_Requested;
+            }
+        } else if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte_Data
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Word_Data
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Process_Call
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block_Process) {
+            if (ma_start_repeats.val == 1) {
+                // Write the command code after the first start
+                log info, 4:
+                    "send the command code 0x%02x to slave %d",
+                    hst_cmd.val, xmit_slva.ADDRESS.val;
+                ma_state.val = SMBus_Master_St_Write_Requested;
+                i2c_write(hst_cmd.val);
+                ma_wr_repeats.val = 1;
+                if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Block) {
+                    sram_rd_ptr.val = 0; // Block transfer always starts at 0
+                    sram_wr_ptr.val = 0;
+                }
+            } else if (ma_start_repeats.val == 2) {
+                // Read the slave after the second start
+                if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Word_Data
+                    || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block)
+                    assert (xmit_slva.RW.val == SMBus_Rd);
+                i2c_read();
+                ma_rd_repeats.val = 1;
+                ma_state.val = SMBus_Master_St_Read_Requested;
+                log info, 4:
+                    "request a byte read from SMBus address 0x%x",
+                    xmit_slva.ADDRESS.val;
+            }
+        } else if (hst_cnt.SMB_CMD.val == SMBus_Cmd_I2C_Read) {
+            log info, 2: "I2C read command is not supported";
+        }
+    }
+
+    // action_in_write_requested: the action of the SMBus processor
+    // in write requested state
+    method action_in_write_requested() {
+        local bool restart;
+        local uint8 data;
+
+        // Only the event of write response is allowed
+        if (   ma_event.val != SMBus_Master_Ev_Write_Response
+            || ma_write_res.val != I2C_status_success) {
+            log spec_viol, 3:
+                "no or bad write response after a write";
+            ma_state.val = SMBus_Master_St_Idle;
+            return;
+        }
+
+        if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte) {
+            assert (xmit_slva.RW.val == SMBus_Wr);
+            log info, 3: "a byte (write) command is finished";
+            ma_state.val = SMBus_Master_St_Idle;
+        } else if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte_Data
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Word_Data
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Process_Call
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block_Process) {
+            restart = false;
+            if (   xmit_slva.RW.val == SMBus_Rd
+                && (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte_Data
+                    || hst_cnt.SMB_CMD.val == SMBus_Cmd_Word_Data
+                    || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block))
+                restart = true;
+            if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Process_Call
+                && ma_wr_repeats.val == 3)
+                restart = true;
+
+            if (restart) {
+                // Read a data byte from the slave, turn the direction firstly
+                log info, 3:
+                    "repeat a start (read) to address %d", xmit_slva.ADDRESS.val;
+                ma_state.val = SMBus_Master_St_Started;
+                i2c_start((xmit_slva.ADDRESS.val << 1) | 1);
+                ma_start_repeats.val = 2;
+            } else {
+                // Process the block read/write separately
+                if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Block
+                    || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block_Process) {
+                    if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Block)
+                        assert (xmit_slva.RW.val == SMBus_Wr);
+                    if (ma_wr_repeats.val == 1) {
+                        // Send the byte count
+                        ma_state.val = SMBus_Master_St_Write_Requested;
+                        i2c_write(hst_d0.val);
+                        ma_wr_repeats.val++;
+                    } else if (ma_wr_repeats.val == (hst_d0.val + 2)) {
+                        if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Block) {
+                            log info, 3:
+                                "a block (write %d bytes) command is finished",
+                                hst_d0.val;
+                            ma_state.val = SMBus_Master_St_Idle;
+                        } else {
+                            log info, 3:
+                                "the write (%d bytes) part of a %s is finished",
+                                hst_d0.val, "block process call cmd";
+                            ma_state.val = SMBus_Master_St_Started;
+                            i2c_restart(
+                                        (xmit_slva.ADDRESS.val << 1) + SMBus_Rd);
+                            ma_start_repeats.val++;
+                        }
+                    } else {
+                        // Send the byte one by one,
+                        // the byte comes from the SRAM when the E32B bit
+                        // or from the host block data byte register
+                        // when the E32B bit is cleared
+                        if (aux_ctl.E32B.val == 1) {
+                            sram_image.image.read(&data, sram_rd_ptr.val, 1);
+                            ma_state.val = SMBus_Master_St_Write_Requested;
+                            i2c_write(data);
+                            ma_wr_repeats.val++;
+                            sram_rd_ptr.val++;
+                        } else {
+                            assert false;
+                        }
+                    }
+                    return;
+                }
+
+                // Process the byte command
+                if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte_Data) {
+                    if (ma_wr_repeats.val == 2) {
+                        log info, 3:
+                            "a byte data (write) command is finished";
+                        ma_state.val = SMBus_Master_St_Idle;
+                    } else {
+                        ma_state.val = SMBus_Master_St_Write_Requested;
+                        i2c_write(hst_d0.val);
+                        ma_wr_repeats.val++;
+                        log info, 4:
+                            "write data byte 0x%02x to SMBus address %d",
+                            hst_d0.val, xmit_slva.ADDRESS.val;
+                    }
+                    return;
+                }
+
+                // Process the word command
+                if (ma_wr_repeats.val == 3) {
+                    log info, 3:
+                        "a word (write) command is finished";
+                    ma_state.val = SMBus_Master_St_Idle;
+                } else {
+                    // Write a data byte to the slave
+                    if (ma_wr_repeats.val == 1)
+                        data = hst_d0.val;
+                    else if (ma_wr_repeats.val == 2)
+                        data = hst_d1.val;
+                    ma_state.val = SMBus_Master_St_Write_Requested;
+                    i2c_write(data);
+                    ma_wr_repeats.val++;
+                    log info, 4:
+                        "write data byte 0x%02x to SMBus address %d",
+                        data, xmit_slva.ADDRESS.val;
+                }
+            }
+        }
+    }
+
+    // action_in_read_ack_requested: the action of SMBus processor when in
+    // the state of ack read requested
+    method action_in_read_ack_requested(bool state_check) {
+        if (state_check
+            && (ma_event.val != SMBus_Master_Ev_Ack_Read_Response)) {
+            log spec_viol, 3:
+                "no ack read response after a ack read request";
+            return;
+        }
+
+        if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte
+            || hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte_Data) {
+            assert (xmit_slva.RW.val == SMBus_Rd);
+            assert (ma_rd_repeats.val == 1);
+            hst_d0.val = ma_read_byte.val;
+            log info, 3: "a %s (read) command is finished",
+                (hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte) ? "byte" : "byte data";
+            ma_state.val = SMBus_Master_St_Idle;
+        } else if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Word_Data
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Process_Call) {
+            if (ma_rd_repeats.val == 1) {
+                hst_d0.val = ma_read_byte.val;
+                log info, 3:
+                    "read the second byte from slave %d", xmit_slva.ADDRESS.val;
+                i2c_read();
+                ma_rd_repeats.val++;
+                ma_state.val = SMBus_Master_St_Read_Requested;
+            } else {
+                assert (ma_rd_repeats.val == 2);
+                hst_d1.val = ma_read_byte.val;
+                if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Word_Data)
+                    log info, 3: "a word (read) command is finished";
+                else if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Process_Call)
+                    log info, 3: "a process call command is finished";
+                ma_state.val = SMBus_Master_St_Idle;
+            }
+        } else if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Block
+                   || hst_cnt.SMB_CMD.val == SMBus_Cmd_Block_Process) {
+            // Read the byte one by one from the slave device,
+            // and write the byte to the SRAM when E32B is set,
+            // or to the host block data byte register
+            if (aux_ctl.E32B.val == 1) {
+                if (ma_rd_repeats.val == 1) {
+                    log info, 2:
+                        "host d0: %d, read length: %d", hst_d0.val, ma_read_byte.val;
+                    if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Block_Process
+                        && ma_read_byte.val + hst_d0.val > smbus_sram_size) {
+                        // Check the sum of read and write
+                        log info, 2:
+                            "the sum of wr and rd bytes rollovers maximum 32";
+                        ma_read_byte.val = smbus_sram_size - hst_d0.val;
+                    }
+                    hst_d0.val = ma_read_byte.val;
+                } else {
+                    sram_image.image.write(&ma_read_byte.val, sram_wr_ptr.val, 1);
+                    sram_wr_ptr.val++;
+                    if (sram_wr_ptr.val == hst_d0.val) {
+                        if (hst_cnt.SMB_CMD.val == SMBus_Cmd_Block)
+                            log info, 3:
+                                "a block (read) command is finished";
+                        else
+                            log info, 3:
+                                "the read (%d bytes) part of a %s is finished",
+                                hst_d0.val, "block process call cmd";
+                        ma_state.val = SMBus_Master_St_Idle;
+                    }
+                    if (sram_wr_ptr.val >= smbus_sram_size) {
+                        hst_sts.BYTE_DONE_STS.val = 1;
+                        hst_sts.DEV_ERR.val = 1;
+                        pcie_config.raise_legacy_interrupt();
+                        ma_state.val = SMBus_Master_St_Idle;
+                        log info, 2:
+                            "32-byte SRAM is filled, abort the %s command",
+                            (hst_cnt.SMB_CMD.val == SMBus_Cmd_Block) ?
+                                "block read" : "block process call";
+                    }
+                }
+                if (ma_state.val != SMBus_Master_St_Idle) {
+                    // Read the next byte
+                    i2c_read();
+                    ma_state.val = SMBus_Master_St_Read_Requested;
+                    ma_rd_repeats.val++;
+                }
+            } else {
+                assert false;
+            }
+        }
+    }
+
+    // process_cmd: process a system management command in a way
+    // with multiple interactions with the I2C link
+    method process_cmd() {
+        local uint8 byte_1;
+
+        switch (ma_state.val) {
+        case SMBus_Master_St_Idle:
+            // Only the event that a command is fired is allowed
+            if (ma_event.val != SMBus_Master_Ev_Cmd_Fired) {
+                log info, 2:
+                    "only the event that a cmd is fired is allowed when idle";
+                break;
+            }
+            byte_1 = xmit_slva.ADDRESS.val << 1;
+            if (   hst_cnt.SMB_CMD.val == SMBus_Cmd_Quick
+                || hst_cnt.SMB_CMD.val == SMBus_Cmd_Byte)
+                byte_1 = byte_1 + xmit_slva.RW.val;
+            log info, 4:
+                "start a %s cycle to the slave address 0x%x",
+                (byte_1 & 0x1) == 0 ? "write" : "read", xmit_slva.ADDRESS.val;
+            ma_state.val = SMBus_Master_St_Started;
+            i2c_start(byte_1);
+            ma_start_repeats.val = 1;
+            hst_sts.be_little_busy();
+            break;
+
+        case SMBus_Master_St_Started:
+            action_in_started();
+            break;
+
+        case SMBus_Master_St_Read_Requested:
+            // Only the event of read result is allowed
+            if (ma_event.val != SMBus_Master_Ev_Read_Response) {
+                log spec_viol, 3: "no read response after a read";
+                break;
+            }
+            i2c_on_read_request();
+            break;
+
+        case SMBus_Master_St_Write_Requested:
+            action_in_write_requested();
+            break;
+
+        case SMBus_Master_St_Read_Ack_Requested:
+            action_in_read_ack_requested(true);
+            break;
+
+        default:
+            assert false;
+        }
+
+        if (ma_state.val == SMBus_Master_St_Idle) {
+            log info, 4: "stop this transfer";
+            i2c_stop();
+            hst_sts.BYTE_DONE_STS.val = 1;
+        }
+    }
+}
+
+method post_init() {
+    if (!SIM_is_restoring_state(dev.obj)) {
+        pcie_config.update_mappings(PCIE_Type_Cfg);
+        pcie_config.update_mappings(PCIE_Type_Mem);
+        pcie_config.update_mappings(PCIE_Type_IO);
+        pcie_config.update_mappings(PCIE_Type_Other);
+    }
+}

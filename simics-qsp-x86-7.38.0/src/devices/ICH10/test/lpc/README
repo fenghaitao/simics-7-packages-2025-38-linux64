@@ -1,0 +1,16 @@
+ICH10 LPC Bridge Test Description
+=================================
+
+Included Cases
+--------------
+The ICH10 LPC bridge test totally includes 4 cases:
+(1) s-fwhi-connect.py: tests firmware hub to connect external devices 
+(2) s-fwhi-boot.py: tests firmware hub to connect and read data from legacy flash
+(3) s-lpc-bridge.py: tests the bridge function between PCI and LPC bus of LPC bridge
+(4) s-serial-ports.py: tests LPC bridge can connect up to 4 RS232 controllers.
+
+
+
+Not Tested Features
+-------------------
+(1) The PCI interrupt routing registers in LPC bridge are not tested.

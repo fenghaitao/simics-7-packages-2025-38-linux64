@@ -1,0 +1,160 @@
+/*
+  lpc-bridge.dml
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "simics/devs/map-demap.dml";
+
+constant LPC_DECODING_RANGE_CNT = 4;
+
+parameter base_io_function = 0x1;
+parameter base_memory_function = 0x5;
+
+connect lpc_io {
+        parameter documentation = "IO space of LPC bus";
+        parameter configuration = "optional";
+        interface memory_space;
+}
+
+bank pci_config {
+    register lpc_en size 2 @ 0x82 "LPC I/F Enables" {
+        // Silent unimplemented, the ports are not there so it will be
+        // quite obvious if SW tries to use them.
+        field cnf2_en [13] is (silent_unimplemented);
+        field cnf1_en [12] is (silent_unimplemented);
+        field mc_en   [11] is (silent_unimplemented);
+        field kbc_en  [10] is (silent_unimplemented);
+        field gameh_en [9] is (silent_unimplemented);
+        field gamel_en [8] is (silent_unimplemented);
+        field fdd_en   [3] is (silent_unimplemented);
+        field lpt_en   [2] is (silent_unimplemented);
+        field comb_en  [1] {
+            method write(val) {
+                $this = val;
+                inline $io_dec.COMB.write($io_dec.COMB);
+            }
+        }
+        field coma_en  [0] {
+            method write(val) {
+                $this = val;
+                inline $io_dec.COMA.write($io_dec.COMA);
+            }
+        }
+    }
+    register gen_dec[LPC_DECODING_RANGE_CNT] size 4 @ 0x84 + $i * 0x4
+                    "Generic Decode Range for External LPC device" {
+        is gen_dec_reg;
+    }
+}
+
+template gen_dec_reg {
+    field en[0]       "Generic Decode Range Enable";
+    field base[15:2]  "Generic Decode Range Base Address";
+    field mask[23:18] "Generic Decode Range Address Mask";
+
+    method before_write(generic_transaction_t *memop, msb1, lsb, value) {
+        if ($en == 1)
+            inline $remove_map();
+    }
+
+    method after_write(generic_transaction_t *memop) {
+        inline $add_map();
+    }
+
+    method mapping_info() -> (int base, int length) {
+        local int bits = 8;
+        if ($mask == 0)
+            bits = 8;
+        else if ($mask == 1)
+            bits = 7;
+        else if ($mask < 4)
+            bits = 6;
+        else if ($mask < 8)
+            bits = 5;
+        else if ($mask < 16)
+            bits = 4;
+        else if ($mask < 32)
+            bits = 3;
+        else if ($mask < 64)
+            bits = 2;
+
+        length = 1 << bits;
+        base = ($base << 2) & ~(length - 1);
+    }
+
+    method remove_map() {
+        if ($lpc_io.obj)
+            call $remove_lpc_mapping(
+                $lpc_io.obj, $base_io_function + $i, Sim_Addr_Space_IO);
+    }
+
+    method add_map() {
+        local int base;
+        local int length;
+
+        if (!$lpc_io.obj)
+            return;
+
+        inline $mapping_info() -> (base, length);
+        if ($en != 0 && base != 0)
+            call $add_lpc_mapping($lpc_io.obj, base, base, length,
+                                  $base_io_function + $i, Sim_Addr_Space_IO);
+    }
+}
+
+method add_lpc_mapping(conf_object_t *target,
+                       physical_address_t base,
+                       physical_address_t start, int length, int func,
+                       addr_space_t type) {
+    log "info", 2:
+        "add LPC Bus %s decoding (target %s, function %d, %#x - %#x)",
+        type == Sim_Addr_Space_IO ? "IO" : "Memory",
+        SIM_object_name(target), func, base, base + length - 1;
+
+    local map_info_t info;
+    inline $require_pci_bus();
+    memset(&info, 0, sizeoftype(map_info_t));
+    info.base = base;
+    info.start = start;
+    info.length = length;
+    info.function = func;
+
+    $pci_bus.pci_bus.add_map($dev.obj, type, target, info);
+}
+
+method remove_lpc_mapping(conf_object_t *target, int func, addr_space_t type) {
+    log "info", 2: "remove LPC Bus %s decoding (target %s, function %d)",
+        type == Sim_Addr_Space_IO ? "IO" : "Memory",
+        SIM_object_name(target), func;
+
+    inline $require_pci_bus();
+    $pci_bus.pci_bus.remove_map($dev.obj, type, func);
+}
+
+implement bridge {
+    method not_taken(conf_object_t *src_space, conf_object_t *dst_space,
+                     exception_type_t ex, generic_transaction_t *mem_op,
+                     map_info_t mapinfo) -> (exception_type_t e) {
+        $pci_config.status.sta = 1;
+
+        /* return all 1s */
+        local int i;
+        if (SIM_mem_op_is_read(mem_op)) {
+            for (i = 0; i < SIM_get_mem_op_size(mem_op); i++)
+                mem_op->real_address[i] = 0xff;
+        }
+        e = Sim_PE_No_Exception;
+    }
+}

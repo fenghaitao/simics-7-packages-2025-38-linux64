@@ -1,0 +1,709 @@
+
+/*
+  nvme.dml
+
+  © 2023 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "utility.dml";
+import "nvme-admin-commands.dml";
+import "nvme-io-commands.dml";
+import "simics/model-iface/image.dml";
+
+extern size_t strnlen(const char *s, size_t maxlen);
+
+constant PRP_OP_READ = 0;
+constant PRP_OP_WRITE = 1;
+
+param N_ASYNC_EVENT_SLOTS = 4;
+
+param ASYNC_EVENT_ERROR_STATUS = 0x00;
+param WRITE_TO_INVALID_DOORBELL_REGISTER = 0x00;
+
+param MAX_N_NAMESPACES = 1024;
+
+
+typedef struct {
+    nvme_command_handler cmd_handler;
+    bool invalid;
+} arbitration_op_t;
+
+
+template read_only_if is (field, write) {
+    param is_read_only default false;
+
+    method owrite(uint64 value) default {
+        this.set(value);
+    }
+    method write(uint64 value) {
+        if (!is_read_only) {
+            owrite(value);
+        } else {
+            if (value != this.val) {
+                log spec_viol: "Illegal write to %s", this.qname;
+            }
+        }
+    }
+}
+
+// A memory-based transport model NVM Express IO controller. It implements
+// version 2.0c of the NVM Express Base Specification and 1.0c of the NVM
+// Command Set Specification
+template nvme_io_controller is (sreset, standard_admin_commands, ids,
+                                standard_io_commands, features, log_pages) {
+
+    param max_ioqpairs default 4;
+    saved uint32 mps;   // Memory page size
+
+    connect images[i < MAX_N_NAMESPACES] {
+        param documentation = "Namespace images";
+
+        interface image;
+    }
+
+    attribute bandwidth is uint64_attr {
+        param documentation = "The read/write speed of the NVMe disk, provided"
+                            + " in MB/s. 0 means instant read/write:s, which is"
+                            + " the default value";
+        param configuration = "optional";
+        param init_val = 0;
+    }
+
+
+    attribute disk_size is uint64_attr {
+        param documentation = "The total size of the NVMe disk";
+    }
+
+    attribute namespace_sizes is (post_init) {
+        param type = "[i*]";
+        param documentation = "Size of the respective namespaces";
+
+        session uint64 *val;
+        session uint64 count;
+
+        method set(attr_value_t value) throws {
+            delete val;
+            val = new uint64[SIM_attr_list_size(value)];
+            count = SIM_attr_list_size(value);
+            for (local int i = 0; i < count; i++) {
+                val[i] = SIM_attr_integer(SIM_attr_list_item(value, i));
+            }
+        }
+
+        method get() -> (attr_value_t) {
+            local attr_value_t value = SIM_alloc_attr_list(count);
+            for (local int i = 0; i < count; i++) {
+                SIM_attr_list_set_item(&value, i, SIM_make_attr_int64(val[i]));
+            }
+            return value;
+        }
+
+        method post_init() {
+            local uint64 n_images = 0;
+            local uint64 sum_namespace_sizes = 0;
+
+            for (local int i = 0; i < MAX_N_NAMESPACES; i++) {
+                if (images[i].obj == NULL) {
+                    break;
+                }
+                n_images++;
+            }
+
+            for (local int i = 0; i < count; i++) {
+                sum_namespace_sizes += val[i];
+            }
+            if (sum_namespace_sizes > disk_size.val) {
+                log error, 1: "Sum of namespace sizes (%d) is larger than the total"
+                            + " size of the disk (%d)", sum_namespace_sizes,
+                            disk_size.val;
+            }
+            if (n_images != count) {
+                log error, 1: "The number of provided namespace images (%d) is"
+                            + " not equal to the number of provided namespace"
+                            + " sizes (%d).", n_images, count;
+            }
+        }
+    }
+
+    attribute SN is init {
+        param documentation =
+            "The serial number for the NVM subsystem as an ASCII string.";
+        param type = "s";
+
+        session char *val;
+
+        method init() {
+            this.val = MM_STRDUP("SIMICS_NVME");
+        }
+
+        method set(attr_value_t val) throws {
+            local uint16 sn_len = strnlen(SIM_attr_string(val), 21);
+            if (sn_len > 20) {
+                log error, 2: "Serial number be 20 ASCII characters or shorter";
+                throw;
+            }
+            MM_FREE(this.val);
+            this.val = MM_STRDUP(SIM_attr_string(val));
+        }
+
+        method get() -> (attr_value_t) {
+            return SIM_make_attr_string(val);
+        }
+    }
+
+    group log_pages is log_page_group;
+
+    group stats {
+        saved uint64 host_read_commands[2];
+        saved uint64 host_write_commands[2];
+        saved uint64 number_of_error_information_log_entries[2];
+    }
+
+    group async_event_slots_fifo {
+        param fifo_size = N_ASYNC_EVENT_SLOTS;
+
+        // Internal
+        saved uint32 fifo_buf_start;
+
+        // Partially internal: should not be modified by the user
+        saved uint32 len;
+
+        saved common_command_format_t fifo_buf[fifo_size];
+
+        // Throws if the FIFO is full
+        method push(common_command_format_t elem) throws {
+            if (len >= fifo_size) throw;
+            fifo_buf[(fifo_buf_start + len++) % fifo_size] = elem;
+        }
+
+        // Throws if the FIFO is empty
+        method pop() -> (common_command_format_t) throws {
+            if (len == 0) throw;
+            local common_command_format_t elem = fifo_buf[fifo_buf_start];
+            fifo_buf_start = (fifo_buf_start + 1) % fifo_size;
+            --len;
+            return elem;
+        }
+
+        method empty() {
+            fifo_buf_start = 0;
+            len = 0;
+        }
+    }
+
+    group arbitration {
+        saved bool posted = false;
+
+        method event(common_command_format_t cmd,
+                     common_completion_entry_t rsp,
+                     error_information_log_entry_t err,
+                     arbitration_op_t op) {
+            posted = false;
+
+            local submission_q sq;
+            local completion_q cq;
+            local uint16 sqid = rsp.sqid;
+            try {
+                sq = get_sq(sqid);
+                cq = get_cq(sq.cqid);
+            } catch assert false;
+
+            if (!op.invalid) {
+                op.cmd_handler.handle_command(&cmd, &rsp, &err);
+            }
+
+            if (cmd.cdw0.opc != OPC_ASYNC_EVENT_REQUEST || rsp.dw3 != 0) {
+                cq.write_entry(&cmd, &rsp, &err);
+                log info, 4: "Command with CID %d has been processed!",
+                            cmd.cdw0.cid;
+            }
+
+            for (local int i = 0; i < (max_ioqpairs + 1); i++) {
+                if ((sqid + 1) > max_ioqpairs) {
+                    sqid = 0;
+                } else {
+                    sqid++;
+                }
+                try {
+                    sq = get_sq(sqid);
+                } catch {
+                    continue;
+                }
+                if (sq.is_created_queue() &&
+                    sq.n_available_commands() > 0) {
+                    handle_cmd(sq);
+                    return;
+                }
+            }
+        }
+    }
+
+    group admin_submission_q is admin_submission_q { param id = 0; }
+    group admin_completion_q is completion_q { param id = 0; }
+    group io_submission_qs[i < max_ioqpairs] is io_submission_q {
+        param id = i + 1;
+    }
+    group io_completion_qs[i < max_ioqpairs] is io_completion_q {
+        param id = i + 1;
+    }
+
+    bank properties {
+        register CAP size 8 @ 0x00 "ControllerCapabilities";
+        register VS size 4 @ 0x08 "Version";
+        register INTMS size 4 "InterruptMaskSet";
+        register INTMC size 4 "InterruptMaskClear";
+        register CC size 4 @ 0x14 "ControllerConfiguration";
+        register CSTS size 4 @ 0x1C "ControllerStatus";
+        register NSSR size 4 @ 0x20 "NVMSubsystemReset";
+        register AQA size 4 @ 0x24 "AdminQueueAttributes";
+        register ASQ size 8 @ 0x28 "AdminSubmissionQueueBaseAddress";
+        register ACQ size 8 @ 0x30 "AdminCompletionQueueBaseAddress";
+        register CMBLOC size 4 @ 0x38 is (unimpl) "ControllerMemoryBufferLocation";
+        register CMBSZ size 4 @ 0x3C is (unimpl) "ControllerMemoryBufferSize";
+        register BPINFO size 4 @ 0x40 is (unimpl) "BootPartitionInformation";
+        register BPRSEL size 4 @ 0x44 is (unimpl) "BootPartitionReadSelect";
+        register BPMBL size 8 @ 0x48 is (unimpl) "BootPartitionMemoryBufferLocation";
+        register CMBMSC size 8 @ 0x50 is (unimpl) "ControllerMemoryBufferMemorySpaceControl";
+        register CMBSTS size 4 @ 0x58 is (unimpl) "ControllerMemoryBufferStatus";
+        register CMBEBS size 4 @ 0x5C is (unimpl) "ControllerMemoryBufferElasticityBufferSize";
+        register CMBSWTP size 4 @ 0x60 is (unimpl) "ControllerMemoryBufferSustainedWriteThroughput";
+        register NSSD size 4 @ 0x64 is (unimpl) "NVMSubsystemShutdown";
+        register CRTO size 4 @ 0x68 "ControllerReadyTimeouts";
+        register PMRCAP size 4 @ 0xE00 is (unimpl) "PersistentMemoryRegionCapabilities";
+        register PMRCTL size 4 @ 0xE04 is (unimpl) "PersistentMemoryRegionControl";
+        register PMRSTS size 4 @ 0xE08 is (unimpl) "PersistentMemoryRegionStatus";
+        register PMREBS size 4 @ 0xE0C is (unimpl) "PersistentMemoryRegionElasticityBufferSize";
+        register PMRSWTP size 4 @ 0xE10 is (unimpl) "PersistentMemoryRegionSustainedWriteThroughput";
+        register PMRMSCL size 4 @ 0xE14 is (unimpl) "PersistentMemoryRegionMemorySpaceControlLower";
+        register PMRMSCU size 4 @ 0xE18 is (unimpl) "PersistentMemoryRegionMemorySpaceControlUpper";
+
+        register CAP is (read_only) {
+            group CRMS {
+                field CRIMS @ [60];
+                field CRWMS @ [59] {  param init_val = 0b1; }
+            }
+            field NSSS @ [58];
+            field CMBS @ [57];
+            field PMRS @ [56];
+            field MPSMAX @ [55:52];
+            field MPSMIN @ [51:48];
+            field CPS @ [47:46];
+            field BPS @ [45];
+            field CSS @ [44:37] { param init_val = 0b00000001; }
+            field NSSRS @ [36] { param init_val = 0b1; }
+            field DSTRD @ [35:32] { param init_val = 0; }
+            field TO @ [31:24] { param init_val = 0xF; }
+            field AMS @ [18:17];
+            field CQR @ [16] {
+                // Require that io queues are physically contiguous in memory
+                param init_val = 0b1;
+            }
+            field MQES @ [15:0] { param init_val = 0x7FF; }
+        }
+
+        register VS is (read_only) {
+            field MJR @ [31:16] { param init_val = 0x2; }
+            field MNR @ [15:8];
+            field TER @ [7:0];
+        }
+
+        register INTMS {
+            param offset default 0x0C;
+            field IVMR @ [31:0];
+        }
+
+        register INTMC {
+            param offset default 0x10;
+            field IVMC @ [31:0];
+        }
+
+        register CC {
+            method write_register(uint64 value, uint64 enabled_bytes,
+                                  void *aux) {
+                local bool was_enabled = EN.val;
+                default(value, enabled_bytes, &was_enabled);
+                if (EN.val) {
+                    CSTS.RDY.val = 0b1;
+                } else if (was_enabled) {
+                    CSTS.RDY.val = 0b0;
+                    reset_queues();
+                }
+            }
+
+            field CRIME @ [24] is (read_only_if) {
+                param is_read_only = CAP.CRMS.CRIMS.val != 0b1 ||
+                                     CAP.CRMS.CRWMS.val != 0b1;
+            }
+            field IOCQES @ [23:20] is read_only_if {
+                // Add is_read_only condition for check if any io completion queues exists
+            }
+            field IOSQES @ [19:16] is read_only_if {
+                // Add is_read_only condition for check if any io submission queues exists
+            }
+            field SHN @ [15:14];
+            field AMS @ [13:11] is write {
+                method write(uint64 value) {
+                    if (value != 0) {
+                        log spec_viol: "Invalid arbitration mechanism selected."
+                                     + " Only Round Robin (0b000) is supported";
+                        return;
+                    }
+                    default(value);
+                }
+            }
+            field MPS @ [10:7] is write {
+                method write(uint64 value) {
+                    if (value > CAP.MPSMAX.val || value < CAP.MPSMIN.val) {
+                        log spec_viol: "Invalid MPS value %d. Should not be"
+                                     + " larger that %d or smaller than %d",
+                                     value, CAP.MPSMAX.val, CAP.MPSMIN.val;
+                        return;
+                    }
+                    mps = 1 << (12 + value);
+                    default(value);
+                }
+            }
+            field CSS @ [6:4] is write_field {
+                method write_field(uint64 value, uint64 enabled_bits, void *aux) {
+                    if (*cast(aux, bool *) && this.val != value) {
+                        log spec_viol: "Command set selection should not occur"
+                                     + " when the controller has been enabled.";
+                        return;
+                    }
+                    this.val = (this.val & ~enabled_bits) |
+                               (value & enabled_bits);
+                }
+            }
+            field EN @ [0] is write {
+                method write(uint64 value) {
+                    default(value);
+                }
+            }
+        }
+
+        register CSTS {
+            field ST @ [6] is read_only;
+            field PP @ [5] is read_only;
+            field NSSRO @ [4] is read_only;  // RWC type...
+            field SHST @ [3:2] is read_only;
+            field CFS @ [1] is read_only;
+            field RDY @ [0] is read_only;
+        }
+
+        register NSSR {
+            field NSSRC @ [31:0] is (read, write, get) {
+                method write(uint64 value) {
+                    if (value == 0x4E564D65) {
+                        dev.soft_reset();
+                    }
+                }
+            }
+        }
+
+        register AQA {
+            param configuration = "pseudo";
+
+            field ACQS @ [27:16] is (read, write, set, get) {
+                method write(uint64 value) {
+                    set(value);
+                }
+                method read() -> (uint64) {
+                    return get();
+                }
+                method set(uint64 value) {
+                    admin_completion_q.size = value + 1;
+                }
+                method get() -> (uint64) {
+                    if (admin_completion_q.size != 0)
+                        return admin_completion_q.size - 1;
+                    else
+                        return 0;
+                }
+            }
+            field ASQS @ [11:0] is (read, write, set, get) {
+                method write(uint64 value) {
+                    set(value);
+                }
+                method read() -> (uint64) {
+                    return get();
+                }
+                method set(uint64 value) {
+                    admin_submission_q.size = value + 1;
+                }
+                method get() -> (uint64) {
+                    if (admin_submission_q.size != 0)
+                        return admin_submission_q.size - 1;
+                    else
+                        return 0;
+                }
+            }
+        }
+
+        register ASQ is (read, write, set, get) {
+            param configuration = "pseudo";
+
+            method write(uint64 value) {
+                set(value);
+            }
+            method read() -> (uint64) {
+                return get();
+            }
+            method set(uint64 value) {
+                admin_submission_q.base_addr = value;
+            }
+            method get() -> (uint64) {
+                return admin_submission_q.base_addr;
+            }
+        }
+
+        register ACQ is (read, write, set, get) {
+            param configuration = "pseudo";
+
+            method write(uint64 value) {
+                set(value);
+            }
+            method read() -> (uint64) {
+                return get();
+            }
+            method set(uint64 value) {
+                admin_completion_q.base_addr = value;
+            }
+            method get() -> (uint64) {
+                return admin_completion_q.base_addr;
+            }
+        }
+
+        register CRTO {
+            field CRIMT @ [31:16] is read_only;
+            field CRWMT @ [15:0] is read_only { param init_val = 0xF; }
+        }
+    }
+
+    method soft_reset() {
+        log_pages.error_count = 1;
+        memset(&log_pages.error_log_page, 0, sizeof(log_pages.error_log_page));
+
+        reset_queues();
+        async_event_slots_fifo.empty();
+
+        default();
+    }
+
+    shared method reset_doorbells();
+    shared method interrupt(uint16 q_id);
+    shared method get_submission_q_tail(uint16 q_id) -> (uint32);
+    shared method get_completion_q_head(uint16 q_id) -> (uint32);
+    shared method transport_read(uint64 addr, size_t len, void *buf) -> (bool);
+    shared method transport_write(uint64 addr, size_t len, void *buf) -> (bool);
+
+    method get_sq(uint16 qid) -> (submission_q) throws {
+        foreach sq in (each submission_q in (this)) {
+            if (sq.id == qid && sq.is_created_queue()) {
+                return sq;
+            }
+        }
+        throw;
+    }
+
+    method get_cq(uint16 qid) -> (completion_q) throws {
+        foreach cq in (each completion_q in (this)) {
+            if (cq.id == qid && cq.is_created_queue()) {
+                return cq;
+            }
+        }
+        throw;
+    }
+
+    method handle_cmd(submission_q sq) {
+        local common_command_format_t cmd;
+        local common_completion_entry_t rsp;
+        local error_information_log_entry_t err;
+        local double processing_time = 0.0;
+        local arbitration_op_t op;
+
+        sq.read_entry(&cmd);
+        rsp = { .sqhd = sq.head, .sqid = sq.id, ... };
+
+        try {
+            op.cmd_handler = sq.cmd_handler(cmd.cdw0.opc);
+            processing_time = op.cmd_handler.processing_time(&cmd);
+        } catch {
+            op.invalid = true;
+            set_error(STATUS_TYPE_GENERIC, STATUS_INVALID_OPC, 0, 0, &rsp,
+                      &err);
+            log unimpl, 1: "Invalid or unimplemented admin OPC %d",
+                           cmd.cdw0.opc;
+        }
+
+        after processing_time s: arbitration.event(cmd, rsp, err, op);
+        arbitration.posted = true;
+    }
+
+    method doorbell_event(int submission_qid) {
+        if (arbitration.posted) {
+            // Let event handle request
+            return;
+        }
+        local submission_q sq;
+        local completion_q cq;
+
+        try {
+            sq = get_sq(submission_qid);
+            cq = get_cq(sq.cqid);
+
+        } catch {
+            log error, 1: "Write to invalid doorbell register SQ%dTDBL",
+                           submission_qid;
+            send_async_event(ASYNC_EVENT_ERROR_STATUS,
+                             WRITE_TO_INVALID_DOORBELL_REGISTER,
+                             LID_ERROR_INFORMATION);
+            return;
+        }
+
+        log info, 4: "Available commands in queue %d: %d", submission_qid, sq.n_available_commands();
+
+        if (sq.n_available_commands() > 0) {
+            handle_cmd(sq);
+        }
+    }
+
+    method reset_queues() {
+        log info, 4: "Resetting all NVMe queues";
+        foreach q in (each nvme_q in (this)) {
+            q.reset();
+        }
+        reset_doorbells();
+    }
+
+    method send_async_event(uint3 event_type, uint8 event_info,
+                            uint8 log_page_id) {
+        local common_command_format_t cmd;
+        local error_information_log_entry_t err;
+
+        try {
+            cmd = async_event_slots_fifo.pop();
+        } catch {
+            log info, 2: "No stored async event slots, skipping...";
+            return;
+        }
+
+        local async_event_dw0_t dw0 = {
+            .log_page_identifier = log_page_id,
+            .asynchronous_event_information = event_info,
+            .asynchronous_event_type = event_type,
+            ...
+        };
+
+        local common_completion_entry_t rsp = {
+            .sqhd = admin_submission_q.head,
+            .sqid = admin_submission_q.id,
+            .cid = cmd.cdw0.cid,
+            .dw0 = dw0,
+            .dw3 = { .p = admin_completion_q.phase, ... },
+            ...
+        };
+
+        local int res = admin_completion_q.write_entry(&cmd, &rsp, &err);
+        if (res != 0) {
+            log info, 3: "Could not send async event, skipping...";
+        } else {
+            interrupt(admin_completion_q.interrupt_vector);
+        }
+    }
+
+    method prp_op(uint64 prp1, uint64 prp2, size_t len, uint8 *buf, uint8 op) {
+        assert((op == PRP_OP_READ) || (op == PRP_OP_WRITE));
+
+        local uint32 n_entries = (len + mps - 1) / mps;
+        local uint16 prp1_off = prp1[11:0];
+        local uint16 prp1_len = mps - prp1[11:0];
+        local bool (*transport_io)(conf_object_t *, uint64, size_t, void *);
+
+        log info, 4: "len: %d", len;
+        log info, 4: "mps: %d", mps;
+        log info, 4: "prp1_off: %d", prp1_off;
+        assert(n_entries != 0);
+
+        if (len <= prp1_len) {
+            if (op == PRP_OP_READ)
+                transport_read(prp1, len, buf);
+            else
+                transport_write(prp1, len, buf);
+            return;
+        }
+
+        if (op == PRP_OP_READ)
+            transport_read(prp1, prp1_len, buf);
+        else
+            transport_write(prp1, prp1_len, buf);
+
+        if (len <= (prp1_len + mps)) {
+
+            if (op == PRP_OP_READ) {
+                transport_read(prp2, len - prp1_len,
+                               &cast(buf, uint8*)[prp1_len]);
+            } else {
+                transport_write(prp2, len - prp1_len,
+                                &cast(buf, uint8*)[prp1_len]);
+            }
+            return;
+        }
+
+        local uint32 remaining = len - prp1_len;
+
+        local uint16 prp_list_off = prp2[11:0];
+        local uint64 prp_list_len = (mps - prp_list_off) / 8;
+        local uint64 prp_list[prp_list_len];
+        transport_read(prp2, sizeof(prp_list), prp_list);
+
+        local uint16 prp_list_idx = 0;
+        local uint16 entry = 1;
+        while(remaining > 0) {
+            local uint32 n = (remaining >= mps) ? mps : remaining;
+            if (prp_list_idx >= prp_list_len) {
+                log spec_viol: "Ran out of prp list entries to accommodate the"
+                             + " response";
+                return;
+            }
+            assert((prp1_len + (mps * (entry - 1)) + n) <= len);
+            if (op == PRP_OP_READ) {
+                transport_read(prp_list[prp_list_idx], n,
+                               &cast(
+                                 buf, uint8*)[prp1_len + (mps * (entry - 1))]);
+            } else {
+                transport_write(prp_list[prp_list_idx], n,
+                                &cast(
+                                  buf, uint8*)[prp1_len + (mps * (entry - 1))]);
+            }
+            prp_list_idx++;
+            entry++;
+            remaining -= n;
+        }
+    }
+
+    method set_error(uint3 sct, uint8 sc, uint8 byte, uint3 bit,
+                    common_completion_entry_t *rsp,
+                    error_information_log_entry_t *err) {
+        rsp->dw3.sct = sct;
+        rsp->dw3.sc = sc;
+        err->parameter_error_location.byte_location = byte;
+        err->parameter_error_location.bit_location = bit;
+    }
+}
+
+method increment_128(uint64 *n) {
+    local int128 res = int128_add_int64(int128_from_hi_lo(n[1], n[0]), 1);
+    n[0] = res.lo;
+    n[1] = res.hi;
+}

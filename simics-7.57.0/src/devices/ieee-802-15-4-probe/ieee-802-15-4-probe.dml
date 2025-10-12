@@ -1,0 +1,138 @@
+/*
+ * ieee-802-15-4-probe.dml
+
+  © 2014 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+device ieee_802_15_4_probe;
+
+parameter desc = "model of IEEE 802.15.4 probe";
+parameter documentation = "The <class>ieee_802_15_4_probe</class> provides a" +
+                          " way to listen to traffic at a particular device" +
+                          " that is connected to the link. The probe will" +
+                          " receive both incoming and outgoing traffic for" +
+                          " the device.";
+parameter limitations = "<ul>"
+    + "<li>At most one snooper function can be active. "
+    + "Attaching a new snooper function would detach the old one, "
+    + "if there is any.</li>"
+    + "<li>Snooper function and user data are not checkpointed.</li>"
+    + "</ul>";
+
+import "utility.dml";
+import "ieee-802-15-4-interfaces.dml";
+
+data ieee_802_15_4_probe_snoop_t snoop_fun;
+data void *user_data;
+
+implement ieee_802_15_4_receiver {
+    method receive(const frags_t *frame,
+                   uint32 rssi,
+                   uint16 channel_page,
+                   uint16 channel_number,
+                   ieee_802_15_4_frame_crc_status_t crc_status) {
+        if ($device.obj) {
+            if ($snoop_fun != NULL) {
+                log "info", 3: "call snooper function (link to device)";
+
+                $snoop_fun($user_data, $dev.obj, IEEE_802_15_4_Probe_Port_B,
+                           frame, rssi, channel_page,
+                           channel_number, crc_status);
+            } else {
+                log "info", 3: "no snooper function attached";
+            }
+
+            $device.ieee_802_15_4_receiver.receive(frame,
+                                                   rssi,
+                                                   channel_page,
+                                                   channel_number,
+                                                   crc_status);
+        } else {
+            log "info", 1: "not connected to device";
+        }
+    }
+
+    method frame_lost(uint32 rssi,
+                      uint16 channel_page,
+                      uint16 channel_number) {
+        if ($device.obj)
+            $device.ieee_802_15_4_receiver.frame_lost(rssi,
+                                                      channel_page,
+                                                      channel_number);
+        else
+            log "info", 1: "not connected to device";
+    }
+}
+
+implement ieee_802_15_4_link {
+    method transmit(const frags_t *frame,
+                    uint16 channel_page,
+                    uint16 channel_number,
+                    ieee_802_15_4_frame_crc_status_t crc_status)
+                    -> (ieee_802_15_4_transmit_status_t status) {
+        if ($ep.obj) {
+            if ($snoop_fun != NULL) {
+                log "info", 3: "call snooper function (device to link)";
+
+                $snoop_fun($user_data, $dev.obj, IEEE_802_15_4_Probe_Port_A,
+                           frame, 0xffffffff, channel_page,
+                           channel_number, crc_status);
+            } else {
+                log "info", 3: "no snooper function attached";
+            }
+
+            status = $ep.ieee_802_15_4_link.transmit(frame,
+                                                     channel_page,
+                                                     channel_number,
+                                                     crc_status);
+        } else {
+            log "info", 1: "not connected to link";
+            status = IEEE_802_15_4_Transmit_Unconnected;
+        }
+    }
+}
+
+implement ieee_802_15_4_probe {
+    method attach_snooper(ieee_802_15_4_probe_snoop_t snoop_fun,
+                          void *user_data) {
+        log "info", 3: "snooper function attached";
+        $snoop_fun = snoop_fun;
+        $user_data = user_data;
+    }
+
+    method detach() {
+        log "info", 3: "snooper function detached";
+
+        $snoop_fun = NULL;
+        $user_data = NULL;
+    }
+}
+
+connect ep {
+    parameter documentation = "the endpoint that the probe " +
+                              "will be connected to";
+
+    interface ieee_802_15_4_link;
+}
+
+connect device {
+    parameter documentation = "the transceiver that the probe " +
+                              "will be connected to";
+
+    interface ieee_802_15_4_receiver;
+}
+
+method init() {
+    $snoop_fun = NULL;
+    $user_data = NULL;
+}

@@ -1,0 +1,14 @@
+ICH10 Thermal Sensor Test Description
+=====================================
+
+Included Cases
+--------------
+The ICH10 thermal sensor test totally includes 2 cases:
+(1) s-thermal-reset.py: tests default states of thermal sensor
+(2) s-thermal-func.py: tests the function registers of thermal sensor
+
+
+
+Not Tested Features
+-------------------
+None

@@ -1,0 +1,123 @@
+/*
+  ehci-pci.dml - USB EHCI PCI common code
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.2;
+
+import "pci/common.dml";
+is pci_device;
+
+bank pci_config {
+    parameter usb_base_address_bits default 8;
+    parameter base_address_registers = ["usb_base_address"];
+
+    register class_code { parameter hard_reset_value = 0x0C0320; }
+
+    register usb_base_address @ 0x10 is (memory_base_address_32) {
+        parameter size_bits = $usb_base_address_bits;
+        parameter map_func = 1;
+    }
+
+    register usb_release_number size 1 @ 0x60 is (read_only) {
+        parameter hard_reset_value = 0x20;
+    }
+    register frame_length_adjustment size 1 @ 0x61;
+    register port_wake_capability    size 2 @ 0x62;
+
+    register legacy_support_ext_cap size        4 @ $EECP;
+
+    register legacy_support_control_status size 4 @ $EECP + 0x04 {
+        field SMI_on_BAR                [31:31] is (write_1_clears);
+        field SMI_on_PCI_Cmd            [30:30] is (write_1_clears);
+        field SMI_on_OS_Owner_Change    [29:29] is (write_1_clears);
+        field reserved1                 [28:22] is (reserved);
+        field SMI_on_Async_Advance      [21:21] is (read_only) {
+            method read() -> (value) {
+                value = $usb_regs.usbsts.interrupt[USB_EHCI_INT_ASYNC_ADVANCE];
+            }
+        }
+        field SMI_on_HS_Error           [20:20] is (read_only) {
+            method read() -> (value) {
+                value = $usb_regs.usbsts.interrupt[USB_EHCI_INT_HOST_SYSTEM_ERROR];
+            }
+        }
+        field SMI_on_FLR                [19:19] is (read_only) {
+            method read() -> (value) {
+                value = $usb_regs.usbsts.interrupt[USB_EHCI_INT_FRAME_LIST_ROLLOVER];
+            }
+        }
+        field SMI_on_Port_Change_Detect [18:18] is (read_only) {
+            method read() -> (value) {
+                value = $usb_regs.usbsts.interrupt[USB_EHCI_INT_PORT_CHANGE_DETECT];
+            }
+        }
+        field SMI_on_USB_Error          [17:17] is (read_only) {
+            method read() -> (value) {
+                value = $usb_regs.usbsts.interrupt[USB_EHCI_INT_USBERRINT];
+            }
+        }
+        field SMI_on_USB_Complete       [16:16] is (read_only) {
+            method read() -> (value) {
+                value = $usb_regs.usbsts.interrupt[USB_EHCI_INT_USBINT];
+            }
+        }
+        field SMI_on_BAR_Enable         [15:15] is (read_write);
+        field SMI_on_PCI_Cmd_Enable     [14:14] is (read_write);
+        field SMI_on_OS_Owner_Enable    [13:13] is (read_write);
+        field reserved2                  [12:6] is (reserved);
+        field SMI_on_Async_Adv_Enable     [5:5] is (read_write);
+        field SMI_on_HS_Error_Enable      [4:4] is (read_write);
+        field SMI_on_FLR_Enable           [3:3] is (read_write);
+        field SMI_on_Port_Change_Enable   [2:2] is (read_write);
+        field SMI_on_USB_Error_Enable     [1:1] is (read_write);
+        field SMI_on_USB_Complete_Enable  [0:0] is (read_write);
+    }
+}
+
+method usb_ehci_raise_interrupt() default {
+    call $pci_config.pci_raise_interrupt();
+}
+
+method usb_ehci_lower_interrupt() default {
+    call $pci_config.pci_lower_interrupt();
+}
+
+method usb_ehci_dma_write(addr_space_t space, const void *buffer,
+                          uint64 address, uint64 size) default {
+    local exception_type_t ex;
+    inline $pci_data_to_memory(space, buffer, address, size) -> (ex);
+    if (ex != Sim_PE_No_Exception)
+        throw;
+}
+
+method usb_ehci_dma_read(addr_space_t space, void *buffer, uint64 address,
+                         uint64 size) default {
+    local exception_type_t ex;
+    inline $pci_data_from_memory(space, buffer, address, size) -> (ex);
+    if (ex != Sim_PE_No_Exception)
+        throw;
+}
+
+method interrupt_side_effects(uint8 interrupt) {
+    $pci_config.legacy_support_control_status.SMI_on_USB_Complete =
+        interrupt[USB_EHCI_INT_USBINT];
+    $pci_config.legacy_support_control_status.SMI_on_Port_Change_Detect =
+        interrupt[USB_EHCI_INT_PORT_CHANGE_DETECT];
+    $pci_config.legacy_support_control_status.SMI_on_Async_Advance =
+        interrupt[USB_EHCI_INT_ASYNC_ADVANCE];
+}
+
+method update_port_status_change(uint1 cs_change) {
+    $pci_config.legacy_support_control_status.SMI_on_Port_Change_Detect = cs_change;
+}

@@ -1,0 +1,34 @@
+/*
+  IEEE 802.3 PHY device with MII interface
+
+  © 2010 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+device generic_eth_phy;
+param desc = "model of generic PHY with MII interface";
+param documentation = "Represents a generic Ethernet 802.3 PHY with"
+    + " MII and MDIO45 interfaces. It reflects link-status in the MII"
+    + " registers but does not autonegotiate speed with the link."
+    + " All Ethernet frames are passed through unmodified, except when"
+    + " loopback mode is enabled in the MII registers, then they are"
+    + " immediately returned back to the MAC."
+    + " The <class>generic_eth_phy</class> can optionally model a maximum"
+    + " transmit bandwidth, see the <attr>tx_bandwidth</attr> attribute.";
+
+import "ieee_phy.dml";
+import "ieee_mii_regs.dml";
+
+param has_mii = true;
+import "ieee_mdio45_regs.dml";
+
+is hreset;

@@ -1,0 +1,297 @@
+/*
+  © 2017 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+// sample device for I3C master
+dml 1.2;
+device sample_i3c_master;
+
+parameter documentation = "Sample I3C master device";
+parameter desc = "sample I3C master";
+
+import "simics/devs/i3c.dml";
+
+connect bus {
+    parameter documentation = "Connect to the object which implements the"
+        + " <iface>i3c_slave</iface>.";
+    parameter configuration = "required";
+    interface i3c_slave;
+}
+
+constant St_idle = 0;
+constant St_start_read = 1;
+constant St_start_write = 2;
+constant St_start_broadcast = 3;
+constant St_start_direct_read = 4;
+constant St_start_direct_write = 5;
+constant St_start_daa = 6;
+constant St_read = 7;
+constant St_direct_read = 8;
+constant St_daa_data = 9;
+constant St_daa_address = 10;
+constant St_ibi_addr = 11;
+constant St_ibi_data = 12;
+
+attribute status {
+    parameter documentation = "Internal status";
+    parameter allocate_type = "uint8";
+}
+
+method set_bytes_t(bytes_t *to_set, const uint8 *buf, int len) {
+    to_set->data = buf;
+    to_set->len  = len;
+}
+            
+bank b {
+    register start_addr         size 1 @ 0;
+    register ccc                size 1 @ 1;
+    register slave_addr         size 1 @ 2;
+    register slave_addr_another size 1 @ 3;
+    register read_value         size 2 @ 4;
+    register write_value        size 2 @ 6;
+
+    register daa_data size 8 @ 8 {
+        field id [47:0];
+        field bcr [55:48];
+        field dcr [63:56];
+    }
+    register assigned_addr size 1 @ 16;
+
+    register trigger_start size 1 @ 17 {
+        method write(val) {
+            if ($status == St_idle) {
+                if ($start_addr >> 1 == 0x7e) {
+                    if (($start_addr & 1) == 1) {
+                        log spec_viol: "invalid start address";
+                        return;
+                    }
+                    // start with broadcast address 0x7e | 0
+                    $status = St_start_broadcast;
+                } else {
+                    // start with normal address (either static or dynamic)
+                    if (($start_addr & 1) == 1) {
+                        $status = St_start_read;
+                    } else {
+                        $status = St_start_write;
+                    }
+                }
+                $bus.i3c_slave.start($start_addr);
+            }
+        }
+    }
+}
+
+method write_value() {
+    local bytes_t val;
+    local uint8 v[2];
+    v[0] = ($b.write_value & 0xff00) >> 8;
+    v[1] = $b.write_value & 0xff;
+    inline $set_bytes_t(&val, &v[0], 2);
+    $bus.i3c_slave.sdr_write(val);
+}
+
+method handle_ccc() {
+    // send the CCC firstly
+    local bytes_t val;
+    inline $set_bytes_t(&val, &($b.ccc), 1);
+    $bus.i3c_slave.sdr_write(val);
+
+    if ($b.ccc == 0x07) {
+        // ENTDAA CCC
+        $status = St_start_daa;
+        $bus.i3c_slave.start(0x7e << 1 | 1);
+    } else if ($b.ccc < 0x80) {
+        // broadcast CCC ranges 0-0x7f
+        $write_value();
+        $status = St_idle;
+        $bus.i3c_slave.stop();
+    } else {
+        // direct CCC ranges 0x80-0xfe.
+        // communicate with the first slave.
+        if ($b.slave_addr >> 1 == 0x7e) {
+            log spec_viol: "invalid start address in direct process";
+            return;
+        }
+        if (($b.slave_addr & 1) == 1) {
+            $status = St_start_direct_read;
+        } else {
+            $status = St_start_direct_write;
+        }
+        $bus.i3c_slave.start($b.slave_addr);
+    }
+}
+
+implement i3c_master {
+    method acknowledge(i3c_ack_t ack) {
+        if (ack == I3C_ack) {
+            if ($status == St_start_read) {
+                $status = St_read;
+                $bus.i3c_slave.read();
+            } else if ($status == St_start_write) {
+                $write_value();
+                $status = St_idle;
+                $bus.i3c_slave.stop();
+            } else if ($status == St_start_broadcast) {
+                $handle_ccc();
+            } else if ($status == St_start_direct_read) {
+                $status = St_direct_read;
+                $bus.i3c_slave.read();
+            } else if ($status == St_start_direct_write) {
+                // write two bytes to two slaves separately
+                if (($b.write_value & 0xff00) != 0) {
+                    // write the first byte to first slave
+                    local bytes_t val;
+                    local uint8 d = ($b.write_value & 0xff00) >> 8;
+                    inline $set_bytes_t(&val, &d, 1);
+                    $bus.i3c_slave.sdr_write(val);
+                    $b.write_value = $b.write_value & 0xff;
+
+                    // issue start to the second slave
+                    if ($b.slave_addr_another >> 1 == 0x7e) {
+                        log spec_viol: "invalid start address in direct process";
+                        return;
+                    }
+                    if (($b.slave_addr_another & 1) == 1) {
+                        log spec_viol: "start read address when in"
+                            + " direct write";
+                    }
+                    $status = St_start_direct_write;
+                    $bus.i3c_slave.start($b.slave_addr_another);
+                } else {
+                    // write the second byte to second slave
+                    local bytes_t val;
+                    local uint8 d = $b.write_value & 0xff;
+                    inline $set_bytes_t(&val, &d, 1);
+                    $bus.i3c_slave.sdr_write(val);
+
+                    $status = St_idle;
+                    $bus.i3c_slave.stop();
+                }
+            } else if ($status == St_start_daa) {
+                $status = St_daa_data;
+                $bus.i3c_slave.daa_read();
+            } else if ($status == St_daa_address) {
+                $status = St_start_daa;
+                $bus.i3c_slave.start(0x7e << 1 | 1);
+            }
+        } else {
+            if ($status == St_start_daa) {
+                $status = St_idle;
+                $bus.i3c_slave.stop();
+            }
+        }
+    }
+
+    method read_response(uint8 data, bool more) {
+        if ($status == St_read) {
+            if (more) {
+                // read the first data
+                $b.read_value = data;
+                $bus.i3c_slave.read();
+            } else {
+                // read the second data
+                $b.read_value = $b.read_value << 8 | data;
+                $status = St_idle;
+                $bus.i3c_slave.stop();
+            }
+        } else if ($status == St_direct_read) {
+            // read two bytes from two slaves separately
+            if ($b.read_value == 0) {
+                // read first byte from first slave
+                $b.read_value = data;
+                if (more) {
+                    $bus.i3c_slave.read();
+                } else {
+                    // to communicate with another slave
+                    if ($b.slave_addr_another >> 1 == 0x7e) {
+                        log spec_viol: "invalid start address in"
+                            + " direct process";
+                        return;
+                    }
+                    if (($b.slave_addr_another & 1) != 1) {
+                        log spec_viol: "start write address when in"
+                            + " direct read";
+                    }
+                    $status = St_start_direct_read;
+                    $bus.i3c_slave.start($b.slave_addr_another);
+                }
+            } else {
+                // read second byte from second slave
+                $b.read_value = $b.read_value << 8 | data;
+                if (more) {
+                    $bus.i3c_slave.read();
+                } else {
+                    $status = St_idle;
+                    $bus.i3c_slave.stop();
+                }
+            }
+        } else if ($status == St_ibi_data) {
+            $b.read_value = data;
+
+            // slave data received, issue stop
+            $status = St_idle;
+            $bus.i3c_slave.stop();
+        }
+    }
+
+    method daa_response(uint64 id, uint8 bcr, uint8 dcr) {
+        if ($status == St_daa_data) {
+            $b.daa_data.id = id;
+            $b.daa_data.bcr = bcr;
+            $b.daa_data.dcr = dcr;
+
+            $status = St_daa_address;
+            $bus.i3c_slave.write($b.assigned_addr);
+        }
+    }
+
+    method ibi_request() {
+        if ($status != St_idle) {
+            log error: "master received start when the status is not idle";
+        } else {
+            $status = St_ibi_addr;
+            $bus.i3c_slave.ibi_start();
+        }
+    }
+
+    method ibi_address(uint8 addr) {
+        if (addr == 0x04) {
+            // hot-join
+            // master responses ACK, then enter into DAA process
+            $bus.i3c_slave.ibi_acknowledge(I3C_ack);
+            $status = St_idle;
+        } else if ((addr & 1) == 1) {
+            // IBI
+            // master responses ACK, check BCR[2]
+            $bus.i3c_slave.ibi_acknowledge(I3C_ack);
+
+            if (($b.daa_data.bcr & 0x2) == 0) {
+                // BCR[2] is 0, issue stop
+                $status = St_idle;
+                $bus.i3c_slave.stop();
+            } else {
+                // BCR[2] is 1, issue read to request data
+                $status = St_ibi_data;
+                $bus.i3c_slave.read();
+            }
+        } else {
+            // secondary master
+            // master responses ACK, then enter into direct read process
+            $bus.i3c_slave.ibi_acknowledge(I3C_ack);
+            $status = St_idle;
+        }
+    }
+}
+
+method init() {
+    $status = St_idle;
+}

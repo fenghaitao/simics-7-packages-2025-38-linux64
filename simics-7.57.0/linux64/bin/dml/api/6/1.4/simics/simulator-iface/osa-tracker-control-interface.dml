@@ -1,0 +1,22 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/simulator-iface/osa-tracker-control-interface.h>
+%}
+
+import "simics/device-api.dml";
+
+extern typedef struct { void (*disable)(conf_object_t *obj); bool (*enable)(conf_object_t *obj); void (*clear_state)(conf_object_t *obj); bool (*add_processor)(conf_object_t *obj, conf_object_t *cpu); bool (*remove_processor)(conf_object_t *obj, conf_object_t *cpu); } osa_tracker_control_interface_t;

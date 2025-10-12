@@ -1,0 +1,135 @@
+/*
+
+  core-f0.dml
+
+  © 2021 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+import "x58-common.dml";
+import "simics/devs/map-demap.dml";
+import "simics/model-iface/state.dml";
+
+attribute vtbar_size_18_bits is (bool_attr) "If TRUE, VTBAR will use 18 bits" {
+    param init_val = false;
+}
+
+bank f0 is cfg_with_caps {
+    param desc = "system management registers";
+    param function = 0;
+
+    register device_id { param init_val = 0x342e; }
+    register header_type {
+        field mf { param init_val = 1; }
+    }
+
+    register vtbar size 4 @ 0x180 is (pcie_base_address) {
+        param type = PCIE_Type_Mem;
+        param map_obj = remap_space.obj;
+        param size_bits = 13;
+        field address @ [31:13];
+        field enable  @ [0];
+
+        method enabled() -> (bool) {
+            return enable.val;
+        }
+        method get_size_bits() -> (uint8) {
+            if (vtbar_size_18_bits.val)
+                return 18;
+            else
+                return default();
+        }
+        method get_map_info() -> (map_info_t) {
+            local map_info_t nfo;
+            nfo = default();
+            if ((external_remap_unit[0].uint64_state.val == NULL)
+                !=
+                (external_remap_unit[1].uint64_state.val == NULL))
+                log critical: "Mixing remap units with different mapping " +
+                              "schemes is not supported.";
+
+            if (external_remap_unit[0].uint64_state.val != NULL)
+                // A remap unit with the state64 interface is expected to need
+                // an unmodified address when its BAR is accessed.
+                // The state64 interface is used to propagate the base to the
+                // remap unit and hence, when it has the interface,
+                // we will forward the access unmodified by setting offset=base
+                nfo.start = nfo.base;
+            return nfo;
+        }
+        method update_map() {
+            default();
+            if (enabled()) {
+                local map_info_t nfo = get_map_info();
+                nfo.length /=2; //we have two units that share the bar equally
+                local uint16 i;
+                for (i=0; i<2; i++) {
+                    if (external_remap_unit[i].uint64_state.val != NULL) {
+                        external_remap_unit[i].uint64_state.set(nfo.base);
+                        dev.remap_space.map_demap.unmap(
+                            external_remap_unit[i].obj, NULL);
+                        dev.remap_space.map_demap.map_simple(
+                            external_remap_unit[i].obj, NULL, nfo);
+                        nfo.base += nfo.length;
+                        nfo.start = nfo.base;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+connect remap_space is init_as_subobj {
+    param documentation = "DMA/Interrupt remapping memory-space";
+    param classname = "memory-space";
+    interface map_demap;
+}
+
+connect remap_unit[i < 2] is (init_as_subobj, post_init) {
+    param documentation = "Internal DMA/Interrupt remapping units";
+    param classname = "x58-remap-unit";
+
+    param map_obj = external_remap_unit[i].obj ? external_remap_unit[i].obj :
+        SIM_object_descendant(this.obj, "bank.vtd");
+
+    method init() {
+        default();
+        local attr_value_t non_isoch = SIM_make_attr_boolean(i == 0);
+        SIM_set_attribute_default(this.obj, "non_isoch", non_isoch);
+    }
+
+    method post_init() {
+        if (!SIM_is_restoring_state(dev.obj)) {
+            local map_info_t nfo =
+                { .length = 0x1000, .base = i * 0x1000, ... };
+            remap_space.map_demap.map_simple(map_obj, NULL, nfo);
+        }
+    }
+}
+
+connect external_remap_unit[i < 2] is map_target {
+    param documentation = "External DMA/Interrupt remapping units. If set, will"
+        + " be used in place of the internal objects in 'remap_unit'";
+
+    interface uint64_state {
+        param required = false;
+    }
+
+    method set(conf_object_t *obj) {
+        if (SIM_object_is_configured(dev.obj))
+            log error: "'%s' must be set before instantiation", name;
+        else
+            default(obj);
+    }
+}

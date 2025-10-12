@@ -1,0 +1,49 @@
+/*
+  © 2025 Intel Corporation
+
+  This software and the related documents are Intel copyrighted materials, and
+  your use of them is governed by the express license under which they were
+  provided to you ("License"). Unless the License provides otherwise, you may
+  not use, modify, copy, publish, distribute, disclose or transmit this software
+  or the related documents without Intel's prior written permission.
+
+  This software and the related documents are provided as is, with no express or
+  implied warranties, other than those that are expressly stated in the License.
+*/
+
+dml 1.4;
+
+header %{
+#include <simics/simulator-iface/probe-interface.h>
+%}
+
+import "simics/pywrap.dml";
+import "simics/base/attr-value.dml";
+import "simics/base/types.dml";
+
+extern typedef int probe_key_t;
+constant Probe_Key_Kind = 0;
+constant Probe_Key_Name = 0;
+constant Probe_Key_Type = 1;
+constant Probe_Key_Categories = 2;
+constant Probe_Key_Cause_Slowdown = 3;
+constant Probe_Key_Owner_Object = 4;
+constant Probe_Key_Display_Name = 5;
+constant Probe_Key_Description = 6;
+constant Probe_Key_Float_Percent = 7;
+constant Probe_Key_Float_Decimals = 8;
+constant Probe_Key_Metric_Prefix = 9;
+constant Probe_Key_Unit = 10;
+constant Probe_Key_Binary_Prefix = 11;
+constant Probe_Key_Time_Format = 12;
+constant Probe_Key_Width = 13;
+constant Probe_Key_Value_Notifier = 14;
+constant Probe_Key_Aggregates = 17;
+constant Probe_Key_Aggregate_Scope = 18;
+constant Probe_Key_Aggregate_Function = 19;
+constant Probe_Key_Definition = 20;
+extern typedef struct { attr_value_t (*value)(conf_object_t *obj); attr_value_t (*properties)(conf_object_t *obj); } probe_interface_t;
+extern typedef struct { int (*num_indices)(conf_object_t *obj); attr_value_t (*value)(conf_object_t *obj, int idx); attr_value_t (*properties)(conf_object_t *obj, int idx); } probe_index_interface_t;
+extern typedef struct { int (*num_indices)(conf_object_t *obj); attr_value_t (*value)(conf_object_t *obj, int idx); attr_value_t (*all_values)(conf_object_t *obj); attr_value_t (*properties)(conf_object_t *obj, int idx); } probe_array_interface_t;
+extern typedef struct { void (*subscribe)(conf_object_t *obj); void (*unsubscribe)(conf_object_t *obj); int (*num_subscribers)(conf_object_t *obj); } probe_subscribe_interface_t;
+extern typedef struct { void (*enable)(conf_object_t *obj); void (*disable)(conf_object_t *obj); uint64 (*get_generation)(conf_object_t *obj); } probe_sampler_cache_interface_t;
